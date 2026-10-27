@@ -16,7 +16,7 @@ the first check with the command to run if the scanner is not usable.
 1. **Driver installed.** By default the script uses the installed package
    (`sudo dnf install ./build/rpm/RPMS/…/sane-backends-plustek8200i-*.rpm`, see
    `~/projects/scanner/README.rpm.md`). `--dev-backend` uses the build in
-   `~/projects/scanner/backends/backend` instead (DESIGN.md §11.4, step 1; override with
+   `~/projects/scanner/backends/backend` instead (negative-vibes DESIGN.md §11.4, step 1; override with
    `NV_BACKEND_DIR`). The summary records which driver was tested.
 
    **The script uses a private SANE configuration that lists only `plustek8200i`.** With the
@@ -94,7 +94,7 @@ the thresholds need a real film frame.
 ## Result on the 8200i
 
 On 2026-10-16 the whole check passed on the OpticFilm 8200i with the installed `plustek8200i`
-0.1.25 driver: 23 passed, 0 failed, 0 warnings. The figures are in DESIGN.md §10. Two earlier
+0.1.25 driver: 23 passed, 0 failed, 0 warnings. The figures are in negative-vibes DESIGN.md §10. Two earlier
 runs are why the script now has a private configuration, a time limit on each scan and a
 USB-address guard: the first showed a service bug (a colour+infrared scan that never ended), and
 the second was cut short when opening the `genesys` entry for the scanner reset it.
@@ -119,4 +119,4 @@ Start the service on the host first. For the scenarios use `SANE_CONFIG_DIR` wit
 `dll.conf` lists only `plustek8200i` and `--select plustek`; never the system configuration.
 `--run` accepts extra finish arguments such as `--filesystem=DIR` and `--env=NAME=VALUE`, which is
 how `hw_cancel.py` and the app (`NV_AUTOSCAN=raw`, `NV_EXPORT_DIR`) were run. On 2026-10-16 the
-scenarios, the cancel check and an app raw scan passed; DESIGN.md §10 has the details.
+scenarios, the cancel check and an app raw scan passed; negative-vibes DESIGN.md §10 has the details.

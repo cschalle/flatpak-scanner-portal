@@ -3,7 +3,7 @@
 #
 # Scans the same frame the direct way (libsane in the app) and through the portal prototype,
 # and checks that the results agree, using the thresholds of DESIGN.md §11.4 (H1, H2, H3, H4,
-# H5). Read docs/scanner-portal/HARDWARE-TEST.md before running it on the scanner.
+# H5). Read docs/HARDWARE-TEST.md before running it on the scanner.
 #
 #   tools/portal-hw-check.sh [--dpi 600] [--out DIR] [--yes] [--skip ir,cancel] [--streamcheck] [--dev-backend]
 #   tools/portal-hw-check.sh --dry-run        # SANE test backend: checks the plumbing, no hardware
@@ -13,12 +13,18 @@
 # without asking; XDP_BUILD must name a meson build directory of the scanner-frontend branch:
 #   XDP_BUILD=/path/to/xdg-desktop-portal/build tools/portal-hw-check.sh --frontend c [--dry-run]
 #
+# NEGATIVE_VIBES_DIR names the negative-vibes checkout (default ../negative-vibes).
+#
 # It never detaches the scanner from the VM or power-cycles it; it tells you how.
 set -u
 
 HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$HERE/.." && pwd)
-CHECK="python3 $HERE/scan-check.py"
+# The checks use Negative Vibes' nv-cli, nv-portal-proto and measurement tools
+NV=${NEGATIVE_VIBES_DIR:-$ROOT/../negative-vibes}
+[ -f "$NV/tools/scan-check.py" ] || { echo "set NEGATIVE_VIBES_DIR to a negative-vibes checkout"; exit 1; }
+NV=$(cd "$NV" && pwd)
+CHECK="python3 $NV/tools/scan-check.py"
 
 ORIG_ARGS=("$@")   # the parsing below shifts them away; the re-exec into the private bus needs them
 DRY=0; DPI=600; OUT=""; YES=0; SKIP=""; STREAMCHECK=0; DEVBACKEND=0; FRONTEND=proto
@@ -131,10 +137,10 @@ usb_stable() { # where
 # ---- build -----------------------------------------------------------------------------
 say "building ($BUILD)"
 FLAG=""; [ "$BUILD" = release ] && FLAG="--release"
-(cd "$ROOT" && cargo build $FLAG --features portal -p nv-cli -p nv-portal-proto 2>&1 | tail -2) || { echo "build failed"; exit 1; }
-BIN="$ROOT/target/$BUILD"
+(cd "$NV" && cargo build $FLAG --features portal -p nv-cli -p nv-portal-proto 2>&1 | tail -2) || { echo "build failed"; exit 1; }
+BIN="$NV/target/$BUILD"
 NVCI="$BIN/nv-cli"; SVCBIN="$BIN/nv-portal-proto"
-cd "$ROOT"   # nv-cli reads data/devices.toml relative to here
+cd "$NV"   # nv-cli reads data/devices.toml relative to here
 
 # ---- C0: the scanner is usable, directly ------------------------------------------------
 say "C0 preflight"
@@ -183,8 +189,8 @@ PORTALFILE
   export XDG_CURRENT_DESKTOP=nvtest XDG_DESKTOP_PORTAL_DIR=$PORTALS
   export XDG_DATA_HOME=$PORTALS/data XDG_STATE_HOME=$PORTALS/state XDG_CACHE_HOME=$PORTALS/cache
   export XDP_SCANNER_HELPER=$XDP_BIN/xdg-desktop-portal-scanner-helper
-  python3 "$ROOT/crates/nv-portal-proto/tests/impl_auto_grant.py" org.freedesktop.impl.portal.desktop.nvtest \
-      "$ROOT/docs/scanner-portal/org.freedesktop.impl.portal.Scanner.xml" > "$OUT/dialog-standin.log" 2>&1 &
+  python3 "$ROOT/tests/impl_auto_grant.py" org.freedesktop.impl.portal.desktop.nvtest \
+      "$ROOT/docs/org.freedesktop.impl.portal.Scanner.xml" > "$OUT/dialog-standin.log" 2>&1 &
   GRANT=$!
   "$XDP_BIN/xdg-desktop-portal" -r 2> "$OUT/service.log" &
   SVC=$!
@@ -267,7 +273,7 @@ say "C3 app scan, libsane in the app"
 limited "$NVCI" scan "$DEV" --dpi "$DPI" -o "$OUT/direct.pnm" > "$OUT/direct.log" 2>&1 && record PASS "C3 direct scan completes" "$(grep -E '^Saved' "$OUT/direct.log" | sed 's/ to .*//')" || record FAIL "C3 direct scan completes" "see $OUT/direct.log"
 
 say "C4 app scan through the portal (progress timed)"
-python3 -I "$HERE/progress-marks.py" "$OUT/portal.log" -- timeout --signal=TERM --kill-after=10 "$TMO" env $PENV "$NVCI" scan --dpi "$DPI" -o "$OUT/portal.pnm" > "$OUT/portal-progress.txt" 2>&1
+python3 -I "$NV/tools/progress-marks.py" "$OUT/portal.log" -- timeout --signal=TERM --kill-after=10 "$TMO" env $PENV "$NVCI" scan --dpi "$DPI" -o "$OUT/portal.pnm" > "$OUT/portal-progress.txt" 2>&1
 PRC=$?
 cat "$OUT/portal-progress.txt" | sed 's/^/    /'
 if grep -q '^Saved' "$OUT/portal.log"; then record PASS "C4 portal scan completes" "$(grep -E '^Saved' "$OUT/portal.log" | sed 's/ to .*//')"; else record FAIL "C4 portal scan completes" "see $OUT/portal.log"; fi
@@ -340,7 +346,7 @@ if ! skipped cancel; then
   say "C8 cancel at 30% of a big scan, then scan again (H4)"
   if [ $DRY -eq 1 ]; then CD=300; RD=75; SETS="--set mode=Color"; else CD=1200; RD=$DPI; SETS="--set mode=Color"; fi
   # The nv-cli scans above have released the scanner; the service holds it only while a session is open.
-  limited env PORTAL_NAME="$PORTAL_BUS" python3 "$ROOT/crates/nv-portal-proto/tests/hw_cancel.py" $SETS --cancel-dpi $CD --rescan-dpi $RD --out "$OUT/portal-after-cancel.pnm" 2>&1 | tee "$OUT/cancel.txt" | sed 's/^/    /'
+  limited env PORTAL_NAME="$PORTAL_BUS" python3 "$ROOT/tests/hw_cancel.py" $SETS --cancel-dpi $CD --rescan-dpi $RD --out "$OUT/portal-after-cancel.pnm" 2>&1 | tee "$OUT/cancel.txt" | sed 's/^/    /'
   if grep -q 'cancelled=1 fast=1' "$OUT/cancel.txt"; then record PASS "H4 portal cancel returns promptly" "$(grep -o 'cancel_seconds=[0-9.]*' "$OUT/cancel.txt")"; else record FAIL "H4 portal cancel returns promptly" "see $OUT/cancel.txt"; fi
   if grep -q 'rescan_ok=1' "$OUT/cancel.txt"; then
     record PASS "H4 scan after cancel completes" ""

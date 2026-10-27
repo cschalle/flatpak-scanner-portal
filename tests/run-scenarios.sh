@@ -1,9 +1,10 @@
 #!/bin/bash
 # Start a private session bus with the prototype service on the SANE test backend,
-# and run scenarios.py against it. Build first: cargo build -p nv-portal-proto
+# and run scenarios.py against it. Build first, in the negative-vibes checkout:
+# cargo build -p nv-portal-proto. NEGATIVE_VIBES_DIR names it (default ../negative-vibes).
 set -e
 here=$(cd "$(dirname "$0")" && pwd)
-root=$(cd "$here/../../.." && pwd)
+root=$(cd "${NEGATIVE_VIBES_DIR:-$here/../../negative-vibes}" && pwd)
 exec dbus-run-session -- bash -c '
   cfg=$(mktemp -d); echo test > "$cfg/dll.conf"
   export SANE_CONFIG_DIR=$cfg

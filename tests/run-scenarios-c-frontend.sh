@@ -10,7 +10,7 @@
 set -e
 : "${XDP_BUILD:?set XDP_BUILD to the xdg-desktop-portal build directory}"
 here=$(cd "$(dirname "$0")" && pwd)
-root=$(cd "$here/../../.." && pwd)
+root=$(cd "$here/.." && pwd)
 export XDP_BUILD here root PYTHONUNBUFFERED=1
 exec dbus-run-session -- bash -c '
   tmp=$(mktemp -d)
@@ -42,7 +42,7 @@ WRAP
   export XDP_SCANNER_HELPER=$tmp/helper
   export PORTAL_NAME=org.freedesktop.portal.Desktop
   python3 "$here/impl_auto_grant.py" org.freedesktop.impl.portal.desktop.nvtest \
-      "$root/docs/scanner-portal/org.freedesktop.impl.portal.Scanner.xml" > "$tmp/backend.log" 2>&1 &
+      "$root/docs/org.freedesktop.impl.portal.Scanner.xml" > "$tmp/backend.log" 2>&1 &
   backend=$!
   "$XDP_BIN/xdg-desktop-portal" -r > "$tmp/frontend.log" 2>&1 &
   frontend=$!
