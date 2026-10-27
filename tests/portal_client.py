@@ -27,6 +27,8 @@ class Client:
         self.me = self.bus.get_unique_name()
         self.events = []
         self.bus.signal_subscribe(NAME, IFACE, "FrameEvent", PATH, None, Gio.DBusSignalFlags.NONE, self._on_frame)
+        self.buttons = []
+        self.bus.signal_subscribe(NAME, IFACE, "ButtonEvent", PATH, None, Gio.DBusSignalFlags.NONE, self._on_button)
         self.bus.signal_subscribe(NAME, "org.freedesktop.portal.Session", "Closed", None, None, Gio.DBusSignalFlags.NONE, self._on_closed)
         self.closed = []
         self.n = 0
@@ -34,6 +36,9 @@ class Client:
     def _on_frame(self, _c, _s, _p, _i, _n, params):
         sess, state, details = params.unpack()
         self.events.append((sess, state, details))
+
+    def _on_button(self, _c, _s, _p, _i, _n, params):
+        self.buttons.append(params.unpack())
 
     def _on_closed(self, _c, _s, path, *_):
         self.closed.append(path)

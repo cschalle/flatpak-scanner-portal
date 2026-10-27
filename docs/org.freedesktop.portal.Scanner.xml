@@ -159,6 +159,14 @@
           reliable enough to filter on; GetOptions() is still authoritative
           for what an opened scanner can do.
 
+        * ``buttons`` (``as``)
+
+          The buttons of the scanner that the portal can report, with
+          ButtonEvent, by the names the portal gives them: ``scan``,
+          ``copy``, ``email``, ``pdf``, ``file`` or ``extra``. Empty when
+          the scanner has none, or its driver is not one the portal knows
+          the buttons of.
+
         * ``available`` (``b``)
 
           Whether the scanner can be opened right now.
@@ -450,6 +458,34 @@
       <arg type="o" name="session_handle" direction="out"/>
       <arg type="s" name="state" direction="out"/>
       <annotation name="org.qtproject.QtDBus.QtTypeName.Out2" value="QVariantMap"/>
+      <arg type="a{sv}" name="details" direction="out"/>
+    </signal>
+
+    <!--
+        ButtonEvent:
+        @session_handle: Object path for the :ref:`org.freedesktop.portal.Session` of the open scanner
+        @scanner_id: The scanner
+        @button: The name of the button, one of ``scan``, ``copy``, ``email``, ``pdf``, ``file`` or ``extra``
+        @details: Vardict with further information
+
+        A button on the scanner was pressed. It is sent to the application
+        that has the scanner open, with the session it opened it with. The
+        portal reads the buttons between the calls of a session and not while
+        a frame is in progress, so a press during a scan is lost, and a
+        button that was down when the session opened is not a press.
+
+        Keys in @details:
+
+        * ``option`` (``s``)
+
+          The name the driver has for the button, such as ``intelliscan``,
+          for telling apart two buttons that have the same @button.
+    -->
+    <signal name="ButtonEvent">
+      <arg type="o" name="session_handle" direction="out"/>
+      <arg type="s" name="scanner_id" direction="out"/>
+      <arg type="s" name="button" direction="out"/>
+      <annotation name="org.qtproject.QtDBus.QtTypeName.Out3" value="QVariantMap"/>
       <arg type="a{sv}" name="details" direction="out"/>
     </signal>
 

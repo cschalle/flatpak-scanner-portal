@@ -1,0 +1,625 @@
+From 907eb94fd2f548145cf4cfbaa098475a2669990c Mon Sep 17 00:00:00 2001
+From: "Christian F.K. Schaller" <christian.schaller@gmail.com>
+Date: Tue, 27 Oct 2026 19:29:13 -0400
+Subject: [PATCH] scanner: Report the buttons of a scanner with ButtonEvent
+
+SANE has no event for the buttons on a scanner. The helper reads the sensor
+options that scanner-devices.json names as buttons, between the requests of
+a session and not while a frame is in progress, and tells the frontend when
+one goes from released to pressed. The frontend sends ButtonEvent to the
+application that has the scanner open, and lists the names of the buttons in
+the scanner's info.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ data/org.freedesktop.portal.Scanner.xml |  36 +++++
+ data/scanner-devices.json               |  68 +++++----
+ desktop-portal/scanner-helper.c         | 186 +++++++++++++++++++++++-
+ desktop-portal/scanner.c                | 149 ++++++++++++++++++-
+ 4 files changed, 405 insertions(+), 34 deletions(-)
+
+diff --git a/data/org.freedesktop.portal.Scanner.xml b/data/org.freedesktop.portal.Scanner.xml
+index 160b79f..803cac6 100644
+--- a/data/org.freedesktop.portal.Scanner.xml
++++ b/data/org.freedesktop.portal.Scanner.xml
+@@ -159,6 +159,14 @@
+           reliable enough to filter on; GetOptions() is still authoritative
+           for what an opened scanner can do.
+ 
++        * ``buttons`` (``as``)
++
++          The buttons of the scanner that the portal can report, with
++          ButtonEvent, by the names the portal gives them: ``scan``,
++          ``copy``, ``email``, ``pdf``, ``file`` or ``extra``. Empty when
++          the scanner has none, or its driver is not one the portal knows
++          the buttons of.
++
+         * ``available`` (``b``)
+ 
+           Whether the scanner can be opened right now.
+@@ -453,6 +461,34 @@
+       <arg type="a{sv}" name="details" direction="out"/>
+     </signal>
+ 
++    <!--
++        ButtonEvent:
++        @session_handle: Object path for the :ref:`org.freedesktop.portal.Session` of the open scanner
++        @scanner_id: The scanner
++        @button: The name of the button, one of ``scan``, ``copy``, ``email``, ``pdf``, ``file`` or ``extra``
++        @details: Vardict with further information
++
++        A button on the scanner was pressed. It is sent to the application
++        that has the scanner open, with the session it opened it with. The
++        portal reads the buttons between the calls of a session and not while
++        a frame is in progress, so a press during a scan is lost, and a
++        button that was down when the session opened is not a press.
++
++        Keys in @details:
++
++        * ``option`` (``s``)
++
++          The name the driver has for the button, such as ``intelliscan``,
++          for telling apart two buttons that have the same @button.
++    -->
++    <signal name="ButtonEvent">
++      <arg type="o" name="session_handle" direction="out"/>
++      <arg type="s" name="scanner_id" direction="out"/>
++      <arg type="s" name="button" direction="out"/>
++      <annotation name="org.qtproject.QtDBus.QtTypeName.Out3" value="QVariantMap"/>
++      <arg type="a{sv}" name="details" direction="out"/>
++    </signal>
++
+     <property name="version" type="u" access="read"/>
+   </interface>
+ </node>
+diff --git a/data/scanner-devices.json b/data/scanner-devices.json
+index 319b423..c4ecb8f 100644
+--- a/data/scanner-devices.json
++++ b/data/scanner-devices.json
+@@ -2,32 +2,50 @@
+   "_comment": "What the scanner portal knows about scanners that SANE does not say. A scanner is matched by its USB id (exact) or by a lower case part of 'vendor model' (a product line). The first match in the list wins, USB ids before product lines. Capabilities: film, infrared, flatbed, adf, color. A scanner that is not named here and is not film by its driver's type is assumed to be for documents. A flatbed with a transparency unit has both film and flatbed.",
+   "version": 1,
+   "scanners": [
+-    { "usb_id": "07b3:1825", "name": "Plustek OpticFilm 8200i SE", "capabilities": ["film", "infrared", "color"] },
+-
+-    { "model_contains": "opticfilm", "capabilities": ["film", "color"] },
+-    { "model_contains": "coolscan", "capabilities": ["film", "color"] },
+-    { "model_contains": "dimage scan", "capabilities": ["film", "color"] },
+-    { "model_contains": "scan elite", "capabilities": ["film", "color"] },
+-    { "model_contains": "filmscan", "capabilities": ["film", "color"] },
+-    { "model_contains": "primefilm", "capabilities": ["film", "color"] },
+-    { "model_contains": "film scanner", "capabilities": ["film", "color"] },
+-    { "model_contains": "slide scanner", "capabilities": ["film", "color"] },
+-
+-    { "model_contains": "perfection v370", "capabilities": ["flatbed", "film", "color"] },
+-    { "model_contains": "perfection v500", "capabilities": ["flatbed", "film", "color"] },
+-    { "model_contains": "perfection v550", "capabilities": ["flatbed", "film", "color"] },
+-    { "model_contains": "perfection v600", "capabilities": ["flatbed", "film", "color"] },
+-    { "model_contains": "perfection v700", "capabilities": ["flatbed", "film", "color"] },
+-    { "model_contains": "perfection v750", "capabilities": ["flatbed", "film", "color"] },
+-    { "model_contains": "perfection v800", "capabilities": ["flatbed", "film", "color"] },
+-    { "model_contains": "perfection v850", "capabilities": ["flatbed", "film", "color"] }
++    {"usb_id": "07b3:1825", "name": "Plustek OpticFilm 8200i SE", "capabilities": ["film", "infrared", "color"]},
++    {"model_contains": "opticfilm", "capabilities": ["film", "color"]},
++    {"model_contains": "coolscan", "capabilities": ["film", "color"]},
++    {"model_contains": "dimage scan", "capabilities": ["film", "color"]},
++    {"model_contains": "scan elite", "capabilities": ["film", "color"]},
++    {"model_contains": "filmscan", "capabilities": ["film", "color"]},
++    {"model_contains": "primefilm", "capabilities": ["film", "color"]},
++    {"model_contains": "film scanner", "capabilities": ["film", "color"]},
++    {"model_contains": "slide scanner", "capabilities": ["film", "color"]},
++    {"model_contains": "perfection v370", "capabilities": ["flatbed", "film", "color"]},
++    {"model_contains": "perfection v500", "capabilities": ["flatbed", "film", "color"]},
++    {"model_contains": "perfection v550", "capabilities": ["flatbed", "film", "color"]},
++    {"model_contains": "perfection v600", "capabilities": ["flatbed", "film", "color"]},
++    {"model_contains": "perfection v700", "capabilities": ["flatbed", "film", "color"]},
++    {"model_contains": "perfection v750", "capabilities": ["flatbed", "film", "color"]},
++    {"model_contains": "perfection v800", "capabilities": ["flatbed", "film", "color"]},
++    {"model_contains": "perfection v850", "capabilities": ["flatbed", "film", "color"]}
+   ],
+   "driver_ranks": {
+-    "_comment": "For a scanner that more than one driver found: the lower the better. Drivers that speak a standard protocol work on more scanners than the vendor's. A driver not named here ranks default_rank, and one that goes through another host comes last.",
+-    "airscan": 0,
+-    "escl": 1,
+-    "hpaio": 8,
+-    "net": 9
++      "_comment": "For a scanner that more than one driver found: the lower the better. Drivers that speak a standard protocol work on more scanners than the vendor's. A driver not named here ranks default_rank, and one that goes through another host comes last.",
++      "airscan": 0,
++      "escl": 1,
++      "hpaio": 8,
++      "net": 9
+   },
+-  "default_rank": 2
++  "default_rank": 2,
++  "buttons": {
++      "_comment": "Which options of a backend are buttons, and what the portal calls them: scan, copy, email, pdf, file or extra. The helper reads them between the requests of a session, about every interval_ms, and a press is a reading of true after a reading of false. trigger names a button option to press before each reading, for a backend that needs it. A backend that is not here reports no buttons.",
++      "plustek8200i": {
++          "interval_ms": 250,
++          "options": {
++              "scan": "scan",
++              "intelliscan": "extra"
++          }
++      },
++      "genesys": {
++          "interval_ms": 250,
++          "options": {
++              "scan": "scan",
++              "file": "file",
++              "email": "email",
++              "copy": "copy",
++              "extra": "extra"
++          }
++      }
++  }
+ }
+diff --git a/desktop-portal/scanner-helper.c b/desktop-portal/scanner-helper.c
+index 816ea55..da40618 100644
+--- a/desktop-portal/scanner-helper.c
++++ b/desktop-portal/scanner-helper.c
+@@ -16,7 +16,9 @@
+  *     the scanner could be opened.
+  */
+ 
++#include <errno.h>
+ #include <fcntl.h>
++#include <poll.h>
+ #include <pthread.h>
+ #include <signal.h>
+ #include <stdio.h>
+@@ -1096,10 +1098,162 @@ stop_frame (Session *session)
+     g_thread_join (g_steal_pointer (&session->thread));
+ }
+ 
++/* ---- Buttons ----
++ *
++ * SANE has no event for the buttons of a scanner. A backend that has them exposes sensor options
++ * that read true (or a number that is not zero) while a button is down or, for some backends, until
++ * they are read. The portal says which options are buttons, and what it calls them, in the
++ * arguments of the helper; the helper reads them between the requests of the session, and tells the
++ * portal when one goes from released to pressed. What a button is called is the portal's: this only
++ * reads.
++ *
++ * The scanner is read from the thread that serves requests and only while no frame is in progress,
++ * since many backends cannot read a sensor in the middle of a scan: a press during a scan is lost. */
++
++typedef struct
++{
++  char *option;       /* the backend's name for it: "scan" */
++  char *name;         /* the portal's: "scan" */
++  SANE_Int index;     /* 0 if the scanner has no such option */
++  const SANE_Option_Descriptor *desc;
++  int last;           /* what the last reading was, so that a press is a change */
++} ButtonWatch;
++
++typedef struct
++{
++  GArray *watches;    /* ButtonWatch */
++  int interval_ms;
++  char *trigger;      /* a button option to press before reading, or NULL */
++  SANE_Int trigger_index;
++} Buttons;
++
++/* The arguments after the scanner's name: --button-interval=MS, --button-trigger=OPTION and
++ * --button=OPTION=NAME, as many of the last as there are buttons. Anything else is an error. */
++static gboolean
++buttons_parse (Buttons *buttons,
++               int      argc,
++               char    *argv[])
++{
++  buttons->watches = g_array_new (FALSE, TRUE, sizeof (ButtonWatch));
++  buttons->interval_ms = 250;
++
++  for (int i = 0; i < argc; i++)
++    {
++      if (g_str_has_prefix (argv[i], "--button-interval="))
++        {
++          buttons->interval_ms = (int) g_ascii_strtoll (argv[i] + strlen ("--button-interval="), NULL, 10);
++          if (buttons->interval_ms < 50)
++            buttons->interval_ms = 50;
++        }
++      else if (g_str_has_prefix (argv[i], "--button-trigger="))
++        {
++          g_free (buttons->trigger);
++          buttons->trigger = g_strdup (argv[i] + strlen ("--button-trigger="));
++        }
++      else if (g_str_has_prefix (argv[i], "--button="))
++        {
++          const char *spec = argv[i] + strlen ("--button=");
++          const char *equals = strchr (spec, '=');
++          ButtonWatch watch = { 0 };
++
++          if (equals == NULL || equals == spec || equals[1] == '\0')
++            return FALSE;
++          watch.option = g_strndup (spec, equals - spec);
++          watch.name = g_strdup (equals + 1);
++          g_array_append_val (buttons->watches, watch);
++        }
++      else
++        {
++          return FALSE;
++        }
++    }
++
++  return TRUE;
++}
++
++static int
++button_read (SANE_Handle handle,
++             ButtonWatch *watch)
++{
++  SANE_Word value = 0;
++
++  if (watch->index == 0 ||
++      sane_control_option (handle, watch->index, SANE_ACTION_GET_VALUE, &value, NULL) != SANE_STATUS_GOOD)
++    return 0;
++
++  return value != 0;
++}
++
++/* Finds the options on the scanner that was opened, and takes the readings that a press is a change
++ * from. A button that is held at the start, or that a backend latches until it is read, is not
++ * a press. */
++static void
++buttons_start (Buttons    *buttons,
++               SANE_Handle handle)
++{
++  for (guint i = 0; i < buttons->watches->len; i++)
++    {
++      ButtonWatch *watch = &g_array_index (buttons->watches, ButtonWatch, i);
++
++      watch->index = option_find (handle, watch->option, &watch->desc);
++      /* Only a number the scanner can be asked for, and not a setting it was told */
++      if (watch->index != 0 &&
++          (!(watch->desc->type == SANE_TYPE_BOOL || watch->desc->type == SANE_TYPE_INT) ||
++           !SANE_OPTION_IS_ACTIVE (watch->desc->cap) || !(watch->desc->cap & SANE_CAP_SOFT_DETECT)))
++        watch->index = 0;
++    }
++
++  if (buttons->trigger != NULL)
++    {
++      const SANE_Option_Descriptor *desc = NULL;
++
++      buttons->trigger_index = option_find (handle, buttons->trigger, &desc);
++      if (desc != NULL && desc->type != SANE_TYPE_BUTTON)
++        buttons->trigger_index = 0;
++    }
++
++  if (buttons->trigger_index != 0)
++    sane_control_option (handle, buttons->trigger_index, SANE_ACTION_SET_VALUE, NULL, NULL);
++  for (guint i = 0; i < buttons->watches->len; i++)
++    {
++      ButtonWatch *watch = &g_array_index (buttons->watches, ButtonWatch, i);
++
++      watch->last = button_read (handle, watch);
++    }
++}
++
++static void
++buttons_poll (Buttons    *buttons,
++              SANE_Handle handle)
++{
++  if (buttons->trigger_index != 0)
++    sane_control_option (handle, buttons->trigger_index, SANE_ACTION_SET_VALUE, NULL, NULL);
++
++  for (guint i = 0; i < buttons->watches->len; i++)
++    {
++      ButtonWatch *watch = &g_array_index (buttons->watches, ButtonWatch, i);
++      int now = button_read (handle, watch);
++
++      if (now && !watch->last)
++        {
++          GVariantBuilder details;
++
++          g_variant_builder_init (&details, G_VARIANT_TYPE_VARDICT);
++          g_variant_builder_add (&details, "{sv}", "button", g_variant_new_string (watch->name));
++          g_variant_builder_add (&details, "{sv}", "option", g_variant_new_string (watch->option));
++          send_reply (0, TRUE, g_variant_new ("(s@a{sv})", "button", g_variant_builder_end (&details)));
++        }
++      watch->last = now;
++    }
++}
++
+ static int
+-run_session (const char *name)
++run_session (const char *name,
++             int         argc,
++             char       *argv[])
+ {
+   Session session = { 0 };
++  Buttons buttons = { 0 };
+   SANE_Handle handle = NULL;
+   SANE_Status status;
+   gboolean running = TRUE;
+@@ -1108,6 +1262,12 @@ run_session (const char *name)
+   /* An application that closes its end of the pipe is an error from write(), not a signal */
+   signal (SIGPIPE, SIG_IGN);
+ 
++  if (!buttons_parse (&buttons, argc, argv))
++    {
++      send_failure (0, "failed", "Malformed arguments");
++      return 2;
++    }
++
+   status = sane_init (NULL, NULL);
+   if (status != SANE_STATUS_GOOD)
+     {
+@@ -1125,6 +1285,7 @@ run_session (const char *name)
+     }
+ 
+   session.handle = handle;
++  buttons_start (&buttons, handle);
+ 
+   if (!send_reply (0, TRUE, g_variant_new_string ("")))
+     running = FALSE;
+@@ -1139,6 +1300,23 @@ run_session (const char *name)
+       int pass_fd = -1;
+       gboolean busy;
+ 
++      /* With buttons to watch, look at them whenever no request has come for a while. The wait is
++       * for the start of a request only: once one has started, it is read to the end. */
++      if (buttons.watches->len > 0)
++        {
++          struct pollfd pfd = { .fd = SCANNER_HELPER_FD, .events = POLLIN };
++          int ready = poll (&pfd, 1, buttons.interval_ms);
++
++          if (ready < 0 && errno == EINTR)
++            continue;
++          if (ready == 0)
++            {
++              if (g_atomic_int_get (&session.busy) == 0 && !session.mid_scan)
++                buttons_poll (&buttons, handle);
++              continue;
++            }
++        }
++
+       request = scanner_protocol_read_with_fd (SCANNER_HELPER_FD, G_VARIANT_TYPE ("(usv)"), -1,
+                                                &pass_fd, &error);
+       if (request == NULL)
+@@ -1259,9 +1437,9 @@ main (int argc, char *argv[])
+   if (argc == 2 && strcmp (argv[1], "list") == 0)
+     return run_list ();
+ 
+-  if (argc == 3 && strcmp (argv[1], "session") == 0)
+-    return run_session (argv[2]);
++  if (argc >= 3 && strcmp (argv[1], "session") == 0)
++    return run_session (argv[2], argc - 3, argv + 3);
+ 
+-  g_printerr ("usage: %s list | session NAME\n", argv[0]);
++  g_printerr ("usage: %s list | session NAME [--button-interval=MS] [--button-trigger=OPTION] [--button=OPTION=NAME]...\n", argv[0]);
+   return 2;
+ }
+diff --git a/desktop-portal/scanner.c b/desktop-portal/scanner.c
+index 916cfad..5346677 100644
+--- a/desktop-portal/scanner.c
++++ b/desktop-portal/scanner.c
+@@ -171,9 +171,27 @@ typedef struct
+   char **capabilities;
+ } ScannerKnown;
+ 
++/* The buttons of a driver's scanners: which options of the backend are buttons, and what they are
++ * called to applications. Read by the helper, which tells the portal when one is pressed. */
++typedef struct
++{
++  int interval_ms;
++  char *trigger;        /* a button option to press before the others are read, or NULL */
++  GPtrArray *options;   /* char *: the backend's name, then the portal's, alternating */
++} ScannerButtons;
++
++static void
++scanner_buttons_free (ScannerButtons *buttons)
++{
++  g_free (buttons->trigger);
++  g_clear_pointer (&buttons->options, g_ptr_array_unref);
++  g_free (buttons);
++}
++
+ typedef struct
+ {
+   GPtrArray *known;     /* ScannerKnown */
++  GHashTable *buttons;  /* backend (char *) -> ScannerButtons */
+   GHashTable *ranks;    /* backend (char *) -> rank (GINT_TO_POINTER) */
+   int default_rank;
+   char *path;
+@@ -195,6 +213,7 @@ scanner_table_free (ScannerTable *table)
+ {
+   g_clear_pointer (&table->known, g_ptr_array_unref);
+   g_clear_pointer (&table->ranks, g_hash_table_unref);
++  g_clear_pointer (&table->buttons, g_hash_table_unref);
+   g_free (table->path);
+   g_free (table);
+ }
+@@ -263,6 +282,7 @@ scanner_table_load (const char *path,
+ 
+   table->known = g_ptr_array_new_with_free_func ((GDestroyNotify) scanner_known_free);
+   table->ranks = g_hash_table_new_full (g_str_hash, g_str_equal, g_free, NULL);
++  table->buttons = g_hash_table_new_full (g_str_hash, g_str_equal, g_free, (GDestroyNotify) scanner_buttons_free);
+   table->default_rank = SCANNER_DEFAULT_RANK;
+   table->path = g_strdup (path);
+   table->mtime = mtime;
+@@ -320,17 +340,55 @@ scanner_table_load (const char *path,
+       }
+   }
+ 
++  {
++    JsonObject *object = json_node_get_object (root);
++    JsonObject *backends = json_object_has_member (object, "buttons") ? json_object_get_object_member (object, "buttons") : NULL;
++    g_autoptr(GList) names = backends != NULL ? json_object_get_members (backends) : NULL;
++
++    for (GList *l = names; l != NULL; l = l->next)
++      {
++        JsonObject *entry = json_object_get_object_member (backends, l->data);
++        JsonObject *options = entry != NULL && json_object_has_member (entry, "options") ? json_object_get_object_member (entry, "options") : NULL;
++        g_autoptr(GList) option_names = options != NULL ? json_object_get_members (options) : NULL;
++        ScannerButtons *buttons;
++
++        if (option_names == NULL)
++          continue;
++
++        buttons = g_new0 (ScannerButtons, 1);
++        buttons->interval_ms = json_object_has_member (entry, "interval_ms") ? (int) json_object_get_int_member (entry, "interval_ms") : 250;
++        if (json_object_has_member (entry, "trigger"))
++          buttons->trigger = g_strdup (json_object_get_string_member (entry, "trigger"));
++        buttons->options = g_ptr_array_new_with_free_func (g_free);
++        for (GList *o = option_names; o != NULL; o = o->next)
++          {
++            const char *name = json_object_get_string_member (options, o->data);
++
++            if (name != NULL)
++              {
++                g_ptr_array_add (buttons->options, g_strdup (o->data));
++                g_ptr_array_add (buttons->options, g_strdup (name));
++              }
++          }
++        g_hash_table_insert (table->buttons, g_strdup (l->data), buttons);
++      }
++  }
++
+   g_debug ("[scanner] Read %u known scanners and %u driver ranks from %s",
+            table->known->len, g_hash_table_size (table->ranks), path);
+   return table;
+ }
+ 
+-/* The table as the file has it now, read again when the file is new or changed. The pointer stays
+- * valid until the next call, which is made from the main thread only. */
++/* The table as the file has it now, read again when the file is new or changed. It is called from
++ * the threads that search for scanners as well as the main one, so a table that has been replaced is
++ * kept, never freed: the file changes rarely and a table is small. */
+ static const ScannerTable *
+ scanner_table_get (void)
+ {
++  static GMutex lock;
+   static ScannerTable *table = NULL;
++  static GPtrArray *retired = NULL;
++  g_autoptr(GMutexLocker) locker = g_mutex_locker_new (&lock);
+   g_autofree char *path = scanner_table_find_file ();
+   gint64 mtime = 0;
+ 
+@@ -347,7 +405,12 @@ scanner_table_get (void)
+   if (table != NULL && g_strcmp0 (table->path, path) == 0 && table->mtime == mtime)
+     return table;
+ 
+-  g_clear_pointer (&table, scanner_table_free);
++  if (table != NULL)
++    {
++      if (retired == NULL)
++        retired = g_ptr_array_new_with_free_func ((GDestroyNotify) scanner_table_free);
++      g_ptr_array_add (retired, table);
++    }
+   table = scanner_table_load (path, mtime);
+   return table;
+ }
+@@ -392,6 +455,13 @@ scanner_backend_rank (const ScannerTable *table,
+   return table->default_rank;
+ }
+ 
++static const ScannerButtons *
++scanner_buttons_for (const ScannerTable *table,
++                     const char         *backend)
++{
++  return backend != NULL ? g_hash_table_lookup (table->buttons, backend) : NULL;
++}
++
+ /* From one entry of the helper's list: an id, the SANE name and the information vardict. What the
+  * portal knows about the scanner is added: its capabilities, and an id that is the same for every
+  * driver that finds it, so that they are one scanner to the dialog and to applications. */
+@@ -441,6 +511,23 @@ scanner_device_new_from_helper (const char *id,
+     g_ptr_array_add (caps, g_strdup ("flatbed"));
+   g_ptr_array_add (caps, NULL);
+ 
++  /* The names of the buttons the portal can report, which is none for a backend that is not in
++   * the table */
++  {
++    const ScannerButtons *buttons = scanner_buttons_for (table, backend);
++    g_autoptr(GPtrArray) names = g_ptr_array_new ();
++
++    for (guint i = 1; buttons != NULL && i < buttons->options->len; i += 2)
++      {
++        const char *name = g_ptr_array_index (buttons->options, i);
++
++        if (!g_ptr_array_find_with_equal_func (names, name, g_str_equal, NULL))
++          g_ptr_array_add (names, (gpointer) name);
++      }
++    g_ptr_array_add (names, NULL);
++    g_variant_dict_insert_value (&dict, "buttons", g_variant_new_strv ((const char * const *) names->pdata, -1));
++  }
++
+   g_variant_dict_insert_value (&dict, "capabilities", g_variant_new_strv ((const char * const *) caps->pdata, -1));
+   device->capabilities = g_strdupv ((char **) caps->pdata);
+ 
+@@ -1828,6 +1915,34 @@ scanner_session_emit_frame_event (XdpScannerSession *self,
+     g_warning ("[scanner] Failed to emit FrameEvent: %s", error->message);
+ }
+ 
++/* Sends a ButtonEvent to the application that owns the session */
++static void
++scanner_session_emit_button_event (XdpScannerSession *self,
++                                   GVariant          *details)
++{
++  XdpSession *session = XDP_SESSION (self);
++  g_autoptr(GError) error = NULL;
++  g_autoptr(GVariant) name = g_variant_lookup_value (details, "button", G_VARIANT_TYPE_STRING);
++  gboolean stopping;
++
++  if (name == NULL)
++    return;
++
++  g_mutex_lock (&self->scanner->mutex);
++  stopping = self->stopping;
++  g_mutex_unlock (&self->scanner->mutex);
++  if (stopping)
++    return;
++
++  g_debug ("[scanner] Button '%s' pressed on %s", g_variant_get_string (name, NULL), self->scanner_id);
++  if (!g_dbus_connection_emit_signal (session->connection, session->sender, DESKTOP_DBUS_PATH,
++                                      "org.freedesktop.portal.Scanner", "ButtonEvent",
++                                      g_variant_new ("(oss@a{sv})", session->id, self->scanner_id,
++                                                     g_variant_get_string (name, NULL), details),
++                                      &error))
++    g_warning ("[scanner] Failed to emit ButtonEvent: %s", error->message);
++}
++
+ /* Reads everything the helper sends: replies go to the call that is waiting for them, and events
+  * (which have serial 0) become FrameEvent signals. Ends when the socket does, which is when the
+  * session is closed or the helper has gone. */
+@@ -1864,7 +1979,10 @@ scanner_session_reader (gpointer data)
+               const char *state;
+ 
+               g_variant_get (event, "(&s@a{sv})", &state, &details);
+-              scanner_session_emit_frame_event (self, state, details);
++              if (g_strcmp0 (state, "button") == 0)
++                scanner_session_emit_button_event (self, details);
++              else
++                scanner_session_emit_frame_event (self, state, details);
+             }
+           continue;
+         }
+@@ -1940,7 +2058,28 @@ scanner_session_open (XdpScannerSession  *self,
+   launcher = g_subprocess_launcher_new (G_SUBPROCESS_FLAGS_NONE);
+   g_subprocess_launcher_take_fd (launcher, fds[1], SCANNER_HELPER_FD);
+ 
+-  helper = g_subprocess_launcher_spawn (launcher, error, helper_path, "session", sane_name, NULL);
++  {
++    g_autoptr(GPtrArray) argv = g_ptr_array_new_with_free_func (g_free);
++    g_autofree char *backend = g_strndup (sane_name, strchrnul (sane_name, ':') - sane_name);
++    const ScannerButtons *buttons = scanner_buttons_for (scanner_table_get (), backend);
++
++    g_ptr_array_add (argv, g_strdup (helper_path));
++    g_ptr_array_add (argv, g_strdup ("session"));
++    g_ptr_array_add (argv, g_strdup (sane_name));
++    if (buttons != NULL)
++      {
++        g_ptr_array_add (argv, g_strdup_printf ("--button-interval=%d", buttons->interval_ms));
++        if (buttons->trigger != NULL)
++          g_ptr_array_add (argv, g_strdup_printf ("--button-trigger=%s", buttons->trigger));
++        for (guint i = 0; i + 1 < buttons->options->len; i += 2)
++          g_ptr_array_add (argv, g_strdup_printf ("--button=%s=%s",
++                                                  (char *) g_ptr_array_index (buttons->options, i),
++                                                  (char *) g_ptr_array_index (buttons->options, i + 1)));
++      }
++    g_ptr_array_add (argv, NULL);
++
++    helper = g_subprocess_launcher_spawnv (launcher, (const char * const *) argv->pdata, error);
++  }
+   if (helper == NULL)
+     {
+       close (fds[0]);

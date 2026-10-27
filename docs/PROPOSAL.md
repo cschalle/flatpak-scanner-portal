@@ -97,10 +97,8 @@ What v1 leaves out on purpose, in the order it is worth doing. None of them brea
      `remember` option the application sets would let it decide for the user.
    - **Settings.** A panel to list and revoke grants, or the permission store's existing one.
 
-2. **Hardware buttons** (scan-to-application). They need a dispatch model of their own: which
-   application receives a press when several are running, and what the user is asked. SANE
-   has no uniform way to report them, since each backend exposes its buttons as options of its
-   own, so the portal needs a table of them like the one for capabilities.
+2. **Hardware buttons** (scan-to-application). Designed below, in three stages; the first is
+   built.
 3. **A native eSCL and IPP-Scan provider.** In v1 network scanners work through `sane-airscan`,
    which speaks eSCL, so this adds no scanners that are not reachable today. It would remove the
    dependency on a SANE backend for them and make a provider other than SANE real, which the
@@ -116,6 +114,70 @@ for film is given `flatbed`, a document application that asks for `any_capabilit
 and `adf` is already offered no film-only scanner, and still gets a flatbed with a transparency
 unit, which it should. An exclusion would only matter for an application that wants everything
 but one kind, and there is none yet.
+
+## Hardware buttons
+
+Some scanners have buttons, and an application can want to react to them: Negative Vibes would
+continue a multi-frame loop when the user presses QuickScan on the 8200i. SANE has no event for
+them. A backend that has buttons exposes them as sensor options (the Plustek 8200i has
+`intelliscan` and `scan`), which an application polls with `GetOptionValues` on an open
+session. That works in v1, and is the fallback for a backend the portal does not know, but it
+makes every application hold the scanner and the exclusive lock, poll over D-Bus several times a
+second, and know each backend's quirks. The portal does the polling instead.
+
+Network scanners are out of scope. eSCL has no push-scan event, `sane-airscan` exposes no buttons,
+and HP's scan-to-computer uses vendor mechanisms that SANE does not see. This is for USB scanners
+whose backend exposes sensors.
+
+**The signal.** One signal carries a press, however the application receives it:
+
+```
+ButtonEvent(session_handle, scanner_id, button, details)
+```
+
+`button` is a name from a small vocabulary: `scan`, `copy`, `email`, `pdf`, `file`, `extra`.
+`details` carries `option`, the backend's own option name (`intelliscan`), so that an
+application can tell the two buttons of the 8200i apart. The scanner's info gains `buttons`, the
+names it can report, so that an application shows "press Scan on the scanner" only when that
+works.
+
+**Detecting a press.** The helper polls the button options about four times a second while a
+session is open and no frame is running, since many backends cannot read a sensor in the middle of
+a scan: a press during a scan is lost. A press is a read of true after a read of false. That
+handles backends that latch (reading clears the value) and backends that report a held button.
+Some backends need a nudge first: the Pixma backend wants its `button-update` action pressed
+before `button-1` is valid. What is a button, what it is called in the vocabulary, the option to
+press first and the interval are per backend, in `scanner-devices.json`, in a `buttons` section.
+A backend that is not named there gets no `ButtonEvent`, and `buttons` is empty.
+
+**Stages.**
+
+1. **Events in a scan session.** The helper polls between frames and the frontend emits
+   `ButtonEvent` on the session that has the scanner open. Nothing new for an application to
+   call. This needs the table section, the polling, the signal and `buttons`.
+2. **Watching without holding the scanner.** `WatchButtons(session, scanner_id)` on a session
+   from `CreateSession`. The portal opens a watcher helper for the scanner. When an application
+   calls `OpenScanner`, the portal closes the watcher and opens it again after that session
+   closes, so the exclusive lock stays honest and `OpenScanner` is never refused by the
+   portal's own watcher.
+3. **Launch on press.** An application registers for a button, for example with a key in its
+   desktop file, and the portal starts it on a press, with a notification that lets the user
+   choose when several qualify. This depends on persistent grants, since the portal must know
+   the application and the scanner across launches.
+
+**Who gets a press.** All the sessions watching the scanner. The first `OpenScanner` wins and the
+others get `Busy`. The portal cannot know which window has focus on Wayland, so it does not guess.
+A notification that asks is the later refinement. A press goes only to an application that was
+granted the scanner; it tells it nothing a scan would not.
+
+**Rejected.** Leaving it to applications is the fallback above, not the design. Depending on
+`scanbd` is not an option for a portal: it is not installed by default, it has its own
+configuration, and it fights the portal over who opens the device.
+
+**Open.** Whether to send to all watchers or only to the newest. Whether the vocabulary is
+enough; `extra` and the raw option name cover the odd cases. Who keeps the per-backend table: it
+is in the same file as the film scanners. A host tool that holds the device, such as `scanbd`,
+will conflict with the portal, which the documentation should say.
 
 ## Architecture
 
