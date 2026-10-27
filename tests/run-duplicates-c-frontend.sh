@@ -1,6 +1,6 @@
 #!/bin/bash
 # SPDX-License-Identifier: LGPL-2.1-or-later
-# Run duplicates.py against the frontend written in C for xdg-desktop-portal, with a helper that
+# Run duplicates.py (which also checks that scanner-devices.json is read) against the frontend written in C for xdg-desktop-portal, with a helper that
 # finds one scanner through two drivers, the first of which cannot open it. On a private session bus
 # it starts the frontend with that helper,
 # the SANE `test` backend, and a stand-in for the dialog that grants without asking.
@@ -24,6 +24,20 @@ DBusName=org.freedesktop.impl.portal.desktop.nvtest
 Interfaces=org.freedesktop.impl.portal.Scanner
 UseIn=nvtest
 PORTAL
+  # The portal reads what it knows about scanners from a data directory. This file names the second
+  # fake scanner as a film scanner, has an entry that cannot be used, and keeps the default ranks.
+  mkdir -p "$tmp/share/xdg-desktop-portal"
+  cat > "$tmp/share/xdg-desktop-portal/scanner-devices.json" <<JSON
+{
+  "version": 1,
+  "scanners": [
+    { "capabilities": ["adf"] },
+    { "model_contains": "other", "name": "Fake Film Thing", "capabilities": ["film", "color"] }
+  ],
+  "driver_ranks": { "_comment": "not a number", "fakea": 0, "hpaio": 8 }
+}
+JSON
+  export XDG_DATA_DIRS=$tmp/share:/usr/local/share:/usr/share
   export SANE_CONFIG_DIR=$tmp/sane XDG_CURRENT_DESKTOP=nvtest XDG_DESKTOP_PORTAL_DIR=$tmp/portals
   # The frontend starts the permission store and the document portal; keep them off the real data
   export XDG_DATA_HOME=$tmp/data XDG_STATE_HOME=$tmp/state XDG_CACHE_HOME=$tmp/cache

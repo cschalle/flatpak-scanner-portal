@@ -1,0 +1,463 @@
+From 14aabcd859d503cd4d8ce2d0d9b06bbaa270ded8 Mon Sep 17 00:00:00 2001
+From: "Christian F.K. Schaller" <christian.schaller@gmail.com>
+Date: Tue, 27 Oct 2026 19:19:19 -0400
+Subject: [PATCH] scanner: Read what is known about scanners from a JSON file
+
+The film scanners the portal knows, and the ranks of the drivers, were a
+table in C. They are in scanner-devices.json now, which the portal reads from
+the data directories and reads again when it changes, so that a distribution
+or an administrator can ship a newer list without a new portal.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ data/meson.build                 |   5 +
+ data/scanner-devices.json        |  33 ++++
+ desktop-portal/scanner-devices.h |  71 ---------
+ desktop-portal/scanner.c         | 251 ++++++++++++++++++++++++++++---
+ 4 files changed, 264 insertions(+), 96 deletions(-)
+ create mode 100644 data/scanner-devices.json
+ delete mode 100644 desktop-portal/scanner-devices.h
+
+diff --git a/data/meson.build b/data/meson.build
+index 4c7aea1..64dc6f8 100644
+--- a/data/meson.build
++++ b/data/meson.build
+@@ -93,3 +93,8 @@ install_data(
+   ],
+   install_dir: datadir / 'dbus-1' / 'interfaces',
+ )
++
++# What the scanner portal knows about scanners, which the portal reads at run time
++install_data('scanner-devices.json',
++    install_dir: datadir / 'xdg-desktop-portal',
++)
+diff --git a/data/scanner-devices.json b/data/scanner-devices.json
+new file mode 100644
+index 0000000..319b423
+--- /dev/null
++++ b/data/scanner-devices.json
+@@ -0,0 +1,33 @@
++{
++  "_comment": "What the scanner portal knows about scanners that SANE does not say. A scanner is matched by its USB id (exact) or by a lower case part of 'vendor model' (a product line). The first match in the list wins, USB ids before product lines. Capabilities: film, infrared, flatbed, adf, color. A scanner that is not named here and is not film by its driver's type is assumed to be for documents. A flatbed with a transparency unit has both film and flatbed.",
++  "version": 1,
++  "scanners": [
++    { "usb_id": "07b3:1825", "name": "Plustek OpticFilm 8200i SE", "capabilities": ["film", "infrared", "color"] },
++
++    { "model_contains": "opticfilm", "capabilities": ["film", "color"] },
++    { "model_contains": "coolscan", "capabilities": ["film", "color"] },
++    { "model_contains": "dimage scan", "capabilities": ["film", "color"] },
++    { "model_contains": "scan elite", "capabilities": ["film", "color"] },
++    { "model_contains": "filmscan", "capabilities": ["film", "color"] },
++    { "model_contains": "primefilm", "capabilities": ["film", "color"] },
++    { "model_contains": "film scanner", "capabilities": ["film", "color"] },
++    { "model_contains": "slide scanner", "capabilities": ["film", "color"] },
++
++    { "model_contains": "perfection v370", "capabilities": ["flatbed", "film", "color"] },
++    { "model_contains": "perfection v500", "capabilities": ["flatbed", "film", "color"] },
++    { "model_contains": "perfection v550", "capabilities": ["flatbed", "film", "color"] },
++    { "model_contains": "perfection v600", "capabilities": ["flatbed", "film", "color"] },
++    { "model_contains": "perfection v700", "capabilities": ["flatbed", "film", "color"] },
++    { "model_contains": "perfection v750", "capabilities": ["flatbed", "film", "color"] },
++    { "model_contains": "perfection v800", "capabilities": ["flatbed", "film", "color"] },
++    { "model_contains": "perfection v850", "capabilities": ["flatbed", "film", "color"] }
++  ],
++  "driver_ranks": {
++    "_comment": "For a scanner that more than one driver found: the lower the better. Drivers that speak a standard protocol work on more scanners than the vendor's. A driver not named here ranks default_rank, and one that goes through another host comes last.",
++    "airscan": 0,
++    "escl": 1,
++    "hpaio": 8,
++    "net": 9
++  },
++  "default_rank": 2
++}
+diff --git a/desktop-portal/scanner-devices.h b/desktop-portal/scanner-devices.h
+deleted file mode 100644
+index 6a79868..0000000
+--- a/desktop-portal/scanner-devices.h
++++ /dev/null
+@@ -1,71 +0,0 @@
+-/* SPDX-License-Identifier: LGPL-2.1-or-later
+- * SPDX-FileCopyrightText: Copyright © the xdg-desktop-portal contributors
+- */
+-
+-/* What the portal knows about scanners that SANE does not say. SANE's device type is whatever
+- * the driver puts there: the Plustek OpticFilm 8200i is a "film scanner" to one driver and a
+- * flatbed to another, and a network scanner's type is its address. The portal gives
+- * applications capabilities they can filter on, so that a film application and a document
+- * application can each be offered the scanners they are for.
+- *
+- * A scanner is matched by its USB id, which is exact, or by a part of its vendor and model, which
+- * covers a product line. Film scanners are few, so naming them is feasible; a scanner that is not
+- * named here and is not film by its type is assumed to be for documents.
+- *
+- * The capabilities are separated by semicolons: film, infrared, flatbed, adf, color. A flatbed with
+- * a transparency unit has both film and flatbed.
+- */
+-
+-#pragma once
+-
+-typedef struct
+-{
+-  const char *usb_id;          /* "07b3:1825", lower case, or NULL */
+-  const char *model_contains;  /* lower case part of "vendor model", or NULL */
+-  const char *name;            /* a clean name to show, or NULL to keep the driver's */
+-  const char *capabilities;
+-} ScannerKnown;
+-
+-static const ScannerKnown scanner_known[] = {
+-  /* By USB id */
+-  { "07b3:1825", NULL, "Plustek OpticFilm 8200i SE", "film;infrared;color" },
+-
+-  /* Dedicated film scanners, by product line */
+-  { NULL, "opticfilm", NULL, "film;color" },
+-  { NULL, "coolscan", NULL, "film;color" },
+-  { NULL, "dimage scan", NULL, "film;color" },
+-  { NULL, "scan elite", NULL, "film;color" },
+-  { NULL, "filmscan", NULL, "film;color" },
+-  { NULL, "primefilm", NULL, "film;color" },
+-  { NULL, "film scanner", NULL, "film;color" },
+-  { NULL, "slide scanner", NULL, "film;color" },
+-
+-  /* Flatbeds with a transparency unit: for documents and for film */
+-  { NULL, "perfection v370", NULL, "flatbed;film;color" },
+-  { NULL, "perfection v500", NULL, "flatbed;film;color" },
+-  { NULL, "perfection v550", NULL, "flatbed;film;color" },
+-  { NULL, "perfection v600", NULL, "flatbed;film;color" },
+-  { NULL, "perfection v700", NULL, "flatbed;film;color" },
+-  { NULL, "perfection v750", NULL, "flatbed;film;color" },
+-  { NULL, "perfection v800", NULL, "flatbed;film;color" },
+-  { NULL, "perfection v850", NULL, "flatbed;film;color" },
+-};
+-
+-/* How a driver ranks for a scanner that more than one driver found: the lower the better. The
+- * drivers that speak a standard protocol to a network scanner work on more scanners and firmware
+- * than the vendor's. Drivers not named here rank in the middle, and a driver that goes through
+- * another host comes last. */
+-typedef struct
+-{
+-  const char *backend;
+-  int rank;
+-} ScannerBackendRank;
+-
+-#define SCANNER_DEFAULT_RANK 2
+-
+-static const ScannerBackendRank scanner_backend_ranks[] = {
+-  { "airscan", 0 },
+-  { "escl", 1 },
+-  { "hpaio", 8 },
+-  { "net", 9 },
+-};
+diff --git a/desktop-portal/scanner.c b/desktop-portal/scanner.c
+index 7c0832f..916cfad 100644
+--- a/desktop-portal/scanner.c
++++ b/desktop-portal/scanner.c
+@@ -17,12 +17,13 @@
+ #include <gio/gio.h>
+ #include <gio/gunixfdlist.h>
+ 
++#include <json-glib/json-glib.h>
++
+ #include "xdp-context.h"
+ #include "xdp-dbus.h"
+ #include "xdp-impl-dbus.h"
+ #include "xdp-portal-config.h"
+ #include "scanner-protocol.h"
+-#include "scanner-devices.h"
+ #include "xdp-request.h"
+ #include "xdp-session.h"
+ #include "xdp-utils.h"
+@@ -153,41 +154,242 @@ scanner_device_free (ScannerDevice *device)
+ 
+ G_DEFINE_AUTOPTR_CLEANUP_FUNC (ScannerDevice, scanner_device_free)
+ 
++/* What the portal knows about scanners that SANE does not say, from scanner-devices.json. A
++ * scanner is matched by its USB id, which is exact, or by a part of its vendor and model, which
++ * covers a product line. Film scanners are few, so naming them is feasible; a scanner that is not
++ * named and is not film by its type is assumed to be for documents. The file is looked for in the
++ * data directories, so that a distribution or an administrator can ship a newer one, and it is read
++ * again when it changes, so that the portal does not have to restart. */
++#define SCANNER_DEFAULT_RANK 2
++#define SCANNER_DEVICES_FILE "scanner-devices.json"
++
++typedef struct
++{
++  char *usb_id;         /* lower case, or NULL */
++  char *model_contains; /* lower case, or NULL */
++  char *name;           /* a clean name to show, or NULL to keep the driver's */
++  char **capabilities;
++} ScannerKnown;
++
++typedef struct
++{
++  GPtrArray *known;     /* ScannerKnown */
++  GHashTable *ranks;    /* backend (char *) -> rank (GINT_TO_POINTER) */
++  int default_rank;
++  char *path;
++  gint64 mtime;
++} ScannerTable;
++
++static void
++scanner_known_free (ScannerKnown *known)
++{
++  g_free (known->usb_id);
++  g_free (known->model_contains);
++  g_free (known->name);
++  g_strfreev (known->capabilities);
++  g_free (known);
++}
++
++static void
++scanner_table_free (ScannerTable *table)
++{
++  g_clear_pointer (&table->known, g_ptr_array_unref);
++  g_clear_pointer (&table->ranks, g_hash_table_unref);
++  g_free (table->path);
++  g_free (table);
++}
++
++static char *
++scanner_table_find_file (void)
++{
++  const char * const *dirs = g_get_system_data_dirs ();
++  g_autofree char *builtin = g_build_filename (DATADIR, "xdg-desktop-portal", SCANNER_DEVICES_FILE, NULL);
++
++  for (size_t i = 0; dirs[i] != NULL; i++)
++    {
++      char *path = g_build_filename (dirs[i], "xdg-desktop-portal", SCANNER_DEVICES_FILE, NULL);
++
++      if (g_file_test (path, G_FILE_TEST_IS_REGULAR))
++        return path;
++      g_free (path);
++    }
++
++  return g_file_test (builtin, G_FILE_TEST_IS_REGULAR) ? g_steal_pointer (&builtin) : NULL;
++}
++
++static ScannerKnown *
++scanner_known_from_json (JsonObject *object)
++{
++  ScannerKnown *known;
++  JsonArray *caps;
++  const char *usb_id = json_object_has_member (object, "usb_id") ? json_object_get_string_member (object, "usb_id") : NULL;
++  const char *model = json_object_has_member (object, "model_contains") ? json_object_get_string_member (object, "model_contains") : NULL;
++  const char *name = json_object_has_member (object, "name") ? json_object_get_string_member (object, "name") : NULL;
++  g_autoptr(GPtrArray) names = g_ptr_array_new ();
++
++  if (usb_id == NULL && model == NULL)
++    return NULL;
++  if (!json_object_has_member (object, "capabilities") ||
++      (caps = json_object_get_array_member (object, "capabilities")) == NULL)
++    return NULL;
++
++  known = g_new0 (ScannerKnown, 1);
++  known->usb_id = usb_id != NULL ? g_ascii_strdown (usb_id, -1) : NULL;
++  known->model_contains = model != NULL ? g_ascii_strdown (model, -1) : NULL;
++  known->name = g_strdup (name);
++  for (guint i = 0; i < json_array_get_length (caps); i++)
++    {
++      const char *cap = json_array_get_string_element (caps, i);
++
++      if (cap != NULL)
++        g_ptr_array_add (names, g_strdup (cap));
++    }
++  g_ptr_array_add (names, NULL);
++  known->capabilities = (char **) g_ptr_array_free (g_steal_pointer (&names), FALSE);
++
++  return known;
++}
++
++/* Reads the file. A file that cannot be read or parsed gives an empty table, so that every scanner
++ * is for documents, and says why. */
++static ScannerTable *
++scanner_table_load (const char *path,
++                    gint64      mtime)
++{
++  ScannerTable *table = g_new0 (ScannerTable, 1);
++  g_autoptr(JsonParser) parser = json_parser_new ();
++  g_autoptr(GError) error = NULL;
++  JsonNode *root;
++
++  table->known = g_ptr_array_new_with_free_func ((GDestroyNotify) scanner_known_free);
++  table->ranks = g_hash_table_new_full (g_str_hash, g_str_equal, g_free, NULL);
++  table->default_rank = SCANNER_DEFAULT_RANK;
++  table->path = g_strdup (path);
++  table->mtime = mtime;
++
++  if (path == NULL)
++    {
++      g_warning ("[scanner] No %s in the data directories: scanners are not told apart by type",
++                 SCANNER_DEVICES_FILE);
++      return table;
++    }
++
++  if (!json_parser_load_from_file (parser, path, &error) ||
++      (root = json_parser_get_root (parser)) == NULL || !JSON_NODE_HOLDS_OBJECT (root))
++    {
++      g_warning ("[scanner] Cannot use %s: %s", path, error != NULL ? error->message : "not an object");
++      return table;
++    }
++
++  {
++    JsonObject *object = json_node_get_object (root);
++
++    if (json_object_has_member (object, "scanners"))
++      {
++        JsonArray *list = json_object_get_array_member (object, "scanners");
++
++        for (guint i = 0; list != NULL && i < json_array_get_length (list); i++)
++          {
++            JsonObject *entry = json_array_get_object_element (list, i);
++            ScannerKnown *known = entry != NULL ? scanner_known_from_json (entry) : NULL;
++
++            if (known != NULL)
++              g_ptr_array_add (table->known, known);
++            else
++              g_warning ("[scanner] %s: ignoring entry %u, which has no usb_id or model_contains and capabilities", path, i);
++          }
++      }
++
++    if (json_object_has_member (object, "default_rank"))
++      table->default_rank = (int) json_object_get_int_member (object, "default_rank");
++
++    if (json_object_has_member (object, "driver_ranks"))
++      {
++        JsonObject *ranks = json_object_get_object_member (object, "driver_ranks");
++        g_autoptr(GList) members = ranks != NULL ? json_object_get_members (ranks) : NULL;
++
++        for (GList *l = members; l != NULL; l = l->next)
++          {
++            JsonNode *node = json_object_get_member (ranks, l->data);
++
++            /* "_comment" and anything else that is not a number */
++            if (node != NULL && JSON_NODE_HOLDS_VALUE (node) && json_node_get_value_type (node) == G_TYPE_INT64)
++              g_hash_table_insert (table->ranks, g_strdup (l->data),
++                                   GINT_TO_POINTER ((int) json_node_get_int (node)));
++          }
++      }
++  }
++
++  g_debug ("[scanner] Read %u known scanners and %u driver ranks from %s",
++           table->known->len, g_hash_table_size (table->ranks), path);
++  return table;
++}
++
++/* The table as the file has it now, read again when the file is new or changed. The pointer stays
++ * valid until the next call, which is made from the main thread only. */
++static const ScannerTable *
++scanner_table_get (void)
++{
++  static ScannerTable *table = NULL;
++  g_autofree char *path = scanner_table_find_file ();
++  gint64 mtime = 0;
++
++  if (path != NULL)
++    {
++      g_autoptr(GFile) file = g_file_new_for_path (path);
++      g_autoptr(GFileInfo) info = g_file_query_info (file, G_FILE_ATTRIBUTE_TIME_MODIFIED,
++                                                     G_FILE_QUERY_INFO_NONE, NULL, NULL);
++
++      if (info != NULL)
++        mtime = g_file_info_get_attribute_uint64 (info, G_FILE_ATTRIBUTE_TIME_MODIFIED);
++    }
++
++  if (table != NULL && g_strcmp0 (table->path, path) == 0 && table->mtime == mtime)
++    return table;
++
++  g_clear_pointer (&table, scanner_table_free);
++  table = scanner_table_load (path, mtime);
++  return table;
++}
++
+ static const ScannerKnown *
+-scanner_known_lookup (const char *usb_id,
+-                      const char *vendor,
+-                      const char *model)
++scanner_known_lookup (const ScannerTable *table,
++                      const char         *usb_id,
++                      const char         *vendor,
++                      const char         *model)
+ {
+   g_autofree char *joined = g_strdup_printf ("%s %s", vendor ? vendor : "", model ? model : "");
+   g_autofree char *full = g_ascii_strdown (joined, -1);
+ 
+-  for (size_t i = 0; i < G_N_ELEMENTS (scanner_known); i++)
++  for (guint i = 0; i < table->known->len; i++)
+     {
+-      if (scanner_known[i].usb_id != NULL && usb_id != NULL &&
+-          g_ascii_strcasecmp (scanner_known[i].usb_id, usb_id) == 0)
+-        return &scanner_known[i];
++      const ScannerKnown *known = g_ptr_array_index (table->known, i);
++
++      if (known->usb_id != NULL && usb_id != NULL && g_ascii_strcasecmp (known->usb_id, usb_id) == 0)
++        return known;
+     }
+ 
+-  for (size_t i = 0; i < G_N_ELEMENTS (scanner_known); i++)
++  for (guint i = 0; i < table->known->len; i++)
+     {
+-      if (scanner_known[i].model_contains != NULL &&
+-          strstr (full, scanner_known[i].model_contains) != NULL)
+-        return &scanner_known[i];
++      const ScannerKnown *known = g_ptr_array_index (table->known, i);
++
++      if (known->model_contains != NULL && strstr (full, known->model_contains) != NULL)
++        return known;
+     }
+ 
+   return NULL;
+ }
+ 
+ static int
+-scanner_backend_rank (const char *backend)
++scanner_backend_rank (const ScannerTable *table,
++                      const char         *backend)
+ {
+-  for (size_t i = 0; backend != NULL && i < G_N_ELEMENTS (scanner_backend_ranks); i++)
+-    {
+-      if (g_strcmp0 (scanner_backend_ranks[i].backend, backend) == 0)
+-        return scanner_backend_ranks[i].rank;
+-    }
++  gpointer rank;
+ 
+-  return SCANNER_DEFAULT_RANK;
++  if (backend != NULL && g_hash_table_lookup_extended (table->ranks, backend, NULL, &rank))
++    return GPOINTER_TO_INT (rank);
++
++  return table->default_rank;
+ }
+ 
+ /* From one entry of the helper's list: an id, the SANE name and the information vardict. What the
+@@ -201,6 +403,7 @@ scanner_device_new_from_helper (const char *id,
+   ScannerDevice *device = g_new0 (ScannerDevice, 1);
+   g_auto(GVariantDict) dict = G_VARIANT_DICT_INIT (info);
+   g_autoptr(GPtrArray) caps = g_ptr_array_new_with_free_func (g_free);
++  const ScannerTable *table = scanner_table_get ();
+   const ScannerKnown *known;
+   const char *physical = NULL;
+   const char *usb_id = NULL;
+@@ -215,13 +418,11 @@ scanner_device_new_from_helper (const char *id,
+   g_variant_dict_lookup (&dict, "model", "&s", &model);
+   g_variant_dict_lookup (&dict, "backend", "&s", &backend);
+ 
+-  known = scanner_known_lookup (usb_id, vendor, model);
++  known = scanner_known_lookup (table, usb_id, vendor, model);
+   if (known != NULL)
+     {
+-      g_auto(GStrv) names = g_strsplit (known->capabilities, ";", -1);
+-
+-      for (size_t i = 0; names[i] != NULL; i++)
+-        g_ptr_array_add (caps, g_strdup (names[i]));
++      for (size_t i = 0; known->capabilities[i] != NULL; i++)
++        g_ptr_array_add (caps, g_strdup (known->capabilities[i]));
+       if (known->name != NULL)
+         g_variant_dict_insert (&dict, "name", "s", known->name);
+     }
+@@ -245,7 +446,7 @@ scanner_device_new_from_helper (const char *id,
+ 
+   device->physical = g_strdup (physical);
+   device->sane_name = g_strdup (sane_name);
+-  device->rank = scanner_backend_rank (backend);
++  device->rank = scanner_backend_rank (table, backend);
+   device->candidates = g_ptr_array_new_with_free_func ((GDestroyNotify) scanner_candidate_free);
+   {
+     ScannerCandidate *candidate = g_new0 (ScannerCandidate, 1);

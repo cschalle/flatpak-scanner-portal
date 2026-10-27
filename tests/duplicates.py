@@ -16,10 +16,18 @@ def main():
           code == 0 and len(scanners) == 2, (code, names))
     for s in scanners:
         check("the entry has no address or bookkeeping", "physical" not in s[1] and "usb_id" not in s[1], s[1])
-        check("the entry is for documents", "flatbed" in s[1]["capabilities"], s[1])
+    film = [s for s in scanners if s[1]["name"] == "Fake Film Thing"]
+    check("scanner-devices.json names a scanner and gives it capabilities",
+          len(film) == 1 and film[0][1]["capabilities"] == ["film", "color"], names)
+    others = [s for s in scanners if s not in film]
+    check("a scanner it does not name is for documents",
+          len(others) == 1 and others[0][1]["capabilities"] == ["flatbed"], others)
     listed = c.call("ListScanners", ({},), "(a{sv})")[0]
     check("ListScanners lists them the same", len(listed) == 2, listed)
 
+    # An entry of the file that has nothing to match on is ignored, not taken for everything
+    check("an unusable entry of the file does not apply to every scanner",
+          not any("adf" in s[1]["capabilities"] for s in scanners), scanners)
     copier = [s for s in scanners if "Copier" in s[1]["name"] or "copier" in s[1]["name"]]
     check("the scanner both drivers found is there once", len(copier) == 1, names)
     sess = c.open(copier[0][0], "dup")

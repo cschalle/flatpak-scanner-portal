@@ -6,6 +6,7 @@
 #
 #   XDP_BUILD=/path/to/xdg-desktop-portal/build tests/run-scenarios-c-frontend.sh
 #
+# XDP_SCANNER_DEVICES is the scanner-devices.json to use, by default the one next to the build.
 # XDP_BUILD is a meson build directory of the scanner-frontend branch (build it with
 # -Dsane=enabled).
 set -e
@@ -23,6 +24,10 @@ DBusName=org.freedesktop.impl.portal.desktop.nvtest
 Interfaces=org.freedesktop.impl.portal.Scanner
 UseIn=nvtest
 PORTAL
+  # What the portal knows about scanners comes from a data directory: the file in the source tree
+  mkdir -p "$tmp/share/xdg-desktop-portal"
+  cp "${XDP_SCANNER_DEVICES:-$XDP_BUILD/../data/scanner-devices.json}" "$tmp/share/xdg-desktop-portal/"
+  export XDG_DATA_DIRS=$tmp/share:/usr/local/share:/usr/share
   export SANE_CONFIG_DIR=$tmp/sane XDG_CURRENT_DESKTOP=nvtest XDG_DESKTOP_PORTAL_DIR=$tmp/portals
   # The frontend starts the permission store and the document portal; keep them off the real data
   export XDG_DATA_HOME=$tmp/data XDG_STATE_HOME=$tmp/state XDG_CACHE_HOME=$tmp/cache

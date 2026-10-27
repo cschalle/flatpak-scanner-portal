@@ -105,9 +105,11 @@ What v1 leaves out on purpose, in the order it is worth doing. None of them brea
    which speaks eSCL, so this adds no scanners that are not reachable today. It would remove the
    dependency on a SANE backend for them and make a provider other than SANE real, which the
    option model is meant to allow.
-4. **The curation table as data.** The film scanners the portal knows are a table in C. Moving
-   it to a file shipped with the portal, or to SANE's own description files if the project takes
-   a capability field, would let it be updated without a new portal. See open question 13.
+4. **The curation table upstream.** The film scanners the portal knows are in
+   `scanner-devices.json`, which the portal reads from the data directories and again when it
+   changes, so a distribution or an administrator can ship a newer list without a new portal.
+   What is left is where the list should live: with the portal, or in SANE's own description
+   files if the project takes a capability field. See open question 13.
 
 Considered and left out: an `excluded_capabilities` option. Because a scanner not known to be
 for film is given `flatbed`, a document application that asks for `any_capabilities` of `flatbed`
@@ -339,16 +341,16 @@ instant, and any provider other than SANE.
 13. **Where do `capabilities` come from?** Not from SANE, whose device type says little and
     differs between drivers: one calls a Plustek OpticFilm a film scanner and another a flatbed,
     and `airscan` gives its address. The frontend keeps a list of the scanners that are for
-    film, by USB id or by product line (`desktop-portal/scanner-devices.h`), and assumes that a
+    film, by USB id or by product line (`data/scanner-devices.json`, read at run time), and assumes that a
     scanner not known to be only for film is for documents, so it has `flatbed` unless its
     driver says it is a sheet feeder. Film scanners are few and a film application is the one
     that needs them found, so a list is feasible, where a list of document scanners would not
     be. A flatbed with a transparency unit has both `film` and `flatbed`. This makes
     `required_capabilities` reliable, and `any_capabilities` lets an application for documents
     ask for `flatbed` or `adf`, so neither kind of application needs to exclude the other's
-    scanners. What is open is who keeps the list: it could be shipped as data and updated with
-    the portal, or live in SANE's own description files if the SANE project takes a capability
-    field.
+    scanners. The list is data, in a file that can be updated without a new portal. What is open is
+    who keeps it: the portal, or SANE's own description files if the SANE project takes a
+    capability field.
 14. **The same scanner twice.** A network printer is found by an eSCL driver and by the vendor's,
     and a USB scanner by more than one backend. The helper reports which physical scanner a
     device is (the USB bus address, or the host of a network scanner), and the frontend gives
