@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: LGPL-2.1-or-later
 # portal-hw-check.sh: the scanner portal prototype against libsane, on the OpticFilm 8200i.
 #
 # Scans the same frame the direct way (libsane in the app) and through the portal prototype,

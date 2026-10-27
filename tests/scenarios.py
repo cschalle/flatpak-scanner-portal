@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: LGPL-2.1-or-later
 """Failure-path and lifecycle checks for the prototype scanner portal.
 
 Run through run-scenarios.sh, which starts a private session bus, the service and the

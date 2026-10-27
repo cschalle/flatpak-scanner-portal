@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: LGPL-2.1-or-later
 """Minimal blocking D-Bus client for the prototype scanner portal (Gio), shared by the
 scenario checks and the hardware checks."""
 import os, sys, time

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: LGPL-2.1-or-later
 """H4 through the portal, on a real scanner: cancel a big scan part-way, then scan again.
 
 Needs a running prototype service (see tools/portal-hw-check.sh). Cancels a frame at about

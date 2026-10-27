@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: LGPL-2.1-or-later
 # Builds xdg-desktop-portal, xdg-desktop-portal-gnome and xdg-desktop-portal-gtk for Fedora 44 with
 # the scanner portal patches, into a local repository.
 #

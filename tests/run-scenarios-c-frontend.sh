@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: LGPL-2.1-or-later
 # Run scenarios.py against the frontend written in C for xdg-desktop-portal, instead of against
 # the prototype service. On a private session bus it starts the frontend with its scanner helper,
 # the SANE `test` backend, and a stand-in for the dialog that grants without asking.

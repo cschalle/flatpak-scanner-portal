@@ -46,6 +46,12 @@ patches:
 the main branch at the time they were made (4907561, f613aa2 and 5409af7). Nothing is pushed to
 the upstream projects yet.
 
+## License
+
+LGPL-2.1-or-later, the license of xdg-desktop-portal, in `COPYING`: the interface files, the tests,
+the tools and the documentation. The patches are under the license of the package they patch.
+Negative Vibes and Simple Scan have their own.
+
 ## Tests
 
 The scenario checks need `dbus-run-session`, python3 with PyGObject, and libsane with its `test`

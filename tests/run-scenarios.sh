@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: LGPL-2.1-or-later
 # Start a private session bus with the prototype service on the SANE test backend,
 # and run scenarios.py against it. Build first, in the negative-vibes checkout:
 # cargo build -p nv-portal-proto. NEGATIVE_VIBES_DIR names it (default ../negative-vibes).

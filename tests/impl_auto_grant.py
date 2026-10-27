@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: LGPL-2.1-or-later
 """Test double for org.freedesktop.impl.portal.Scanner, the part of the portal that draws the dialog.
 
 It shows nothing and answers at once: it grants the first scanner it is offered, or every scanner
