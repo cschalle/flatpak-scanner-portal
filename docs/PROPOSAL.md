@@ -49,16 +49,71 @@ the same kind of consent question, has none.
   and backend-specific options all survive it.
 - Simple applications stay simple: well-known option names mean a "resolution and mode" UI
   needs no special cases.
+- One entry per physical scanner, with capabilities the portal sets. SANE reports a network
+  printer once for each driver that finds it, and its device type differs between drivers, so
+  the portal merges the duplicates, tries the drivers in rank order and says which scanners are
+  for film, so that a film application and a document application are each offered theirs.
 
-## Non-goals for v1
+## Non-goals
 
-- Scanner **discovery** by sandboxed applications. An application sees only what it was
-  granted, never a list of what is on the network.
-- **Hardware buttons** (scan-to-application), which need a dispatch model of their own.
-- **eSCL / IPP-Scan** as a provider, though the model is meant to allow it later.
-- A **per-scan prompt**. Scanning requires a physical action by the user, so the grant is the
-  consent; see the decisions table.
-- **Persistent grants** and a permission store table. See open question 8.
+- Scanner **discovery** by sandboxed applications. The portal searches and the dialog shows the
+  user what it found, but the application is handed only the scanners the user chose, never a
+  list of what is on the network.
+- A **per-scan prompt**. The grant is the consent, and the dialog names the scanner. What an
+  application can do with a grant is limited to what is on the glass or in the feeder, which is
+  why one choice is proportionate; see the decisions table.
+- **Scanner setup**: adding a network scanner, installing a driver or editing SANE's
+  configuration. The portal uses what the host has already set up.
+- **Sharing one scanner between applications at the same time.** The lock is exclusive; see
+  open question 6.
+- **Image processing**: OCR, file formats, colour management, cropping. The portal returns
+  frames as the scanner produced them and applications do the rest.
+- **Scanners that SANE does not drive**, such as WIA. Provided by another provider later, if at
+  all; see phase 2.
+- **Fixing SANE's device metadata upstream.** The portal corrects what it needs in its own
+  table instead, since a change to SANE's API would have to keep every existing application
+  working.
+
+## Phase 2
+
+What v1 leaves out on purpose, in the order it is worth doing. None of them breaks what v1 defines; some add to it.
+
+1. **Persistent grants.** The most important item. In v1 a grant lasts while the application is
+   on the bus, so the user chooses the scanner on every launch. That costs a dialog each time
+   and means the Problem section's "the user cannot see or revoke which applications may scan"
+   is only half answered: closing the application is the only revocation. Phase 2 stores the
+   grant in the permission store, in a `scanner` table keyed by the scanner's id, adds a
+   `remember` option to `SelectScanners`, and gives the user a place in Settings to review and
+   revoke. It needs more than a table and a dialog checkbox:
+
+   - **A stable id.** The id today comes from the USB bus and device number, or the host
+     address, which is right for merging duplicates within a run and wrong for remembering
+     anything: both change when a scanner is replugged, rebooted or given a new DHCP lease. A
+     stored grant needs a key that survives that: for USB the vendor and product id with the
+     serial number, or the port path when there is none, and for a network scanner the name it
+     advertises (the eSCL service name carries a part of the MAC address), not its address.
+   - **The user decides, not the application.** The choice to remember belongs in the dialog,
+     as a switch, so the backend interface gains an answer field and both dialogs change. A
+     `remember` option the application sets would let it decide for the user.
+   - **Settings.** A panel to list and revoke grants, or the permission store's existing one.
+
+2. **Hardware buttons** (scan-to-application). They need a dispatch model of their own: which
+   application receives a press when several are running, and what the user is asked. SANE
+   has no uniform way to report them, since each backend exposes its buttons as options of its
+   own, so the portal needs a table of them like the one for capabilities.
+3. **A native eSCL and IPP-Scan provider.** In v1 network scanners work through `sane-airscan`,
+   which speaks eSCL, so this adds no scanners that are not reachable today. It would remove the
+   dependency on a SANE backend for them and make a provider other than SANE real, which the
+   option model is meant to allow.
+4. **The curation table as data.** The film scanners the portal knows are a table in C. Moving
+   it to a file shipped with the portal, or to SANE's own description files if the project takes
+   a capability field, would let it be updated without a new portal. See open question 13.
+
+Considered and left out: an `excluded_capabilities` option. Because a scanner not known to be
+for film is given `flatbed`, a document application that asks for `any_capabilities` of `flatbed`
+and `adf` is already offered no film-only scanner, and still gets a flatbed with a transparency
+unit, which it should. An exclusion would only matter for an application that wants everything
+but one kind, and there is none yet.
 
 ## Architecture
 
@@ -98,7 +153,7 @@ Consent and enumeration:
 
 | Member | Purpose |
 |---|---|
-| `SelectScanners(parent_window, options) → Request` | Shows the dialog and records the grant for the application's connection. Called on a user action, or when `ListScanners` comes back empty, which is the case on every start while grants are not remembered. `options` can ask for `multiple` and filter on `required_capabilities` (`film`, `adf`, `infrared`, `flatbed`, `color`). |
+| `SelectScanners(parent_window, options) → Request` | Shows the dialog and records the grant for the application's connection. Called on a user action, or when `ListScanners` comes back empty, which is the case on every start while grants are not remembered. `options` can ask for `multiple` and filter on `required_capabilities` (all of them) or `any_capabilities` (at least one of them), from `film`, `adf`, `infrared`, `flatbed`, `color`. |
 | `ListScanners(options) → a(sa{sv})` | The granted, currently available scanners. Each is an opaque id plus `name`, `vendor`, `model`, `backend`, `kind`, `type`, `capabilities`, `available`. |
 | `CreateSession(options) → Session` | A monitoring session, needed only for `ScannerEvents`. |
 | `ScannerEvents(session, a(ssa{sv}))` | `add`, `change` or `remove` for granted scanners only. |
@@ -160,8 +215,8 @@ memory for as long as the application stays on the bus; nothing is written to di
 | Opaque scanner ids, never raw SANE device names | Some backends interpret device names as file paths or network addresses. Handing an application control of that string lets it steer the host at arbitrary files and hosts. |
 | The application sees only granted scanners | Enumerating the LAN's scanners is a fingerprinting and privacy problem, and not something an application needs before the user has chosen anything. |
 | A `Session` for an open scanner | Lifecycle comes for free: the application exiting releases the hardware lock, and the portal can revoke access with `Session.Closed`. |
-| No per-scan prompt once granted | Scanning needs the user to put something in the scanner, so it cannot happen unnoticed; one choice per run of the application is proportionate. Open to argument if reviewers disagree. |
-| Grants last for the application's run and are kept in memory | The print portal asks every time and keeps nothing, and scanning is an occasional, deliberate act like printing, so a dialog at the start of a scanning session is the expected cost. It removes the permission table, a revocation path and a settings panel from v1, and the user's only revocation is to close the application. Remembering the choice can be added later without changing the API; see open question 8. |
+| No per-scan prompt once granted | An application with a grant can scan only what is on the glass or in the feeder, and the dialog names the scanner, so one choice per run of the application is proportionate. It is not true that a scan cannot happen unnoticed: a page left in the scanner can be read. The exposure is small, and a prompt for every scan would make the scanning applications unusable. Open to argument if reviewers disagree. |
+| Grants last for the application's run and are kept in memory | The print portal asks every time and keeps nothing, and scanning is an occasional, deliberate act like printing, so a dialog at the start of a scanning session is the expected cost. It removes the permission table, a revocation path and a settings panel from v1, and the user's only revocation is to close the application. Remembering the choice is the first item of phase 2 and does not change the API; see open question 8. |
 | The backend does UI only | Same split as `org.freedesktop.impl.portal.Usb`, and it keeps libsane out of the desktop shell's process as well as out of the frontend's. |
 
 ## Security and privacy
