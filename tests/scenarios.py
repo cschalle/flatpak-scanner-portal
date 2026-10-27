@@ -52,6 +52,21 @@ def main():
     check("... and nothing is granted for it", film.call("ListScanners", ({},), "(a{sv})")[0] == [])
     film.bus.close_sync(None)
 
+    # ---- an app for documents is offered it: a scanner that is not known to be for film only is
+    # assumed to be a flatbed, whatever its driver says
+    doc = Client()
+    code, results = doc.select(any_capabilities=v("as", ["flatbed", "adf"]))
+    got = results.get("scanners", [])
+    check("a scanner not known to be film is offered to an application that wants flatbed or adf",
+          code == 0 and [s[0] for s in got] == [sid], (code, results))
+    check("... with the flatbed capability", bool(got) and "flatbed" in got[0][1].get("capabilities", []), got)
+    check("... and without the portal's own bookkeeping", bool(got) and "physical" not in got[0][1] and "usb_id" not in got[0][1], got)
+    doc.bus.close_sync(None)
+    docs = Client()
+    code, results = docs.select(required_capabilities=v("as", ["flatbed"]), any_capabilities=v("as", ["film"]))
+    check("required and any are both applied", code != 0 and not results.get("scanners"), (code, results))
+    docs.bus.close_sync(None)
+
     # ---- permissions
     check("OpenScanner on a scanner that was never granted is NotAllowed", (c.error("OpenScanner", ("deadbeef", {}), "(sa{sv})") or "").endswith("Error.NotAllowed"))
     bad_token = c.error("SelectScanners", ("", {"handle_token": v("s", "has space")}), "(sa{sv})")

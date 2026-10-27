@@ -80,6 +80,16 @@
           values: ``film`` (transparency unit), ``adf``, ``infrared``,
           ``flatbed``, ``color``. Unknown values are ignored.
 
+        * ``any_capabilities`` (``as``)
+
+          Only offer scanners that have at least one of these capabilities,
+          with the same values. It is applied together with
+          ``required_capabilities``. An application for documents asks for
+          ``['flatbed', 'adf']``, one for film for ``film`` in
+          ``required_capabilities``, and neither is offered the other's
+          scanners. A flatbed with a transparency unit has both, and is
+          offered to both.
+
         The following results get returned via the :ref:`org.freedesktop.portal.Request::Response` signal:
 
         * ``scanners`` (``a(sa{sv})``)
@@ -104,6 +114,12 @@
         that are currently available. The scanner id is opaque and stable
         across sessions for the same physical scanner where the backend
         allows it. Applications must not construct ids.
+
+        A physical scanner is listed once, however many drivers find it, as
+        a network printer is by both an eSCL and a vendor driver. The portal
+        opens it with the driver that ranks best, and with the next one if
+        that cannot open it, so an application does not see a driver that
+        does not work.
 
         Keys in the information vardict:
 
@@ -136,7 +152,12 @@
         * ``capabilities`` (``as``)
 
           Same vocabulary as ``required_capabilities`` in SelectScanners().
-          Capabilities are hints; GetOptions() is authoritative.
+          The portal sets them, not the driver: it knows which scanners are
+          for film, by USB id or by product line, and assumes that a scanner
+          it does not know to be for film only is for documents, so it has
+          ``flatbed`` unless its driver says it is a sheet feeder. They are
+          reliable enough to filter on; GetOptions() is still authoritative
+          for what an opened scanner can do.
 
         * ``available`` (``b``)
 

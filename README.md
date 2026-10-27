@@ -25,6 +25,7 @@ patches for the three portals. The applications that use it are separate project
 | `tests/impl_auto_grant.py` | A stand-in for the dialog that grants without asking |
 | `tests/run-scenarios.sh` | The checks against the prototype service |
 | `tests/run-scenarios-c-frontend.sh` | The checks against the frontend in C |
+| `tests/duplicates.py`, `run-duplicates-c-frontend.sh` | A scanner found by two drivers is one, and opening falls back to the next driver |
 | `tools/portal-hw-check.sh` | The portal against libsane on the 8200i |
 | `patches/` | The scanner patches for xdg-desktop-portal, -gnome and -gtk, as files |
 | `rpm/build.sh` | Builds the three portals with the patches as RPMs for Fedora 44 |
@@ -38,7 +39,7 @@ patches:
 
 | Package | `<release>/` | `main/` |
 |---|---|---|
-| xdg-desktop-portal | 1.22.1 (11 patches) | main (11) |
+| xdg-desktop-portal | 1.22.1 (12 patches) | main (12) |
 | xdg-desktop-portal-gnome | 50.0 (4) | main (4) |
 | xdg-desktop-portal-gtk | 1.15.3 (2) | main (2) |
 

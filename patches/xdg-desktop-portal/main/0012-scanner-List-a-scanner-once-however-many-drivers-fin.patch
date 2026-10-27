@@ -1,0 +1,723 @@
+From 631b8f42e5e1e46fb6e02cb7e8c8590834ebd83f Mon Sep 17 00:00:00 2001
+From: "Christian F.K. Schaller" <christian.schaller@gmail.com>
+Date: Tue, 27 Oct 2026 15:25:53 -0400
+Subject: [PATCH] scanner: List a scanner once however many drivers find it,
+ and know which are for film
+
+A network printer is found by both an eSCL and a vendor driver, and the vendor
+one may not be able to open it. The helper now says which physical scanner a
+device is, by USB bus address or network host. The portal gives such scanners
+one id, offers the dialog one entry, ranks the drivers and opens the scanner
+with the next one when the best cannot.
+
+SANE's device type does not say which scanners are for film: one driver calls a
+Plustek OpticFilm a film scanner and another a flatbed. The portal has a list
+of film scanners and flatbeds with a transparency unit, and assumes that a
+scanner it does not know to be for film only is for documents, so capabilities
+can be used to filter. SelectScanners also takes any_capabilities.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ data/org.freedesktop.portal.Scanner.xml |  23 +-
+ desktop-portal/scanner-devices.h        |  71 +++++++
+ desktop-portal/scanner-helper.c         | 100 +++++++++
+ desktop-portal/scanner.c                | 269 +++++++++++++++++++++---
+ 4 files changed, 438 insertions(+), 25 deletions(-)
+ create mode 100644 desktop-portal/scanner-devices.h
+
+diff --git a/data/org.freedesktop.portal.Scanner.xml b/data/org.freedesktop.portal.Scanner.xml
+index 908d5c7..160b79f 100644
+--- a/data/org.freedesktop.portal.Scanner.xml
++++ b/data/org.freedesktop.portal.Scanner.xml
+@@ -80,6 +80,16 @@
+           values: ``film`` (transparency unit), ``adf``, ``infrared``,
+           ``flatbed``, ``color``. Unknown values are ignored.
+ 
++        * ``any_capabilities`` (``as``)
++
++          Only offer scanners that have at least one of these capabilities,
++          with the same values. It is applied together with
++          ``required_capabilities``. An application for documents asks for
++          ``['flatbed', 'adf']``, one for film for ``film`` in
++          ``required_capabilities``, and neither is offered the other's
++          scanners. A flatbed with a transparency unit has both, and is
++          offered to both.
++
+         The following results get returned via the :ref:`org.freedesktop.portal.Request::Response` signal:
+ 
+         * ``scanners`` (``a(sa{sv})``)
+@@ -105,6 +115,12 @@
+         across sessions for the same physical scanner where the backend
+         allows it. Applications must not construct ids.
+ 
++        A physical scanner is listed once, however many drivers find it, as
++        a network printer is by both an eSCL and a vendor driver. The portal
++        opens it with the driver that ranks best, and with the next one if
++        that cannot open it, so an application does not see a driver that
++        does not work.
++
+         Keys in the information vardict:
+ 
+         * ``name`` (``s``)
+@@ -136,7 +152,12 @@
+         * ``capabilities`` (``as``)
+ 
+           Same vocabulary as ``required_capabilities`` in SelectScanners().
+-          Capabilities are hints; GetOptions() is authoritative.
++          The portal sets them, not the driver: it knows which scanners are
++          for film, by USB id or by product line, and assumes that a scanner
++          it does not know to be for film only is for documents, so it has
++          ``flatbed`` unless its driver says it is a sheet feeder. They are
++          reliable enough to filter on; GetOptions() is still authoritative
++          for what an opened scanner can do.
+ 
+         * ``available`` (``b``)
+ 
+diff --git a/desktop-portal/scanner-devices.h b/desktop-portal/scanner-devices.h
+new file mode 100644
+index 0000000..6a79868
+--- /dev/null
++++ b/desktop-portal/scanner-devices.h
+@@ -0,0 +1,71 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later
++ * SPDX-FileCopyrightText: Copyright © the xdg-desktop-portal contributors
++ */
++
++/* What the portal knows about scanners that SANE does not say. SANE's device type is whatever
++ * the driver puts there: the Plustek OpticFilm 8200i is a "film scanner" to one driver and a
++ * flatbed to another, and a network scanner's type is its address. The portal gives
++ * applications capabilities they can filter on, so that a film application and a document
++ * application can each be offered the scanners they are for.
++ *
++ * A scanner is matched by its USB id, which is exact, or by a part of its vendor and model, which
++ * covers a product line. Film scanners are few, so naming them is feasible; a scanner that is not
++ * named here and is not film by its type is assumed to be for documents.
++ *
++ * The capabilities are separated by semicolons: film, infrared, flatbed, adf, color. A flatbed with
++ * a transparency unit has both film and flatbed.
++ */
++
++#pragma once
++
++typedef struct
++{
++  const char *usb_id;          /* "07b3:1825", lower case, or NULL */
++  const char *model_contains;  /* lower case part of "vendor model", or NULL */
++  const char *name;            /* a clean name to show, or NULL to keep the driver's */
++  const char *capabilities;
++} ScannerKnown;
++
++static const ScannerKnown scanner_known[] = {
++  /* By USB id */
++  { "07b3:1825", NULL, "Plustek OpticFilm 8200i SE", "film;infrared;color" },
++
++  /* Dedicated film scanners, by product line */
++  { NULL, "opticfilm", NULL, "film;color" },
++  { NULL, "coolscan", NULL, "film;color" },
++  { NULL, "dimage scan", NULL, "film;color" },
++  { NULL, "scan elite", NULL, "film;color" },
++  { NULL, "filmscan", NULL, "film;color" },
++  { NULL, "primefilm", NULL, "film;color" },
++  { NULL, "film scanner", NULL, "film;color" },
++  { NULL, "slide scanner", NULL, "film;color" },
++
++  /* Flatbeds with a transparency unit: for documents and for film */
++  { NULL, "perfection v370", NULL, "flatbed;film;color" },
++  { NULL, "perfection v500", NULL, "flatbed;film;color" },
++  { NULL, "perfection v550", NULL, "flatbed;film;color" },
++  { NULL, "perfection v600", NULL, "flatbed;film;color" },
++  { NULL, "perfection v700", NULL, "flatbed;film;color" },
++  { NULL, "perfection v750", NULL, "flatbed;film;color" },
++  { NULL, "perfection v800", NULL, "flatbed;film;color" },
++  { NULL, "perfection v850", NULL, "flatbed;film;color" },
++};
++
++/* How a driver ranks for a scanner that more than one driver found: the lower the better. The
++ * drivers that speak a standard protocol to a network scanner work on more scanners and firmware
++ * than the vendor's. Drivers not named here rank in the middle, and a driver that goes through
++ * another host comes last. */
++typedef struct
++{
++  const char *backend;
++  int rank;
++} ScannerBackendRank;
++
++#define SCANNER_DEFAULT_RANK 2
++
++static const ScannerBackendRank scanner_backend_ranks[] = {
++  { "airscan", 0 },
++  { "escl", 1 },
++  { "hpaio", 8 },
++  { "net", 9 },
++};
+diff --git a/desktop-portal/scanner-helper.c b/desktop-portal/scanner-helper.c
+index 9e9c52b..816ea55 100644
+--- a/desktop-portal/scanner-helper.c
++++ b/desktop-portal/scanner-helper.c
+@@ -69,6 +69,99 @@ scanner_capabilities (const char *type)
+   return (const char **) g_ptr_array_free (caps, FALSE);
+ }
+ 
++/* A number from a file in a sysfs directory, or -1 */
++static int
++sysfs_int (const char *dir,
++           const char *file)
++{
++  g_autofree char *path = g_build_filename (dir, file, NULL);
++  g_autofree char *contents = NULL;
++
++  if (!g_file_get_contents (path, &contents, NULL, NULL))
++    return -1;
++
++  return (int) g_ascii_strtoll (g_strstrip (contents), NULL, 10);
++}
++
++/* The vendor and product id ("07b3:1825") of the USB device at a bus and device number, or NULL */
++static char *
++usb_id_for_address (int bus,
++                    int address)
++{
++  g_autoptr(GDir) dir = g_dir_open ("/sys/bus/usb/devices", 0, NULL);
++  const char *entry;
++
++  while (dir != NULL && (entry = g_dir_read_name (dir)) != NULL)
++    {
++      g_autofree char *base = g_build_filename ("/sys/bus/usb/devices", entry, NULL);
++      g_autofree char *vendor = NULL;
++      g_autofree char *product = NULL;
++      g_autofree char *vendor_path = NULL;
++      g_autofree char *product_path = NULL;
++
++      if (sysfs_int (base, "busnum") != bus || sysfs_int (base, "devnum") != address)
++        continue;
++
++      vendor_path = g_build_filename (base, "idVendor", NULL);
++      product_path = g_build_filename (base, "idProduct", NULL);
++      if (g_file_get_contents (vendor_path, &vendor, NULL, NULL) &&
++          g_file_get_contents (product_path, &product, NULL, NULL))
++        return g_strdup_printf ("%s:%s", g_strstrip (vendor), g_strstrip (product));
++    }
++
++  return NULL;
++}
++
++/* The host of a network scanner, from the address in its name or type: `ip=192.0.2.1` (HPLIP,
++ * airscan) or a URL (eSCL). Drivers that reach a scanner through another host, such as SANE's net
++ * backend, are not matched, since that host may have several. */
++static char *
++network_host (const SANE_Device *device)
++{
++  const char *name = device->name;
++  const char *type = device->type ? device->type : "";
++  const char *start = NULL;
++  gsize len;
++
++  if (g_str_has_prefix (name, "net:"))
++    return NULL;
++
++  if ((start = strstr (name, "ip=")) != NULL)
++    start += 3;
++  else if (g_str_has_prefix (type, "ip="))
++    start = type + 3;
++  else if ((start = strstr (name, "://")) != NULL)
++    start += 3;
++  if (start == NULL)
++    return NULL;
++
++  len = strcspn (start, "&:/?, ");
++  return len > 0 ? g_strndup (start, len) : NULL;
++}
++
++/* Which physical scanner this is, so that the portal can tell that two drivers have found the
++ * same one: the USB bus and device number, or the host of a network scanner. NULL if unknown. */
++static char *
++scanner_physical (const SANE_Device *device,
++                  char             **usb_id)
++{
++  const char *usb = strstr (device->name, "libusb:");
++  g_autofree char *host = NULL;
++  int bus;
++  int address;
++
++  *usb_id = NULL;
++
++  if (usb != NULL && sscanf (usb, "libusb:%d:%d", &bus, &address) == 2)
++    {
++      *usb_id = usb_id_for_address (bus, address);
++      return g_strdup_printf ("usb:%d:%d", bus, address);
++    }
++
++  host = network_host (device);
++  return host != NULL ? g_strdup_printf ("net:%s", host) : NULL;
++}
++
+ /* Webcams come through SANE's v4l backend and cannot scan anything a user would call a scan */
+ static gboolean
+ is_webcam (const SANE_Device *device)
+@@ -85,6 +178,8 @@ scanner_to_variant (const SANE_Device *device)
+   g_autofree char *name = NULL;
+   g_autofree char *backend = NULL;
+   g_autofree const char **caps = scanner_capabilities (device->type);
++  g_autofree char *usb_id = NULL;
++  g_autofree char *physical = scanner_physical (device, &usb_id);
+   const char *colon = strchr (device->name, ':');
+   GVariantBuilder info;
+ 
+@@ -104,6 +199,11 @@ scanner_to_variant (const SANE_Device *device)
+                          g_variant_new_string (device->type ? device->type : ""));
+   g_variant_builder_add (&info, "{sv}", "capabilities", g_variant_new_strv (caps, -1));
+   g_variant_builder_add (&info, "{sv}", "available", g_variant_new_boolean (TRUE));
++  /* For the portal's own use: it takes these out before an application sees the scanner */
++  if (physical != NULL)
++    g_variant_builder_add (&info, "{sv}", "physical", g_variant_new_string (physical));
++  if (usb_id != NULL)
++    g_variant_builder_add (&info, "{sv}", "usb_id", g_variant_new_string (usb_id));
+ 
+   return g_variant_new ("(ss@a{sv})", id, device->name, g_variant_builder_end (&info));
+ }
+diff --git a/desktop-portal/scanner.c b/desktop-portal/scanner.c
+index fb07fed..7c0832f 100644
+--- a/desktop-portal/scanner.c
++++ b/desktop-portal/scanner.c
+@@ -22,6 +22,7 @@
+ #include "xdp-impl-dbus.h"
+ #include "xdp-portal-config.h"
+ #include "scanner-protocol.h"
++#include "scanner-devices.h"
+ #include "xdp-request.h"
+ #include "xdp-session.h"
+ #include "xdp-utils.h"
+@@ -113,12 +114,29 @@ scanner_grants_from_app_info (XdpAppInfo *app_info)
+  * with the keys name, vendor, model, backend, kind, type, capabilities and available.
+  */
+ 
++/* A name libsane has for a scanner, and how well its driver ranks */
++typedef struct
++{
++  char *name;
++  int rank;
++} ScannerCandidate;
++
++static void
++scanner_candidate_free (ScannerCandidate *candidate)
++{
++  g_free (candidate->name);
++  g_free (candidate);
++}
++
+ typedef struct
+ {
+   char *id;
+-  char *sane_name; /* what libsane calls it; never given to an application */
++  char *sane_name; /* what libsane calls it, the best of the candidates; never given to an application */
+   GVariant *info; /* a{sv}, floating reference sunk */
+   GStrv capabilities;
++  char *physical;  /* which physical scanner, "usb:1:5" or "net:192.0.2.1", or NULL if not known */
++  int rank;        /* of the driver of sane_name */
++  GPtrArray *candidates; /* ScannerCandidate, best first: every name libsane has for this scanner */
+ } ScannerDevice;
+ 
+ static void
+@@ -126,6 +144,8 @@ scanner_device_free (ScannerDevice *device)
+ {
+   g_free (device->id);
+   g_free (device->sane_name);
++  g_free (device->physical);
++  g_clear_pointer (&device->candidates, g_ptr_array_unref);
+   g_clear_pointer (&device->info, g_variant_unref);
+   g_strfreev (device->capabilities);
+   g_free (device);
+@@ -133,32 +153,176 @@ scanner_device_free (ScannerDevice *device)
+ 
+ G_DEFINE_AUTOPTR_CLEANUP_FUNC (ScannerDevice, scanner_device_free)
+ 
+-/* From one entry of the helper's list: an id, the SANE name and the information vardict */
++static const ScannerKnown *
++scanner_known_lookup (const char *usb_id,
++                      const char *vendor,
++                      const char *model)
++{
++  g_autofree char *joined = g_strdup_printf ("%s %s", vendor ? vendor : "", model ? model : "");
++  g_autofree char *full = g_ascii_strdown (joined, -1);
++
++  for (size_t i = 0; i < G_N_ELEMENTS (scanner_known); i++)
++    {
++      if (scanner_known[i].usb_id != NULL && usb_id != NULL &&
++          g_ascii_strcasecmp (scanner_known[i].usb_id, usb_id) == 0)
++        return &scanner_known[i];
++    }
++
++  for (size_t i = 0; i < G_N_ELEMENTS (scanner_known); i++)
++    {
++      if (scanner_known[i].model_contains != NULL &&
++          strstr (full, scanner_known[i].model_contains) != NULL)
++        return &scanner_known[i];
++    }
++
++  return NULL;
++}
++
++static int
++scanner_backend_rank (const char *backend)
++{
++  for (size_t i = 0; backend != NULL && i < G_N_ELEMENTS (scanner_backend_ranks); i++)
++    {
++      if (g_strcmp0 (scanner_backend_ranks[i].backend, backend) == 0)
++        return scanner_backend_ranks[i].rank;
++    }
++
++  return SCANNER_DEFAULT_RANK;
++}
++
++/* From one entry of the helper's list: an id, the SANE name and the information vardict. What the
++ * portal knows about the scanner is added: its capabilities, and an id that is the same for every
++ * driver that finds it, so that they are one scanner to the dialog and to applications. */
+ static ScannerDevice *
+ scanner_device_new_from_helper (const char *id,
+                                 const char *sane_name,
+                                 GVariant   *info)
+ {
+   ScannerDevice *device = g_new0 (ScannerDevice, 1);
+-  const char **caps = NULL;
+-
+-  device->id = g_strdup (id);
++  g_auto(GVariantDict) dict = G_VARIANT_DICT_INIT (info);
++  g_autoptr(GPtrArray) caps = g_ptr_array_new_with_free_func (g_free);
++  const ScannerKnown *known;
++  const char *physical = NULL;
++  const char *usb_id = NULL;
++  const char *vendor = NULL;
++  const char *model = NULL;
++  const char *backend = NULL;
++  const char **hints = NULL;
++
++  g_variant_dict_lookup (&dict, "physical", "&s", &physical);
++  g_variant_dict_lookup (&dict, "usb_id", "&s", &usb_id);
++  g_variant_dict_lookup (&dict, "vendor", "&s", &vendor);
++  g_variant_dict_lookup (&dict, "model", "&s", &model);
++  g_variant_dict_lookup (&dict, "backend", "&s", &backend);
++
++  known = scanner_known_lookup (usb_id, vendor, model);
++  if (known != NULL)
++    {
++      g_auto(GStrv) names = g_strsplit (known->capabilities, ";", -1);
++
++      for (size_t i = 0; names[i] != NULL; i++)
++        g_ptr_array_add (caps, g_strdup (names[i]));
++      if (known->name != NULL)
++        g_variant_dict_insert (&dict, "name", "s", known->name);
++    }
++  else if (g_variant_dict_lookup (&dict, "capabilities", "^a&s", &hints))
++    {
++      for (size_t i = 0; hints[i] != NULL; i++)
++        g_ptr_array_add (caps, g_strdup (hints[i]));
++      g_free (hints);
++    }
++
++  /* What is not known to be only for film is for documents. Film scanners are few and named; the
++   * rest, such as a network scanner whose driver says nothing, are flatbeds or sheet feeders. */
++  if (!g_ptr_array_find_with_equal_func (caps, "film", g_str_equal, NULL) &&
++      !g_ptr_array_find_with_equal_func (caps, "flatbed", g_str_equal, NULL) &&
++      !g_ptr_array_find_with_equal_func (caps, "adf", g_str_equal, NULL))
++    g_ptr_array_add (caps, g_strdup ("flatbed"));
++  g_ptr_array_add (caps, NULL);
++
++  g_variant_dict_insert_value (&dict, "capabilities", g_variant_new_strv ((const char * const *) caps->pdata, -1));
++  device->capabilities = g_strdupv ((char **) caps->pdata);
++
++  device->physical = g_strdup (physical);
+   device->sane_name = g_strdup (sane_name);
+-  device->info = g_variant_ref (info);
++  device->rank = scanner_backend_rank (backend);
++  device->candidates = g_ptr_array_new_with_free_func ((GDestroyNotify) scanner_candidate_free);
++  {
++    ScannerCandidate *candidate = g_new0 (ScannerCandidate, 1);
++
++    candidate->name = g_strdup (sane_name);
++    candidate->rank = device->rank;
++    g_ptr_array_add (device->candidates, candidate);
++  }
+ 
+-  if (g_variant_lookup (info, "capabilities", "^a&s", &caps))
++  /* Only the portal needs these, and an address is not for applications */
++  g_variant_dict_remove (&dict, "physical");
++  g_variant_dict_remove (&dict, "usb_id");
++  device->info = g_variant_ref_sink (g_variant_dict_end (&dict));
++
++  if (device->physical != NULL)
+     {
+-      device->capabilities = g_strdupv ((char **) caps);
+-      g_free (caps);
++      g_autofree char *sum = g_compute_checksum_for_string (G_CHECKSUM_SHA256, device->physical, -1);
++
++      device->id = g_strdup_printf ("sane-%.16s", sum);
+     }
+   else
+     {
+-      device->capabilities = g_new0 (char *, 1);
++      device->id = g_strdup (id);
+     }
+ 
+   return device;
+ }
+ 
++/* One scanner for each physical scanner. The drivers that found it are kept, best first, in the
++ * scanner that stays, and OpenScanner tries them in that order, so that a driver that cannot open
++ * the scanner, such as HPLIP's for a network printer that only speaks eSCL, is not the end of it.
++ * Takes the list and returns the new one; scanners that are not known to be the same stay. */
++static GPtrArray *
++scanner_merge_duplicates (GPtrArray *devices)
++{
++  GPtrArray *merged = g_ptr_array_new_with_free_func ((GDestroyNotify) scanner_device_free);
++  g_autoptr(GHashTable) groups = g_hash_table_new (g_str_hash, g_str_equal);
++  gsize n = 0;
++  gpointer *items = g_ptr_array_steal (devices, &n);
++
++  g_ptr_array_unref (devices);
++
++  for (gsize i = 0; i < n; i++)
++    {
++      ScannerDevice *device = items[i];
++      ScannerDevice *first = device->physical != NULL ? g_hash_table_lookup (groups, device->physical) : NULL;
++
++      if (first == NULL)
++        {
++          g_ptr_array_add (merged, device);
++          if (device->physical != NULL)
++            g_hash_table_insert (groups, device->physical, device);
++          continue;
++        }
++
++      /* The same scanner found by another driver: keep its names, in the order of the drivers
++       * and, among equals, of the search */
++      for (guint k = 0; k < device->candidates->len; k++)
++        {
++          ScannerCandidate *candidate = g_ptr_array_index (device->candidates, k);
++          guint at = first->candidates->len;
++
++          while (at > 0 && ((ScannerCandidate *) g_ptr_array_index (first->candidates, at - 1))->rank > candidate->rank)
++            at--;
++          g_ptr_array_insert (first->candidates, at, candidate);
++        }
++      g_free (g_ptr_array_steal (device->candidates, NULL));   /* the names moved, they are not freed */
++      g_free (first->sane_name);
++      first->sane_name = g_strdup (((ScannerCandidate *) g_ptr_array_index (first->candidates, 0))->name);
++      first->rank = ((ScannerCandidate *) g_ptr_array_index (first->candidates, 0))->rank;
++      scanner_device_free (device);
++    }
++  g_free (items);
++
++  return merged;
++}
++
+ static ScannerDevice *
+ scanner_device_new (const char *id,
+                     const char *name,
+@@ -653,7 +817,7 @@ scanner_enumerate_with_helper (void)
+   GPtrArray *all;
+ 
+   scanner_discover (collect_batch, &collected, NULL);
+-  all = scanner_flatten (&collected);
++  all = scanner_merge_duplicates (scanner_flatten (&collected));
+   g_clear_pointer (&collected.slots, g_ptr_array_unref);
+ 
+   return all;
+@@ -723,6 +887,23 @@ scanner_device_has_capabilities (ScannerDevice       *device,
+   return TRUE;
+ }
+ 
++/* TRUE if there is nothing asked for, or the scanner has at least one of the capabilities */
++static gboolean
++scanner_device_has_any_capability (ScannerDevice       *device,
++                                   const char * const  *any)
++{
++  if (any == NULL || any[0] == NULL)
++    return TRUE;
++
++  for (size_t i = 0; any[i]; i++)
++    {
++      if (g_strv_contains ((const char * const *) device->capabilities, any[i]))
++        return TRUE;
++    }
++
++  return FALSE;
++}
++
+ static GVariant *
+ scanner_device_to_variant (ScannerDevice *device)
+ {
+@@ -796,7 +977,8 @@ typedef struct
+   XdpScanner *scanner;
+   gboolean multiple;
+   GHashTable *candidates; /* id → GVariant (s, a{sv}) */
+-  GStrv required;         /* the capabilities asked for */
++  GStrv required;         /* the capabilities asked for: a scanner has all of them */
++  GStrv any;              /* the capabilities asked for: a scanner has at least one of them */
+   GCancellable *cancellable; /* ends the search for scanners, which may outlive the call */
+   gboolean finished;      /* the backend has answered, nothing more is offered */
+ } SelectData;
+@@ -808,6 +990,7 @@ select_data_free (SelectData *data)
+   g_clear_object (&data->cancellable);
+   g_clear_pointer (&data->candidates, g_hash_table_unref);
+   g_strfreev (data->required);
++  g_strfreev (data->any);
+   g_free (data);
+ }
+ 
+@@ -917,6 +1100,7 @@ typedef struct
+   GCancellable *cancellable;
+   GPtrArray *slots;       /* per backend: the ScannerDevice it found, NULL until it answers */
+   GPtrArray *before;      /* what came before the hand-over, in the order of the drivers */
++  GHashTable *seen;       /* the ids the dialog has been offered: a scanner found by two drivers is offered once */
+   gboolean handed_over;
+   gboolean done;
+ } SelectSearch;
+@@ -929,6 +1113,7 @@ select_search_free (SelectSearch *search)
+   g_clear_object (&search->cancellable);
+   g_clear_pointer (&search->slots, g_ptr_array_unref);
+   g_clear_pointer (&search->before, g_ptr_array_unref);
++  g_clear_pointer (&search->seen, g_hash_table_unref);
+   g_mutex_clear (&search->mutex);
+   g_cond_clear (&search->cond);
+   g_free (search);
+@@ -947,6 +1132,7 @@ select_search_new (XdpRequest *request,
+   search->scanner = g_object_ref (scanner);
+   search->cancellable = g_object_ref (cancellable);
+   search->before = g_ptr_array_new ();   /* the devices belong to slots */
++  search->seen = g_hash_table_new_full (g_str_hash, g_str_equal, g_free, NULL);
+ 
+   return search;
+ }
+@@ -963,7 +1149,8 @@ select_offer (SelectData      *data,
+       ScannerDevice *device = g_ptr_array_index (devices, i);
+       GVariant *entry;
+ 
+-      if (!scanner_device_has_capabilities (device, (const char * const *) data->required))
++      if (!scanner_device_has_capabilities (device, (const char * const *) data->required) ||
++          !scanner_device_has_any_capability (device, (const char * const *) data->any))
+         continue;
+ 
+       entry = g_variant_ref_sink (scanner_device_to_variant (device));
+@@ -1019,6 +1206,7 @@ select_search_batch (GPtrArray *devices,
+                      gpointer   user_data)
+ {
+   SelectSearch *search = user_data;
++  g_autoptr(GPtrArray) fresh = g_ptr_array_new ();   /* the ones not offered yet; they belong to slots */
+   gboolean forward;
+   gboolean searching;
+ 
+@@ -1031,12 +1219,21 @@ select_search_batch (GPtrArray *devices,
+     }
+   g_ptr_array_index (search->slots, index) = g_ptr_array_ref (devices);
+ 
++  /* Another driver may have found a scanner already: it is the same scanner, so not another entry */
++  for (guint k = 0; k < devices->len; k++)
++    {
++      ScannerDevice *device = g_ptr_array_index (devices, k);
++
++      if (g_hash_table_add (search->seen, g_strdup (device->id)))
++        g_ptr_array_add (fresh, device);
++    }
++
+   forward = search->handed_over;
+   if (!forward)
+     {
+       /* The call still builds its list, from the order of the drivers */
+-      for (guint k = 0; k < devices->len; k++)
+-        g_ptr_array_add (search->before, g_ptr_array_index (devices, k));
++      for (guint k = 0; k < fresh->len; k++)
++        g_ptr_array_add (search->before, g_ptr_array_index (fresh, k));
+       g_cond_broadcast (&search->cond);
+     }
+ 
+@@ -1046,7 +1243,7 @@ select_search_batch (GPtrArray *devices,
+   g_mutex_unlock (&search->mutex);
+ 
+   if (forward)
+-    select_send_update (search, devices, searching);
++    select_send_update (search, fresh, searching);
+ 
+   g_ptr_array_unref (devices);
+ }
+@@ -1074,7 +1271,7 @@ select_search_thread (gpointer user_data)
+   /* What was found is the list of scanners now, to the calls that ask for one in the next
+    * seconds, unless the search was cut short and may have missed some */
+   collected.slots = search->slots;
+-  all = scanner_flatten (&collected);
++  all = scanner_merge_duplicates (scanner_flatten (&collected));
+   if (complete)
+     {
+       g_mutex_lock (&self->mutex);
+@@ -1140,6 +1337,7 @@ handle_select_scanners (XdpDbusScanner         *object,
+   g_autoptr(GVariant) impl_options = NULL;
+   g_autoptr(GError) error = NULL;
+   g_autofree const char **required = NULL;
++  g_autofree const char **any = NULL;
+   GVariantBuilder options_builder;
+   SelectSearch *search;
+   SelectData *data;
+@@ -1154,6 +1352,7 @@ handle_select_scanners (XdpDbusScanner         *object,
+     { "accept_label", G_VARIANT_TYPE_STRING, NULL },
+     { "title", G_VARIANT_TYPE_STRING, NULL },
+     { "required_capabilities", G_VARIANT_TYPE_STRING_ARRAY, validate_required_capabilities },
++    { "any_capabilities", G_VARIANT_TYPE_STRING_ARRAY, validate_required_capabilities },
+   };
+ 
+   request = xdp_request_from_invocation (invocation);
+@@ -1175,6 +1374,7 @@ handle_select_scanners (XdpDbusScanner         *object,
+ 
+   g_variant_lookup (filtered_options, "multiple", "b", &multiple);
+   g_variant_lookup (filtered_options, "required_capabilities", "^a&s", &required);
++  g_variant_lookup (filtered_options, "any_capabilities", "^a&s", &any);
+ 
+   /* The scanners the dialog may offer: all that exist and have what the application asked for.
+    * The application never sees this list, only what the user picks from it. */
+@@ -1182,6 +1382,7 @@ handle_select_scanners (XdpDbusScanner         *object,
+   data->scanner = g_object_ref (self);
+   data->multiple = multiple;
+   data->required = g_strdupv ((char **) required);
++  data->any = g_strdupv ((char **) any);
+   data->cancellable = g_cancellable_new ();
+   data->candidates = g_hash_table_new_full (g_str_hash, g_str_equal,
+                                             g_free, (GDestroyNotify) g_variant_unref);
+@@ -1708,13 +1909,33 @@ handle_open_scanner (XdpDbusScanner         *object,
+   g_hash_table_insert (self->open_scanners, g_strdup (arg_scanner_id), session);
+   g_mutex_unlock (&self->mutex);
+ 
+-  if (!scanner_session_open (session, device->sane_name, &error))
+-    {
+-      /* Never exported or registered; closing releases the lock and the object path */
+-      g_dbus_method_invocation_return_gerror (invocation, error);
+-      xdp_session_close (XDP_SESSION (session), FALSE);
+-      return G_DBUS_METHOD_INVOCATION_HANDLED;
+-    }
++  /* The drivers that found it, best first. One that cannot open the scanner is not the end of it,
++   * unless the scanner is busy, which another driver would only meet too. */
++  {
++    guint n_names = device->candidates != NULL ? device->candidates->len : 1;
++    gboolean opened = FALSE;
++
++    for (guint i = 0; i < n_names && !opened; i++)
++      {
++        const char *name = device->candidates != NULL ? ((ScannerCandidate *) g_ptr_array_index (device->candidates, i))->name
++                                                        : device->sane_name;
++
++        g_clear_error (&error);
++        opened = scanner_session_open (session, name, &error);
++        if (!opened && !g_error_matches (error, XDG_DESKTOP_PORTAL_ERROR, XDG_DESKTOP_PORTAL_ERROR_BUSY) && i + 1 < n_names)
++          g_debug ("[scanner] %s did not open (%s), trying the next driver", name, error->message);
++        else if (!opened)
++          break;
++      }
++
++    if (!opened)
++      {
++        /* Never exported or registered; closing releases the lock and the object path */
++        g_dbus_method_invocation_return_gerror (invocation, error);
++        xdp_session_close (XDP_SESSION (session), FALSE);
++        return G_DBUS_METHOD_INVOCATION_HANDLED;
++      }
++  }
+ 
+   /* Listing and opening take seconds, and the application may have left the bus meanwhile.
+    * Nothing would tell this session, which did not exist yet when the application went, so it

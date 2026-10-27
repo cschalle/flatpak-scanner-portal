@@ -281,13 +281,28 @@ instant, and any provider other than SANE.
     the documentation says that `type` is a backend-defined hint that can contain an address
     and must not be parsed beyond that, or the portal reports its own small vocabulary
     (`virtual`, `scanner`, `camera`) and keeps the raw string out.
-13. **Where do `capabilities` come from?** The prototype reads them from words in the type
-    string (`film`, `flatbed`, `adf`), so a scanner whose backend does not say, such as the
-    `airscan` one, has none, and a `required_capabilities` filter can never offer it.
-    Reading them from the scanner's options needs it opened, which takes the lock and, for a
-    network scanner, many seconds. The recommendation is to keep `capabilities` as a hint,
-    say that an empty list means unknown, and drop `required_capabilities` from v1 unless a
-    reliable source is found.
+13. **Where do `capabilities` come from?** Not from SANE, whose device type says little and
+    differs between drivers: one calls a Plustek OpticFilm a film scanner and another a flatbed,
+    and `airscan` gives its address. The frontend keeps a list of the scanners that are for
+    film, by USB id or by product line (`desktop-portal/scanner-devices.h`), and assumes that a
+    scanner not known to be only for film is for documents, so it has `flatbed` unless its
+    driver says it is a sheet feeder. Film scanners are few and a film application is the one
+    that needs them found, so a list is feasible, where a list of document scanners would not
+    be. A flatbed with a transparency unit has both `film` and `flatbed`. This makes
+    `required_capabilities` reliable, and `any_capabilities` lets an application for documents
+    ask for `flatbed` or `adf`, so neither kind of application needs to exclude the other's
+    scanners. What is open is who keeps the list: it could be shipped as data and updated with
+    the portal, or live in SANE's own description files if the SANE project takes a capability
+    field.
+14. **The same scanner twice.** A network printer is found by an eSCL driver and by the vendor's,
+    and a USB scanner by more than one backend. The helper reports which physical scanner a
+    device is (the USB bus address, or the host of a network scanner), and the frontend gives
+    those one id, offers the dialog one entry and keeps the drivers in rank order, `airscan`
+    and `escl` before the others and HPLIP's `hpaio` last. `OpenScanner` tries them in turn, so
+    a driver that cannot open the scanner, which HPLIP does for a printer that only speaks eSCL,
+    is not the end of it. Scanners found only through SANE's `net` driver are not merged, since
+    the host may serve several. Open: the ranking is a guess made from the drivers seen so far,
+    and a USB scanner is only matched by its bus address while the helper is listing it.
 
 ## Upstreaming plan
 
