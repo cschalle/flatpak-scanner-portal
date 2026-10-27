@@ -1,0 +1,249 @@
+From 91d3191952980c6af45f2d4a3c8980bb017e941f Mon Sep 17 00:00:00 2001
+From: "Christian F.K. Schaller" <christian.schaller@gmail.com>
+Date: Mon, 26 Oct 2026 18:15:39 -0400
+Subject: [PATCH] scanner: Keep the scanner free when an app leaves during
+ OpenScanner
+
+This commit makes OpenScanner cope with an application that leaves the
+bus while the call is running, and stops every call from listing all
+the scanners again.
+
+Listing takes seconds when a driver searches the network, and opening
+starts a helper, so an application can quit in the middle of
+OpenScanner. The session did not exist when the application left, so
+nothing told it, and it held the scanner until the portal restarted:
+the next launch of the application got Busy. OpenScanner now checks
+that the caller is still on the bus once the helper is up, and if it
+is not, closes the session and fails with NameHasNoOwner.
+
+The peer leaving closes a session at any moment after it is created,
+and that close drops the reference the session was created with. The
+call now holds a reference of its own for as long as it runs, and every
+way out of it closes the session. With the check above and without
+this, the new scenario crashed the portal in scanner_session_open (),
+which found the session freed under it.
+
+The list of scanners is kept for 30 seconds. ListScanners and
+OpenScanner use it; SelectScanners always asks again, so the dialog
+shows what is plugged in. OpenScanner asks again once if the scanner is
+not in the list, so one that was plugged in since is still found. A
+full SANE configuration took about 6 seconds to list on the machine
+this was tried on, and every call that listed paid for it.
+
+Tested on main, with the next commit: the scenario checks pass 46 of
+46, among them one for an application that leaves during OpenScanner.
+On 1.22.1 the portal stops during that scenario without this commit,
+after 37 other checks passed; that was not tried on main.
+---
+ desktop-portal/scanner.c | 111 ++++++++++++++++++++++++++++++++-------
+ 1 file changed, 93 insertions(+), 18 deletions(-)
+
+diff --git a/desktop-portal/scanner.c b/desktop-portal/scanner.c
+index 736c6e7..af318ea 100644
+--- a/desktop-portal/scanner.c
++++ b/desktop-portal/scanner.c
+@@ -39,8 +39,17 @@ struct _XdpScanner
+   /* The scanners that are open, by id. This is the host's exclusive lock: one application at a
+    * time has a scanner. The sessions are not owned; a session removes itself when it closes. */
+   GHashTable *open_scanners;
++
++  /* What the last enumeration found, and when (monotonic microseconds). Asking libsane takes
++   * seconds on a machine with network scanners, and an application that has just had the user
++   * choose a scanner lists and opens it straight away, so those calls reuse it. */
++  GPtrArray *cached_devices;
++  gint64 cached_at;
+ };
+ 
++/* How long a list of scanners may be reused by ListScanners and OpenScanner */
++#define SCANNER_CACHE_SECONDS 30
++
+ #define XDP_TYPE_SCANNER (xdp_scanner_get_type ())
+ G_DECLARE_FINAL_TYPE (XdpScanner, xdp_scanner, XDP, SCANNER, XdpDbusScannerSkeleton);
+ 
+@@ -271,14 +280,37 @@ scanner_enumerate_fake (void)
+   return devices;
+ }
+ 
+-/* The scanners that exist right now, as a list of ScannerDevice */
++/* The scanners that exist, as a list of ScannerDevice. A list found less than max_age_seconds
++ * ago is reused; 0 always asks libsane. */
+ static GPtrArray *
+-scanner_enumerate (XdpScanner *self)
++scanner_enumerate (XdpScanner *self,
++                   guint       max_age_seconds)
+ {
++  GPtrArray *devices;
++
+   if (g_strcmp0 (g_getenv ("XDG_DESKTOP_PORTAL_SCANNER_FAKE"), "1") == 0)
+     return scanner_enumerate_fake ();
+ 
+-  return scanner_enumerate_with_helper ();
++  g_mutex_lock (&self->mutex);
++  if (max_age_seconds > 0 && self->cached_devices != NULL &&
++      g_get_monotonic_time () - self->cached_at <= (gint64) max_age_seconds * G_USEC_PER_SEC)
++    {
++      devices = g_ptr_array_ref (self->cached_devices);
++      g_mutex_unlock (&self->mutex);
++      return devices;
++    }
++  g_mutex_unlock (&self->mutex);
++
++  /* Without the mutex: this takes seconds, and other calls must not wait for it */
++  devices = scanner_enumerate_with_helper ();
++
++  g_mutex_lock (&self->mutex);
++  g_clear_pointer (&self->cached_devices, g_ptr_array_unref);
++  self->cached_devices = g_ptr_array_ref (devices);
++  self->cached_at = g_get_monotonic_time ();
++  g_mutex_unlock (&self->mutex);
++
++  return devices;
+ }
+ 
+ static gboolean
+@@ -337,7 +369,7 @@ handle_list_scanners (XdpDbusScanner         *object,
+   g_mutex_unlock (&self->mutex);
+ 
+   if (has_grants)
+-    devices = scanner_enumerate (self);
++    devices = scanner_enumerate (self, SCANNER_CACHE_SECONDS);
+   else
+     devices = g_ptr_array_new_with_free_func ((GDestroyNotify) scanner_device_free);
+ 
+@@ -522,7 +554,7 @@ handle_select_scanners (XdpDbusScanner         *object,
+ 
+   /* The scanners the dialog may offer: all that exist and have what the application asked for.
+    * The application never sees this list, only what the user picks from it. */
+-  devices = scanner_enumerate (self);
++  devices = scanner_enumerate (self, 0);
+ 
+   data = g_new0 (SelectData, 1);
+   data->scanner = g_object_ref (self);
+@@ -909,6 +941,25 @@ scanner_session_open (XdpScannerSession  *self,
+   return TRUE;
+ }
+ 
++/* Whether the name is still owned, that is, the caller is still there */
++static gboolean
++sender_is_on_bus (GDBusConnection *connection,
++                  const char      *sender)
++{
++  g_autoptr(GVariant) reply = NULL;
++  gboolean has_owner = FALSE;
++
++  reply = g_dbus_connection_call_sync (connection, "org.freedesktop.DBus", "/org/freedesktop/DBus",
++                                       "org.freedesktop.DBus", "NameHasOwner",
++                                       g_variant_new ("(s)", sender), G_VARIANT_TYPE ("(b)"),
++                                       G_DBUS_CALL_FLAGS_NONE, -1, NULL, NULL);
++  if (reply == NULL)
++    return TRUE;   /* Cannot tell: do not turn the application away */
++
++  g_variant_get (reply, "(b)", &has_owner);
++  return has_owner;
++}
++
+ static gboolean
+ handle_open_scanner (XdpDbusScanner         *object,
+                      GDBusMethodInvocation  *invocation,
+@@ -918,7 +969,10 @@ handle_open_scanner (XdpDbusScanner         *object,
+   XdpScanner *self = XDP_SCANNER (object);
+   XdpAppInfo *app_info = xdp_invocation_get_app_info (invocation);
+   g_autoptr(GPtrArray) devices = NULL;
+-  g_autoptr(XdpScannerSession) session = NULL;
++  /* The session lives until xdp_session_close () drops the reference it was created with, which
++   * the peer leaving can do at any moment from the moment it exists. This call has its own. */
++  XdpScannerSession *session = NULL;
++  g_autoptr(XdpScannerSession) holder = NULL;
+   g_autoptr(GError) error = NULL;
+   g_autoptr(GVariant) options = NULL;
+   GVariantBuilder options_builder;
+@@ -963,15 +1017,22 @@ handle_open_scanner (XdpDbusScanner         *object,
+ 
+   /* Where the scanner is now, since a USB scanner that was unplugged and plugged in again has a
+    * new SANE name */
+-  devices = scanner_enumerate (self);
+-  for (guint i = 0; i < devices->len; i++)
++  for (guint attempt = 0; attempt < 2 && device == NULL; attempt++)
+     {
+-      ScannerDevice *candidate = g_ptr_array_index (devices, i);
++      /* The list the dialog just found if it is recent, then a fresh one, which finds a scanner
++       * that has been plugged in again since */
++      g_clear_pointer (&devices, g_ptr_array_unref);
++      devices = scanner_enumerate (self, attempt == 0 ? SCANNER_CACHE_SECONDS : 0);
+ 
+-      if (g_strcmp0 (candidate->id, arg_scanner_id) == 0)
++      for (guint i = 0; i < devices->len; i++)
+         {
+-          device = candidate;
+-          break;
++          ScannerDevice *candidate = g_ptr_array_index (devices, i);
++
++          if (g_strcmp0 (candidate->id, arg_scanner_id) == 0)
++            {
++              device = candidate;
++              break;
++            }
+         }
+     }
+ 
+@@ -990,6 +1051,7 @@ handle_open_scanner (XdpDbusScanner         *object,
+       g_dbus_method_invocation_return_gerror (invocation, error);
+       return G_DBUS_METHOD_INVOCATION_HANDLED;
+     }
++  holder = g_object_ref (session);
+ 
+   /* Take the lock before opening, so that two applications asking at once cannot both open it */
+   g_mutex_lock (&self->mutex);
+@@ -999,6 +1061,7 @@ handle_open_scanner (XdpDbusScanner         *object,
+       g_dbus_method_invocation_return_error (invocation, XDG_DESKTOP_PORTAL_ERROR,
+                                              XDG_DESKTOP_PORTAL_ERROR_BUSY,
+                                              "The scanner is in use");
++      xdp_session_close (XDP_SESSION (session), FALSE);
+       return G_DBUS_METHOD_INVOCATION_HANDLED;
+     }
+   g_hash_table_insert (self->open_scanners, g_strdup (arg_scanner_id), session);
+@@ -1006,15 +1069,31 @@ handle_open_scanner (XdpDbusScanner         *object,
+ 
+   if (!scanner_session_open (session, device->sane_name, &error))
+     {
+-      /* Never exported or registered: dropping the last reference releases the lock */
++      /* Never exported or registered; closing releases the lock and the object path */
+       g_dbus_method_invocation_return_gerror (invocation, error);
++      xdp_session_close (XDP_SESSION (session), FALSE);
++      return G_DBUS_METHOD_INVOCATION_HANDLED;
++    }
++
++  /* Listing and opening take seconds, and the application may have left the bus meanwhile.
++   * Nothing would tell this session, which did not exist yet when the application went, so it
++   * would hold the scanner for as long as the portal runs. */
++  if (!sender_is_on_bus (g_dbus_method_invocation_get_connection (invocation),
++                         g_dbus_method_invocation_get_sender (invocation)))
++    {
++      g_dbus_method_invocation_return_error (invocation, G_DBUS_ERROR, G_DBUS_ERROR_NAME_HAS_NO_OWNER,
++                                             "The application has left the bus");
++      /* The session may have been closed already, when the application left while the helper was
++       * starting; closing it again would do nothing, and the helper has come up since. */
++      xdp_scanner_session_close (XDP_SESSION (session));
++      xdp_session_close (XDP_SESSION (session), FALSE);
+       return G_DBUS_METHOD_INVOCATION_HANDLED;
+     }
+ 
+   if (!xdp_session_export (XDP_SESSION (session), &error))
+     {
+       g_dbus_method_invocation_return_gerror (invocation, error);
+-      xdp_session_close (XDP_SESSION (g_steal_pointer (&session)), FALSE);
++      xdp_session_close (XDP_SESSION (session), FALSE);
+       return G_DBUS_METHOD_INVOCATION_HANDLED;
+     }
+ 
+@@ -1024,10 +1103,6 @@ handle_open_scanner (XdpDbusScanner         *object,
+ 
+   xdp_dbus_scanner_complete_open_scanner (object, invocation, XDP_SESSION (session)->id);
+ 
+-  /* xdp_session_close () drops one more reference than export and register took, the one this
+-   * call was created with, so it is not released here. */
+-  g_steal_pointer (&session);
+-
+   return G_DBUS_METHOD_INVOCATION_HANDLED;
+ }
+ 

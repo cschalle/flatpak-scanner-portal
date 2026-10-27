@@ -1,0 +1,115 @@
+From 7f3745e0d4b013e8effe828b4856bff5b2e76f47 Mon Sep 17 00:00:00 2001
+From: "Christian F.K. Schaller" <christian.schaller@gmail.com>
+Date: Mon, 26 Oct 2026 10:27:42 -0400
+Subject: [PATCH] scanner: Follow the GNOME HIG in the dialog
+
+This commit changes the scanner dialog where it differed from the HIG
+pages for action dialogs, boxed lists and writing style.
+
+Return now chooses, as the Select button does. The dialog sets Select as
+its default widget and also catches Return in the capture phase, because
+a radio button with the focus handles Return itself and the default
+button never saw it.
+
+The control in a row takes keyboard focus, not the row, and the first
+scanner that is chosen starts with the focus. The check button of a row
+now has the scanner's name as its accessible label and the subtitle as
+its description, since it has no text of its own.
+
+The window title reads Select Scanners when more than one scanner can be
+chosen. The empty state text no longer ends in a period. The window
+accepts a width of 360 pixels, so that it can shrink on a narrow screen.
+
+Checked by hand on a Wayland session with made-up scanners: Return with
+no click first, the title and check marks with multiple set, long scanner
+names and a long application title wrapping, and Tab moving between
+Cancel, Select and the chosen scanner. Not checked: the focus ring, the
+accessible names (there is no accessibility bus on the test bus), the
+narrow width, and the empty state.
+---
+ src/scannerdialog.c  | 19 ++++++++++++++++++-
+ src/scannerdialog.ui | 16 +++++++++++++++-
+ 2 files changed, 33 insertions(+), 2 deletions(-)
+
+diff --git a/src/scannerdialog.c b/src/scannerdialog.c
+index 3c0b602..df62649 100644
+--- a/src/scannerdialog.c
++++ b/src/scannerdialog.c
+@@ -273,6 +273,14 @@ add_scanner_row (ScannerDialog *self,
+   adw_action_row_add_suffix (ADW_ACTION_ROW (row), choice);
+   adw_action_row_set_activatable_widget (ADW_ACTION_ROW (row), choice);
+ 
++  /* The control takes keyboard focus, not the row, and a screen reader needs the scanner's name
++   * on it, since the control has no text of its own. */
++  gtk_widget_set_focusable (row, FALSE);
++  gtk_accessible_update_property (GTK_ACCESSIBLE (choice),
++                                  GTK_ACCESSIBLE_PROPERTY_LABEL, title,
++                                  GTK_ACCESSIBLE_PROPERTY_DESCRIPTION, subtitle,
++                                  -1);
++
+   g_object_set_data_full (G_OBJECT (choice), SCANNER_ID_KEY, g_strdup (id), g_free);
+ 
+   if (!available)
+@@ -323,6 +331,10 @@ scanner_dialog_new (const char *app_id,
+   g_variant_dict_lookup (opts, "title", "&s", &title);
+ 
+   gtk_window_set_modal (GTK_WINDOW (self), modal);
++  gtk_window_set_title (GTK_WINDOW (self), self->multiple ? _("Select Scanners") : _("Select Scanner"));
++
++  /* Return chooses, as the Select button does */
++  gtk_window_set_default_widget (GTK_WINDOW (self), GTK_WIDGET (self->accept_button));
+ 
+   if (accept_label && *accept_label)
+     {
+@@ -359,7 +371,12 @@ scanner_dialog_new (const char *app_id,
+   /* The first scanner that can be used is chosen already, so that one click is enough in the
+    * common case of one scanner. */
+   if (self->choices->len > 0)
+-    gtk_check_button_set_active (g_ptr_array_index (self->choices, 0), TRUE);
++    {
++      GtkCheckButton *preselected = g_ptr_array_index (self->choices, 0);
++
++      gtk_check_button_set_active (preselected, TRUE);
++      gtk_window_set_focus (GTK_WINDOW (self), GTK_WIDGET (preselected));
++    }
+   else
+     gtk_stack_set_visible_child_name (GTK_STACK (self->stack), "empty-state");
+ 
+diff --git a/src/scannerdialog.ui b/src/scannerdialog.ui
+index ba639e8..0e8e8ea 100644
+--- a/src/scannerdialog.ui
++++ b/src/scannerdialog.ui
+@@ -3,10 +3,24 @@
+   <requires lib="gtk" version="4.0"/>
+   <template class="ScannerDialog" parent="AdwWindow">
+     <property name="default-width">500</property>
++    <property name="width-request">360</property>
+     <property name="default-height">280</property>
+     <property name="modal">True</property>
+     <property name="title" translatable="yes">Select Scanner</property>
+ 
++    <!-- Return chooses, whichever control has the focus: a radio button would otherwise take it -->
++    <child>
++      <object class="GtkShortcutController">
++        <property name="propagation-phase">capture</property>
++        <child>
++          <object class="GtkShortcut">
++            <property name="trigger">Return|KP_Enter</property>
++            <property name="action">signal(activate-default)</property>
++          </object>
++        </child>
++      </object>
++    </child>
++
+     <child>
+       <object class="GtkShortcutController">
+         <child>
+@@ -100,7 +114,7 @@
+                 <property name="child">
+                   <object class="AdwStatusPage">
+                     <property name="title" translatable="yes">No Scanners Found</property>
+-                    <property name="description" translatable="yes">Connect a scanner and make sure it is turned on.</property>
++                    <property name="description" translatable="yes">Connect a scanner and make sure it is turned on</property>
+                     <property name="icon-name">scanner-symbolic</property>
+                   </object>
+                 </property>

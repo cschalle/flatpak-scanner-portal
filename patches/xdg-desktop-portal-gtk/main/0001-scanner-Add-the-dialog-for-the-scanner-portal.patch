@@ -1,0 +1,1111 @@
+From 497791f21aeb2d7ecb89bb47100bd42a19e34178 Mon Sep 17 00:00:00 2001
+From: "Christian F.K. Schaller" <christian.schaller@gmail.com>
+Date: Mon, 26 Oct 2026 15:02:46 -0400
+Subject: [PATCH] scanner: Add the dialog for the scanner portal
+
+This commit implements org.freedesktop.impl.portal.Scanner, whose one
+method, SelectScanners, shows a dialog that lists the scanners the
+frontend found and returns the ids of the ones the user chose. The
+backend only asks for consent; the frontend talks to the scanner.
+
+The dialog is a GTK 3 window with a list of rows, one per scanner,
+each showing the name, how it is connected and what it can scan (film,
+flatbed, feeder). It honours the modal, multiple, accept_label and
+title options of the frontend call. With multiple unset the rows are
+radio buttons, and the first available scanner is chosen already, so
+that one click is enough when there is one scanner. Scanners that are
+not available are shown and cannot be chosen. The heading names the
+application and the application's own title is shown under it. With
+no scanners it shows an empty state.
+
+Return chooses, Escape, Cancel and closing the window answer with the
+cancelled response, and Request.Close destroys the dialog without an
+answer, because the frontend answers a closed request itself.
+
+The interface XML is copied into data/ because an installed
+xdg-desktop-portal does not carry the Scanner interface yet. The copy
+goes away when it does. The dialog mirrors the libadwaita one in
+xdg-desktop-portal-gnome.
+
+Tested by calling SelectScanners on a private bus with made-up
+scanners, one of them unavailable: choosing the second scanner with
+Return returns its id, and the layout was checked in a screenshot.
+Escape, Cancel, multiple selection, Request.Close and the empty list
+were not tested.
+---
+ data/gtk.portal.in                           |   2 +-
+ data/meson.build                             |   2 +
+ data/org.freedesktop.impl.portal.Scanner.xml |  51 ++
+ src/meson.build                              |   2 +
+ src/scanner.c                                | 221 +++++++++
+ src/scanner.h                                |  24 +
+ src/scannerdialog.c                          | 470 +++++++++++++++++++
+ src/scannerdialog.h                          |  37 ++
+ src/scannerdialog.ui                         | 145 ++++++
+ src/xdg-desktop-portal-gtk.c                 |   7 +
+ src/xdg-desktop-portal-gtk.gresource.xml     |   1 +
+ 11 files changed, 961 insertions(+), 1 deletion(-)
+ create mode 100644 data/org.freedesktop.impl.portal.Scanner.xml
+ create mode 100644 src/scanner.c
+ create mode 100644 src/scanner.h
+ create mode 100644 src/scannerdialog.c
+ create mode 100644 src/scannerdialog.h
+ create mode 100644 src/scannerdialog.ui
+
+diff --git a/data/gtk.portal.in b/data/gtk.portal.in
+index d9b568e..21a9d33 100644
+--- a/data/gtk.portal.in
++++ b/data/gtk.portal.in
+@@ -1,4 +1,4 @@
+ [portal]
+ DBusName=org.freedesktop.impl.portal.desktop.gtk
+-Interfaces=org.freedesktop.impl.portal.FileChooser;@appchooser_iface@org.freedesktop.impl.portal.Print;org.freedesktop.impl.portal.Notification;org.freedesktop.impl.portal.Inhibit;org.freedesktop.impl.portal.Access;org.freedesktop.impl.portal.Account;org.freedesktop.impl.portal.Email;org.freedesktop.impl.portal.DynamicLauncher;@lockdown_iface@@settings_iface@@wallpaper_iface@
++Interfaces=org.freedesktop.impl.portal.FileChooser;@appchooser_iface@org.freedesktop.impl.portal.Print;org.freedesktop.impl.portal.Notification;org.freedesktop.impl.portal.Inhibit;org.freedesktop.impl.portal.Access;org.freedesktop.impl.portal.Account;org.freedesktop.impl.portal.Email;org.freedesktop.impl.portal.DynamicLauncher;org.freedesktop.impl.portal.Scanner;@lockdown_iface@@settings_iface@@wallpaper_iface@
+ UseIn=gnome
+diff --git a/data/meson.build b/data/meson.build
+index 18febc2..6aea1a0 100644
+--- a/data/meson.build
++++ b/data/meson.build
+@@ -9,6 +9,8 @@ portal_dbus_interfaces = [
+   desktop_portal_interfaces_dir / 'org.freedesktop.impl.portal.Account.xml',
+   desktop_portal_interfaces_dir / 'org.freedesktop.impl.portal.Email.xml',
+   desktop_portal_interfaces_dir / 'org.freedesktop.impl.portal.DynamicLauncher.xml',
++  # Not in an installed xdg-desktop-portal yet
++  files('org.freedesktop.impl.portal.Scanner.xml'),
+ ]
+ 
+ fdo_dbus_interfaces = files(
+diff --git a/data/org.freedesktop.impl.portal.Scanner.xml b/data/org.freedesktop.impl.portal.Scanner.xml
+new file mode 100644
+index 0000000..4ce64c9
+--- /dev/null
++++ b/data/org.freedesktop.impl.portal.Scanner.xml
+@@ -0,0 +1,51 @@
++<?xml version="1.0"?>
++<!--
++ DRAFT. Prototype for upstream xdg-desktop-portal. Not yet reviewed.
++ SPDX-License-Identifier: LGPL-2.1-or-later
++-->
++<node name="/" xmlns:doc="http://www.freedesktop.org/dbus/1.0/doc.dtd">
++  <!--
++      org.freedesktop.impl.portal.Scanner:
++      @short_description: Scanner portal backend interface
++
++      The backend only provides UI, like org.freedesktop.impl.portal.Usb.
++      Talking to scanners is done by the frontend through a host helper
++      (see PROPOSAL.md), not by the backend.
++
++      This documentation describes version 1 of this interface.
++  -->
++  <interface name="org.freedesktop.impl.portal.Scanner">
++
++    <!--
++        SelectScanners:
++        @handle: Object path for the :ref:`org.freedesktop.impl.portal.Request` object representing this call
++        @parent_window: Identifier for the application window
++        @app_id: App id of the application
++        @scanners: Array of scanner id and information vardict for every
++        scanner the frontend found that matches the request, with the same
++        keys as org.freedesktop.portal.Scanner.ListScanners
++        @options: Vardict with the options of the frontend call
++        @response: Numeric Request response
++        @results: Vardict with the results of the call
++
++        Shows the selection dialog. Results:
++
++        * ``scanners`` (``as``)
++
++          The ids chosen from @scanners. The frontend stores the grant.
++    -->
++    <method name="SelectScanners">
++      <arg type="o" name="handle" direction="in"/>
++      <arg type="s" name="parent_window" direction="in"/>
++      <arg type="s" name="app_id" direction="in"/>
++      <annotation name="org.qtproject.QtDBus.QtTypeName.In3" value="QList&lt;QPair&lt;QString,QVariantMap&gt;&gt;"/>
++      <arg type="a(sa{sv})" name="scanners" direction="in"/>
++      <annotation name="org.qtproject.QtDBus.QtTypeName.In4" value="QVariantMap"/>
++      <arg type="a{sv}" name="options" direction="in"/>
++      <arg type="u" name="response" direction="out"/>
++      <annotation name="org.qtproject.QtDBus.QtTypeName.Out1" value="QVariantMap"/>
++      <arg type="a{sv}" name="results" direction="out"/>
++    </method>
++    <property name="version" type="u" access="read"/>
++  </interface>
++</node>
+diff --git a/src/meson.build b/src/meson.build
+index 6b8394e..5682671 100644
+--- a/src/meson.build
++++ b/src/meson.build
+@@ -14,6 +14,8 @@ portal_sources = files(
+   'gtkbackports.c',
+   'externalwindow.c',
+   'dynamic-launcher.c',
++  'scanner.c',
++  'scannerdialog.c',
+ )
+ 
+ portal_c_args = [
+diff --git a/src/scanner.c b/src/scanner.c
+new file mode 100644
+index 0000000..1d96b40
+--- /dev/null
++++ b/src/scanner.c
+@@ -0,0 +1,221 @@
++/*
++ * scanner.c
++ *
++ * Copyright © 2026 Christian Schaller
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library. If not, see <http://www.gnu.org/licenses/>.
++ */
++
++
++#define _GNU_SOURCE 1
++
++#include "config.h"
++
++#include <gio/gio.h>
++#include <gtk/gtk.h>
++
++#include "xdg-desktop-portal-dbus.h"
++
++#include "scanner.h"
++#include "scannerdialog.h"
++#include "request.h"
++#include "utils.h"
++#include "externalwindow.h"
++
++typedef struct {
++  XdpImplScanner *impl;
++  GDBusMethodInvocation *invocation;
++  Request *request;
++
++  GtkWidget *dialog;
++  ExternalWindow *external_parent;
++
++  int response;
++} ScannerDialogHandle;
++
++static void
++scanner_dialog_handle_free (gpointer data)
++{
++  ScannerDialogHandle *handle = data;
++
++  g_clear_object (&handle->external_parent);
++  g_object_unref (handle->request);
++  g_object_unref (handle->dialog);
++
++  g_free (handle);
++}
++
++static void
++scanner_dialog_handle_close (ScannerDialogHandle *handle)
++{
++  gtk_widget_destroy (handle->dialog);
++  scanner_dialog_handle_free (handle);
++}
++
++static void
++send_response (ScannerDialogHandle *handle)
++{
++  GVariantBuilder opt_builder;
++
++  g_variant_builder_init (&opt_builder, G_VARIANT_TYPE_VARDICT);
++
++  if (handle->response == 0)
++    {
++      g_auto(GStrv) selected = scanner_dialog_get_selected (SCANNER_DIALOG (handle->dialog));
++
++      g_variant_builder_add (&opt_builder, "{sv}", "scanners",
++                             g_variant_new_strv ((const char * const *) selected, -1));
++    }
++
++  if (handle->request->exported)
++    request_unexport (handle->request);
++
++  xdp_impl_scanner_complete_select_scanners (handle->impl,
++                                             handle->invocation,
++                                             handle->response,
++                                             g_variant_builder_end (&opt_builder));
++
++  scanner_dialog_handle_close (handle);
++}
++
++static void
++scanner_dialog_done (GtkWidget *widget,
++                     int        response,
++                     gpointer   user_data)
++{
++  ScannerDialogHandle *handle = user_data;
++
++  switch (response)
++    {
++    default:
++      g_warning ("Unexpected response: %d", response);
++      handle->response = 2;
++      break;
++
++    case GTK_RESPONSE_DELETE_EVENT:
++    case GTK_RESPONSE_CANCEL:
++      handle->response = 1;
++      break;
++
++    case GTK_RESPONSE_OK:
++      handle->response = 0;
++      break;
++    }
++
++  send_response (handle);
++}
++
++/* The frontend answers a request that was closed itself, so the dialog goes away without an
++ * answer from here. */
++static gboolean
++handle_close (XdpImplRequest        *object,
++              GDBusMethodInvocation *invocation,
++              ScannerDialogHandle   *handle)
++{
++  scanner_dialog_handle_close (handle);
++
++  return FALSE;
++}
++
++static gboolean
++handle_select_scanners (XdpImplScanner        *object,
++                        GDBusMethodInvocation *invocation,
++                        const char            *arg_handle,
++                        const char            *arg_parent_window,
++                        const char            *arg_app_id,
++                        GVariant              *arg_scanners,
++                        GVariant              *arg_options)
++{
++  g_autoptr(Request) request = NULL;
++  const char *sender;
++  ScannerDialogHandle *handle;
++  GtkWidget *dialog;
++  GdkDisplay *display;
++  GdkScreen *screen;
++  ExternalWindow *external_parent = NULL;
++  GtkWidget *fake_parent;
++
++  sender = g_dbus_method_invocation_get_sender (invocation);
++
++  request = request_new (sender, arg_app_id, arg_handle);
++
++  if (arg_parent_window && *arg_parent_window)
++    {
++      external_parent = create_external_window_from_handle (arg_parent_window);
++      if (!external_parent)
++        g_warning ("Failed to associate portal window with parent window %s",
++                   arg_parent_window);
++    }
++
++  if (external_parent)
++    display = external_window_get_display (external_parent);
++  else
++    display = gdk_display_get_default ();
++  screen = gdk_display_get_default_screen (display);
++
++  fake_parent = g_object_new (GTK_TYPE_WINDOW,
++                              "type", GTK_WINDOW_TOPLEVEL,
++                              "screen", screen,
++                              NULL);
++  g_object_ref_sink (fake_parent);
++
++  dialog = GTK_WIDGET (scanner_dialog_new (arg_app_id, arg_scanners, arg_options));
++  gtk_window_set_transient_for (GTK_WINDOW (dialog), GTK_WINDOW (fake_parent));
++
++  handle = g_new0 (ScannerDialogHandle, 1);
++  handle->impl = object;
++  handle->invocation = invocation;
++  handle->request = g_object_ref (request);
++  handle->dialog = g_object_ref (dialog);
++  handle->external_parent = external_parent;
++  handle->response = 2;
++
++  g_signal_connect (request, "handle-close", G_CALLBACK (handle_close), handle);
++
++  g_signal_connect (dialog, "done", G_CALLBACK (scanner_dialog_done), handle);
++
++  gtk_widget_realize (dialog);
++
++  if (external_parent)
++    external_window_set_parent_of (external_parent, gtk_widget_get_window (dialog));
++
++  gtk_widget_show (dialog);
++
++  request_export (request, g_dbus_method_invocation_get_connection (invocation));
++
++  return TRUE;
++}
++
++gboolean
++scanner_init (GDBusConnection  *bus,
++              GError          **error)
++{
++  GDBusInterfaceSkeleton *helper;
++
++  helper = G_DBUS_INTERFACE_SKELETON (xdp_impl_scanner_skeleton_new ());
++
++  g_signal_connect (helper, "handle-select-scanners", G_CALLBACK (handle_select_scanners), NULL);
++
++  xdp_impl_scanner_set_version (XDP_IMPL_SCANNER (helper), 1);
++
++  if (!g_dbus_interface_skeleton_export (helper,
++                                         bus,
++                                         DESKTOP_PORTAL_OBJECT_PATH,
++                                         error))
++    return FALSE;
++
++  g_debug ("providing %s", g_dbus_interface_skeleton_get_info (helper)->name);
++
++  return TRUE;
++}
+diff --git a/src/scanner.h b/src/scanner.h
+new file mode 100644
+index 0000000..b3ba7fa
+--- /dev/null
++++ b/src/scanner.h
+@@ -0,0 +1,24 @@
++/*
++ * scanner.h
++ *
++ * Copyright © 2026 Christian Schaller
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library. If not, see <http://www.gnu.org/licenses/>.
++ */
++
++#pragma once
++
++#include <gio/gio.h>
++
++gboolean scanner_init (GDBusConnection *bus, GError **error);
+diff --git a/src/scannerdialog.c b/src/scannerdialog.c
+new file mode 100644
+index 0000000..640e2e9
+--- /dev/null
++++ b/src/scannerdialog.c
+@@ -0,0 +1,470 @@
++/*
++ * scannerdialog.c
++ *
++ * Copyright © 2026 Christian Schaller
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library. If not, see <http://www.gnu.org/licenses/>.
++ */
++
++#define _GNU_SOURCE 1
++
++#include "config.h"
++
++#include <string.h>
++
++#include <gio/gio.h>
++#include <gio/gdesktopappinfo.h>
++#include <glib/gi18n.h>
++#include <gdk/gdkkeysyms.h>
++
++#include "scannerdialog.h"
++
++struct _ScannerDialog {
++  GtkWindow parent;
++
++  GtkWidget *accept_button;
++  GtkWidget *scanner_list;
++  GtkWidget *heading;
++  GtkWidget *subheading;
++  GtkWidget *stack;
++
++  /* The check button of every row that can be chosen, in list order */
++  GPtrArray *choices;
++  gboolean multiple;
++};
++
++struct _ScannerDialogClass {
++  GtkWindowClass parent_class;
++};
++
++enum {
++  DONE,
++  LAST_SIGNAL
++};
++
++static guint signals[LAST_SIGNAL];
++
++G_DEFINE_TYPE (ScannerDialog, scanner_dialog, GTK_TYPE_WINDOW)
++
++#define SCANNER_ID_KEY "scanner-id"
++
++static void
++update_accept_button (ScannerDialog *dialog)
++{
++  gboolean any = FALSE;
++
++  for (guint i = 0; i < dialog->choices->len; i++)
++    {
++      GtkToggleButton *choice = g_ptr_array_index (dialog->choices, i);
++
++      if (gtk_toggle_button_get_active (choice))
++        {
++          any = TRUE;
++          break;
++        }
++    }
++
++  gtk_widget_set_sensitive (dialog->accept_button, any);
++}
++
++static void
++choice_toggled (GtkToggleButton *choice,
++                ScannerDialog   *dialog)
++{
++  update_accept_button (dialog);
++}
++
++/* A click anywhere on a row that can be chosen chooses it */
++static void
++row_activated (GtkListBox    *list,
++               GtkListBoxRow *row,
++               ScannerDialog *dialog)
++{
++  GtkWidget *choice = g_object_get_data (G_OBJECT (row), "choice");
++
++  if (choice && gtk_widget_get_sensitive (choice))
++    gtk_button_clicked (GTK_BUTTON (choice));
++}
++
++static void
++finish (ScannerDialog *dialog,
++        int            response)
++{
++  gtk_widget_hide (GTK_WIDGET (dialog));
++  g_signal_emit (dialog, signals[DONE], 0, response);
++}
++
++static void
++button_clicked (GtkWidget     *button,
++                ScannerDialog *dialog)
++{
++  finish (dialog, button == dialog->accept_button ? GTK_RESPONSE_OK : GTK_RESPONSE_CANCEL);
++}
++
++/* Escape cancels and Return chooses, whichever control has the focus: a radio button would
++ * otherwise take Return itself. */
++static gboolean
++scanner_dialog_key_press_event (GtkWidget   *widget,
++                                GdkEventKey *event)
++{
++  ScannerDialog *dialog = SCANNER_DIALOG (widget);
++
++  if (event->keyval == GDK_KEY_Escape)
++    {
++      finish (dialog, GTK_RESPONSE_CANCEL);
++      return GDK_EVENT_STOP;
++    }
++
++  if ((event->keyval == GDK_KEY_Return || event->keyval == GDK_KEY_KP_Enter) &&
++      gtk_widget_get_sensitive (dialog->accept_button))
++    {
++      finish (dialog, GTK_RESPONSE_OK);
++      return GDK_EVENT_STOP;
++    }
++
++  return GTK_WIDGET_CLASS (scanner_dialog_parent_class)->key_press_event (widget, event);
++}
++
++static gboolean
++scanner_dialog_delete_event (GtkWidget   *widget,
++                             GdkEventAny *event)
++{
++  finish (SCANNER_DIALOG (widget), GTK_RESPONSE_CANCEL);
++
++  return TRUE;
++}
++
++static void
++scanner_dialog_finalize (GObject *object)
++{
++  ScannerDialog *dialog = SCANNER_DIALOG (object);
++
++  g_clear_pointer (&dialog->choices, g_ptr_array_unref);
++
++  G_OBJECT_CLASS (scanner_dialog_parent_class)->finalize (object);
++}
++
++static void
++scanner_dialog_class_init (ScannerDialogClass *class)
++{
++  GObjectClass *object_class = G_OBJECT_CLASS (class);
++  GtkWidgetClass *widget_class = GTK_WIDGET_CLASS (class);
++
++  object_class->finalize = scanner_dialog_finalize;
++  widget_class->key_press_event = scanner_dialog_key_press_event;
++  widget_class->delete_event = scanner_dialog_delete_event;
++
++  signals[DONE] = g_signal_new ("done",
++                                G_TYPE_FROM_CLASS (class),
++                                G_SIGNAL_RUN_LAST,
++                                0,
++                                NULL, NULL,
++                                NULL,
++                                G_TYPE_NONE, 1,
++                                G_TYPE_INT);
++
++  gtk_widget_class_set_template_from_resource (widget_class, "/org/freedesktop/portal/desktop/gtk/scannerdialog.ui");
++  gtk_widget_class_bind_template_child (widget_class, ScannerDialog, accept_button);
++  gtk_widget_class_bind_template_child (widget_class, ScannerDialog, scanner_list);
++  gtk_widget_class_bind_template_child (widget_class, ScannerDialog, heading);
++  gtk_widget_class_bind_template_child (widget_class, ScannerDialog, subheading);
++  gtk_widget_class_bind_template_child (widget_class, ScannerDialog, stack);
++  gtk_widget_class_bind_template_callback (widget_class, button_clicked);
++  gtk_widget_class_bind_template_callback (widget_class, row_activated);
++}
++
++static void
++scanner_dialog_init (ScannerDialog *dialog)
++{
++  dialog->choices = g_ptr_array_new ();
++
++  gtk_widget_init_template (GTK_WIDGET (dialog));
++}
++
++static char *
++get_app_display_name (const char *app_id)
++{
++  g_autoptr(GAppInfo) info = NULL;
++  g_autofree char *id = NULL;
++
++  if (!app_id || *app_id == '\0')
++    return NULL;
++
++  id = g_strconcat (app_id, ".desktop", NULL);
++  info = G_APP_INFO (g_desktop_app_info_new (id));
++  if (info)
++    return g_strdup (g_app_info_get_display_name (info));
++
++  return g_strdup (app_id);
++}
++
++/* What the scanner is and how it is connected, from the hints the portal gives. The name of the
++ * scanner comes from the driver and is shown as it is. */
++static char *
++describe_scanner (const char  *kind,
++                  const char  *type,
++                  const char **capabilities,
++                  gboolean     available)
++{
++  g_autoptr(GPtrArray) parts = g_ptr_array_new_with_free_func (g_free);
++
++  if (g_strcmp0 (kind, "usb") == 0)
++    g_ptr_array_add (parts, g_strdup (_("USB")));
++  else if (g_strcmp0 (kind, "network") == 0)
++    g_ptr_array_add (parts, g_strdup (_("Network")));
++
++  /* Every kind of glass the scanner has, since a multi-function device has two */
++  if (g_strv_contains (capabilities, "film") ||
++      g_strv_contains (capabilities, "flatbed") ||
++      g_strv_contains (capabilities, "adf"))
++    {
++      g_autoptr(GPtrArray) sources = g_ptr_array_new ();
++
++      if (g_strv_contains (capabilities, "flatbed"))
++        g_ptr_array_add (sources, (gpointer) _("Flatbed"));
++      if (g_strv_contains (capabilities, "adf"))
++        g_ptr_array_add (sources, (gpointer) _("Feeder"));
++      if (g_strv_contains (capabilities, "film"))
++        g_ptr_array_add (sources, (gpointer) _("Film"));
++      g_ptr_array_add (sources, NULL);
++
++      g_ptr_array_add (parts, g_strjoinv (" + ", (char **) sources->pdata));
++    }
++  else if (type && *type && g_strcmp0 (type, "virtual device") != 0)
++    g_ptr_array_add (parts, g_strdup (type));
++
++  if (!available)
++    g_ptr_array_add (parts, g_strdup (_("Not available")));
++
++  g_ptr_array_add (parts, NULL);
++
++  return g_strjoinv (" · ", (char **) parts->pdata);
++}
++
++static void
++add_scanner_row (ScannerDialog  *dialog,
++                 const char     *id,
++                 GVariant       *info,
++                 GtkRadioButton **first)
++{
++  g_autoptr(GVariantDict) dict = g_variant_dict_new (info);
++  g_autofree const char **capabilities = NULL;
++  g_autofree char *subtitle = NULL;
++  g_autofree char *title = NULL;
++  const char *name = NULL;
++  const char *vendor = NULL;
++  const char *model = NULL;
++  const char *kind = NULL;
++  const char *type = NULL;
++  gboolean available = TRUE;
++  GtkWidget *row;
++  GtkWidget *box;
++  GtkWidget *icon;
++  GtkWidget *texts;
++  GtkWidget *label;
++  GtkWidget *choice;
++  AtkObject *atk;
++
++  g_variant_dict_lookup (dict, "name", "&s", &name);
++  g_variant_dict_lookup (dict, "vendor", "&s", &vendor);
++  g_variant_dict_lookup (dict, "model", "&s", &model);
++  g_variant_dict_lookup (dict, "kind", "&s", &kind);
++  g_variant_dict_lookup (dict, "type", "&s", &type);
++  g_variant_dict_lookup (dict, "available", "b", &available);
++  g_variant_dict_lookup (dict, "capabilities", "^a&s", &capabilities);
++
++  if (name && *name)
++    title = g_strdup (name);
++  else if (vendor && model)
++    title = g_strdup_printf ("%s %s", vendor, model);
++  else
++    title = g_strdup (_("Unknown scanner"));
++
++  subtitle = describe_scanner (kind, type, capabilities ? capabilities : (const char *[]) { NULL }, available);
++
++  box = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 12);
++  gtk_widget_set_margin_start (box, 12);
++  gtk_widget_set_margin_end (box, 12);
++  gtk_widget_set_margin_top (box, 8);
++  gtk_widget_set_margin_bottom (box, 8);
++
++  icon = gtk_image_new_from_icon_name ("scanner-symbolic", GTK_ICON_SIZE_LARGE_TOOLBAR);
++  gtk_box_pack_start (GTK_BOX (box), icon, FALSE, FALSE, 0);
++
++  texts = gtk_box_new (GTK_ORIENTATION_VERTICAL, 2);
++  gtk_widget_set_valign (texts, GTK_ALIGN_CENTER);
++  gtk_box_pack_start (GTK_BOX (box), texts, TRUE, TRUE, 0);
++
++  label = gtk_label_new (title);
++  gtk_label_set_xalign (GTK_LABEL (label), 0);
++  gtk_label_set_ellipsize (GTK_LABEL (label), PANGO_ELLIPSIZE_END);
++  gtk_box_pack_start (GTK_BOX (texts), label, FALSE, FALSE, 0);
++
++  if (*subtitle)
++    {
++      label = gtk_label_new (subtitle);
++      gtk_label_set_xalign (GTK_LABEL (label), 0);
++      gtk_label_set_ellipsize (GTK_LABEL (label), PANGO_ELLIPSIZE_END);
++      gtk_style_context_add_class (gtk_widget_get_style_context (label), "dim-label");
++      gtk_box_pack_start (GTK_BOX (texts), label, FALSE, FALSE, 0);
++    }
++
++  /* One choice at most unless the application can use several: radio behaviour */
++  if (dialog->multiple)
++    choice = gtk_check_button_new ();
++  else
++    choice = gtk_radio_button_new_from_widget (*first);
++  gtk_widget_set_valign (choice, GTK_ALIGN_CENTER);
++  gtk_box_pack_end (GTK_BOX (box), choice, FALSE, FALSE, 0);
++
++  /* The control has no text of its own, so a screen reader needs the scanner's name on it */
++  atk = gtk_widget_get_accessible (choice);
++  atk_object_set_name (atk, title);
++  atk_object_set_description (atk, subtitle);
++
++  g_object_set_data_full (G_OBJECT (choice), SCANNER_ID_KEY, g_strdup (id), g_free);
++
++  row = gtk_list_box_row_new ();
++  gtk_container_add (GTK_CONTAINER (row), box);
++  gtk_widget_set_can_focus (row, FALSE);
++  g_object_set_data (G_OBJECT (row), "choice", choice);
++
++  if (!available)
++    {
++      /* Only the control is dimmed. The text says why the scanner cannot be chosen, so it stays
++       * at the contrast of the other rows, which matters most in high contrast. */
++      gtk_widget_set_sensitive (choice, FALSE);
++      gtk_list_box_row_set_activatable (GTK_LIST_BOX_ROW (row), FALSE);
++    }
++  else
++    {
++      if (!dialog->multiple && !*first)
++        *first = GTK_RADIO_BUTTON (choice);
++
++      g_signal_connect (choice, "toggled", G_CALLBACK (choice_toggled), dialog);
++      g_ptr_array_add (dialog->choices, choice);
++    }
++
++  gtk_widget_show_all (row);
++  gtk_list_box_insert (GTK_LIST_BOX (dialog->scanner_list), row, -1);
++}
++
++ScannerDialog *
++scanner_dialog_new (const char *app_id,
++                    GVariant   *scanners,
++                    GVariant   *options)
++{
++  g_autoptr(GVariantDict) opts = g_variant_dict_new (options);
++  g_autofree char *app_name = NULL;
++  g_autofree char *heading = NULL;
++  GtkRadioButton *first = NULL;
++  guint n_rows = 0;
++  const char *accept_label = NULL;
++  const char *title = NULL;
++  gboolean modal = TRUE;
++  GVariantIter iter;
++  GVariant *info;
++  const char *id;
++  ScannerDialog *dialog;
++
++  dialog = g_object_new (SCANNER_TYPE_DIALOG, NULL);
++
++  g_variant_dict_lookup (opts, "multiple", "b", &dialog->multiple);
++  g_variant_dict_lookup (opts, "modal", "b", &modal);
++  g_variant_dict_lookup (opts, "accept_label", "&s", &accept_label);
++  g_variant_dict_lookup (opts, "title", "&s", &title);
++
++  gtk_window_set_modal (GTK_WINDOW (dialog), modal);
++  gtk_window_set_title (GTK_WINDOW (dialog), dialog->multiple ? _("Select Scanners") : _("Select Scanner"));
++  gtk_header_bar_set_title (GTK_HEADER_BAR (gtk_window_get_titlebar (GTK_WINDOW (dialog))),
++                            dialog->multiple ? _("Select Scanners") : _("Select Scanner"));
++
++  if (accept_label && *accept_label)
++    {
++      gtk_button_set_label (GTK_BUTTON (dialog->accept_button), accept_label);
++      gtk_button_set_use_underline (GTK_BUTTON (dialog->accept_button), TRUE);
++    }
++
++  app_name = get_app_display_name (app_id);
++  if (app_name)
++    heading = dialog->multiple ? g_strdup_printf (_("%s wants to use the following scanners"), app_name)
++                               : g_strdup_printf (_("%s wants to use a scanner"), app_name);
++  else
++    heading = g_strdup (dialog->multiple ? _("An app wants to use the following scanners")
++                                         : _("An app wants to use a scanner"));
++  gtk_label_set_label (GTK_LABEL (dialog->heading), heading);
++
++  /* The application's own words, kept apart from the heading, which is the portal's */
++  if (title && *title)
++    {
++      gtk_label_set_label (GTK_LABEL (dialog->subheading), title);
++      gtk_label_set_ellipsize (GTK_LABEL (dialog->subheading), PANGO_ELLIPSIZE_END);
++      gtk_label_set_lines (GTK_LABEL (dialog->subheading), 2);
++      gtk_widget_show (dialog->subheading);
++    }
++
++  g_variant_iter_init (&iter, scanners);
++  while (g_variant_iter_next (&iter, "(&s@a{sv})", &id, &info))
++    {
++      add_scanner_row (dialog, id, info, &first);
++      n_rows++;
++      g_variant_unref (info);
++    }
++
++  /* The first scanner that can be used is chosen already, so that one click is enough in the
++   * common case of one scanner. */
++  if (dialog->choices->len > 0)
++    {
++      GtkWidget *preselected = g_ptr_array_index (dialog->choices, 0);
++
++      gtk_toggle_button_set_active (GTK_TOGGLE_BUTTON (preselected), TRUE);
++      gtk_window_set_focus (GTK_WINDOW (dialog), preselected);
++    }
++  else
++    gtk_stack_set_visible_child_name (GTK_STACK (dialog->stack), "empty-state");
++
++  update_accept_button (dialog);
++
++  /* Size the window to the list: room for the heading and the header bar, a row each, and no
++   * more than about what fits on a small screen. */
++  {
++    int height = n_rows > 0 ? 190 + (int) n_rows * 60 : 320;
++
++    gtk_window_set_default_size (GTK_WINDOW (dialog), 500, CLAMP (height, 280, 600));
++  }
++
++  return dialog;
++}
++
++char **
++scanner_dialog_get_selected (ScannerDialog *dialog)
++{
++  GStrvBuilder *builder = g_strv_builder_new ();
++  char **selected;
++
++  g_return_val_if_fail (dialog != NULL, NULL);
++
++  for (guint i = 0; i < dialog->choices->len; i++)
++    {
++      GtkToggleButton *choice = g_ptr_array_index (dialog->choices, i);
++
++      if (gtk_toggle_button_get_active (choice))
++        g_strv_builder_add (builder, g_object_get_data (G_OBJECT (choice), SCANNER_ID_KEY));
++    }
++
++  selected = g_strv_builder_end (builder);
++  g_strv_builder_unref (builder);
++
++  return selected;
++}
+diff --git a/src/scannerdialog.h b/src/scannerdialog.h
+new file mode 100644
+index 0000000..086c8d8
+--- /dev/null
++++ b/src/scannerdialog.h
+@@ -0,0 +1,37 @@
++/*
++ * scannerdialog.h
++ *
++ * Copyright © 2026 Christian Schaller
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library. If not, see <http://www.gnu.org/licenses/>.
++ */
++
++#pragma once
++
++#include <gtk/gtk.h>
++
++GType scanner_dialog_get_type (void) G_GNUC_CONST;
++
++#define SCANNER_TYPE_DIALOG (scanner_dialog_get_type ())
++#define SCANNER_DIALOG(object) (G_TYPE_CHECK_INSTANCE_CAST (object, SCANNER_TYPE_DIALOG, ScannerDialog))
++
++typedef struct _ScannerDialog ScannerDialog;
++typedef struct _ScannerDialogClass ScannerDialogClass;
++
++ScannerDialog *scanner_dialog_new (const char *app_id,
++                                   GVariant   *scanners,
++                                   GVariant   *options);
++
++/* The ids of the scanners the user chose, NULL-terminated; free with g_strfreev () */
++char **scanner_dialog_get_selected (ScannerDialog *dialog);
+diff --git a/src/scannerdialog.ui b/src/scannerdialog.ui
+new file mode 100644
+index 0000000..47cca80
+--- /dev/null
++++ b/src/scannerdialog.ui
+@@ -0,0 +1,145 @@
++<?xml version="1.0" encoding="UTF-8"?>
++<interface domain="xdg-desktop-portal-gtk">
++  <!-- interface-requires gtk+ 3.22 -->
++  <template class="ScannerDialog" parent="GtkWindow">
++    <property name="type-hint">dialog</property>
++    <property name="default-width">500</property>
++    <property name="default-height">280</property>
++    <property name="title" translatable="yes">Select Scanner</property>
++    <child type="titlebar">
++      <object class="GtkHeaderBar" id="titlebar">
++        <property name="visible">1</property>
++        <property name="title" translatable="yes">Select Scanner</property>
++        <child>
++          <object class="GtkButton" id="cancel_button">
++            <property name="visible">1</property>
++            <property name="label" translatable="yes">_Cancel</property>
++            <property name="use-underline">1</property>
++            <signal name="clicked" handler="button_clicked"/>
++          </object>
++        </child>
++        <child>
++          <object class="GtkButton" id="accept_button">
++            <property name="visible">1</property>
++            <property name="label" translatable="yes">_Select</property>
++            <property name="use-underline">1</property>
++            <property name="sensitive">0</property>
++            <property name="can-default">1</property>
++            <signal name="clicked" handler="button_clicked"/>
++            <style>
++              <class name="suggested-action"/>
++            </style>
++          </object>
++          <packing>
++            <property name="pack-type">end</property>
++          </packing>
++        </child>
++      </object>
++    </child>
++    <child>
++      <object class="GtkStack" id="stack">
++        <property name="visible">1</property>
++        <property name="hexpand">1</property>
++        <property name="vexpand">1</property>
++
++        <!-- Scanner list -->
++        <child>
++          <object class="GtkBox">
++            <property name="visible">1</property>
++            <property name="orientation">vertical</property>
++            <property name="margin">18</property>
++            <property name="spacing">6</property>
++            <child>
++              <object class="GtkLabel" id="heading">
++                <property name="visible">1</property>
++                <property name="wrap">1</property>
++                <property name="xalign">0</property>
++              </object>
++            </child>
++            <child>
++              <object class="GtkLabel" id="subheading">
++                <property name="visible">0</property>
++                <property name="no-show-all">1</property>
++                <property name="wrap">1</property>
++                <property name="xalign">0</property>
++                <style>
++                  <class name="dim-label"/>
++                </style>
++              </object>
++            </child>
++            <child>
++              <object class="GtkScrolledWindow">
++                <property name="visible">1</property>
++                <property name="hscrollbar-policy">never</property>
++                <property name="shadow-type">in</property>
++                <property name="vexpand">1</property>
++                <property name="margin-top">12</property>
++                <child>
++                  <object class="GtkListBox" id="scanner_list">
++                    <property name="visible">1</property>
++                    <property name="selection-mode">none</property>
++                    <signal name="row-activated" handler="row_activated"/>
++                  </object>
++                </child>
++              </object>
++            </child>
++          </object>
++          <packing>
++            <property name="name">scanners</property>
++          </packing>
++        </child>
++
++        <!-- Empty state -->
++        <child>
++          <object class="GtkBox">
++            <property name="visible">1</property>
++            <property name="orientation">vertical</property>
++            <property name="valign">center</property>
++            <property name="spacing">6</property>
++            <property name="margin">18</property>
++            <child>
++              <object class="GtkImage">
++                <property name="visible">1</property>
++                <property name="icon-name">scanner-symbolic</property>
++                <property name="pixel-size">64</property>
++                <style>
++                  <class name="dim-label"/>
++                </style>
++              </object>
++            </child>
++            <child>
++              <object class="GtkLabel">
++                <property name="visible">1</property>
++                <property name="label" translatable="yes">No Scanners Found</property>
++                <style>
++                  <class name="title-2"/>
++                </style>
++              </object>
++            </child>
++            <child>
++              <object class="GtkLabel">
++                <property name="visible">1</property>
++                <property name="label" translatable="yes">Connect a scanner and make sure it is turned on</property>
++                <property name="wrap">1</property>
++                <property name="justify">center</property>
++                <style>
++                  <class name="dim-label"/>
++                </style>
++              </object>
++            </child>
++          </object>
++          <packing>
++            <property name="name">empty-state</property>
++          </packing>
++        </child>
++      </object>
++    </child>
++  </template>
++  <object class="GtkSizeGroup">
++    <property name="mode">both</property>
++    <widgets>
++      <widget name="cancel_button"/>
++      <widget name="accept_button"/>
++    </widgets>
++  </object>
++</interface>
+diff --git a/src/xdg-desktop-portal-gtk.c b/src/xdg-desktop-portal-gtk.c
+index 28859e4..12e9e18 100644
+--- a/src/xdg-desktop-portal-gtk.c
++++ b/src/xdg-desktop-portal-gtk.c
+@@ -55,6 +55,7 @@
+ #include "access.h"
+ #include "account.h"
+ #include "email.h"
++#include "scanner.h"
+ 
+ #ifdef BUILD_LOCKDOWN
+ #include "lockdown.h"
+@@ -173,6 +174,12 @@ on_bus_acquired (GDBusConnection *connection,
+       g_clear_error (&error);
+     }
+ 
++  if (!scanner_init (connection, &error))
++    {
++      g_warning ("error: %s\n", error->message);
++      g_clear_error (&error);
++    }
++
+ #ifdef BUILD_LOCKDOWN
+   if (!lockdown_init (connection, &error))
+     {
+diff --git a/src/xdg-desktop-portal-gtk.gresource.xml b/src/xdg-desktop-portal-gtk.gresource.xml
+index 8ddf406..74d58f2 100644
+--- a/src/xdg-desktop-portal-gtk.gresource.xml
++++ b/src/xdg-desktop-portal-gtk.gresource.xml
+@@ -4,6 +4,7 @@
+     <file>appchooserdialog.ui</file>
+     <file>appchooserrow.ui</file>
+     <file>accountdialog.ui</file>
++    <file>scannerdialog.ui</file>
+     <file>wallpaperdialog.ui</file>
+     <file>wallpaperpreview.ui</file>
+     <file>wallpaperpreview.css</file>

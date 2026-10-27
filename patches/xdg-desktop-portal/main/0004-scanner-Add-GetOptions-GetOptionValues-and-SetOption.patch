@@ -1,0 +1,755 @@
+From 96be008208e2a7c5c97d13fb706f30d130066321 Mon Sep 17 00:00:00 2001
+From: "Christian F.K. Schaller" <christian.schaller@gmail.com>
+Date: Mon, 26 Oct 2026 11:25:33 -0400
+Subject: [PATCH] scanner: Add GetOptions, GetOptionValues and SetOptions
+
+This commit gives an open scanner session its options. The helper
+answers three more requests: get_options lists SANE's options as
+descriptors, get_values reads every active, readable one, and
+set_options applies a list in order, since the order matters to SANE
+(mode before resolution, for example). The portal forwards the
+application's call and maps the helper's answer: an application's own
+mistake is InvalidArgument, anything else Failed.
+
+Option 0, the count, is not listed. String options whose names contain
+"file", "path" or "dir" are hidden, so that an application cannot make
+the host open files of its choosing; SANE has no type for a file name,
+so this is a heuristic on the name. Options that carry arrays, such as
+gamma tables, are hidden because the interface cannot carry them yet.
+
+A value of {'auto': true} sets an option to its automatic value, and only
+if it has the automatic capability. Integers are accepted for fixed
+options. An entry that fails stops the call and leaves the earlier
+entries applied.
+
+Calls on one session are serialized, since the helper's replies are
+matched to requests by order. Closing a session shuts its socket down
+instead of closing it, which ends the helper and any call waiting on it
+without leaving a call with a descriptor that could be reused; the
+descriptor is closed when the session is finalized.
+
+Tested with SANE's test backend, on the helper alone over a socketpair
+(16 checks) and through the portal on a private bus (13 checks):
+descriptors, values, ordered set, reload flags, auto, invalid names,
+types and values, another application and an unknown or closed session
+refused, and ten concurrent calls. Not tested: a helper that crashes in
+the middle of a call and the call timeout.
+---
+ desktop-portal/scanner-helper.c | 434 +++++++++++++++++++++++++++++++-
+ desktop-portal/scanner.c        | 196 ++++++++++++++-
+ 2 files changed, 625 insertions(+), 5 deletions(-)
+
+diff --git a/desktop-portal/scanner-helper.c b/desktop-portal/scanner-helper.c
+index a50061f..7d248c6 100644
+--- a/desktop-portal/scanner-helper.c
++++ b/desktop-portal/scanner-helper.c
+@@ -176,6 +176,413 @@ send_failure (guint32      serial,
+   return send_reply (serial, FALSE, g_variant_new ("(ss)", kind, message));
+ }
+ 
++/* ---- Options ----
++ *
++ * The same view of SANE's options that the portal's interface gives applications: by name, in the
++ * backend's order, without option 0 (the count), and without the options that would let an
++ * application make the host open files or sockets of its choosing. */
++
++static SANE_Int
++option_count (SANE_Handle handle)
++{
++  SANE_Int count = 0;
++
++  if (sane_control_option (handle, 0, SANE_ACTION_GET_VALUE, &count, NULL) != SANE_STATUS_GOOD)
++    return 0;
++
++  return count;
++}
++
++/* Options that are not given to applications. SANE has no type for file names, so a string option
++ * is hidden by its name, which is a heuristic; arrays (gamma tables) cannot be carried yet. */
++static gboolean
++option_hidden (const SANE_Option_Descriptor *desc)
++{
++  if (desc->type == SANE_TYPE_STRING)
++    {
++      g_autofree char *name = g_ascii_strdown (desc->name ? desc->name : "", -1);
++
++      return strstr (name, "file") || strstr (name, "path") || strstr (name, "dir");
++    }
++
++  return (desc->type == SANE_TYPE_BOOL || desc->type == SANE_TYPE_INT || desc->type == SANE_TYPE_FIXED) &&
++         desc->size > (SANE_Int) sizeof (SANE_Word);
++}
++
++static const char *
++option_type_name (SANE_Value_Type type)
++{
++  switch (type)
++    {
++    case SANE_TYPE_BOOL: return "bool";
++    case SANE_TYPE_INT: return "int";
++    case SANE_TYPE_FIXED: return "fixed";
++    case SANE_TYPE_STRING: return "string";
++    case SANE_TYPE_BUTTON: return "button";
++    case SANE_TYPE_GROUP: return "group";
++    }
++  return "group";
++}
++
++static const char *
++option_unit_name (SANE_Unit unit)
++{
++  switch (unit)
++    {
++    case SANE_UNIT_PIXEL: return "pixel";
++    case SANE_UNIT_BIT: return "bit";
++    case SANE_UNIT_MM: return "mm";
++    case SANE_UNIT_DPI: return "dpi";
++    case SANE_UNIT_PERCENT: return "percent";
++    case SANE_UNIT_MICROSECOND: return "microsecond";
++    case SANE_UNIT_NONE: break;
++    }
++  return "none";
++}
++
++static double
++option_word_to_double (const SANE_Option_Descriptor *desc,
++                       SANE_Word                     word)
++{
++  return desc->type == SANE_TYPE_FIXED ? SANE_UNFIX (word) : (double) word;
++}
++
++static GVariant *
++option_constraint (const SANE_Option_Descriptor *desc)
++{
++  switch (desc->constraint_type)
++    {
++    case SANE_CONSTRAINT_RANGE:
++      return g_variant_new ("(sv)", "range",
++                            g_variant_new ("(ddd)",
++                                           option_word_to_double (desc, desc->constraint.range->min),
++                                           option_word_to_double (desc, desc->constraint.range->max),
++                                           option_word_to_double (desc, desc->constraint.range->quant)));
++
++    case SANE_CONSTRAINT_WORD_LIST:
++      {
++        const SANE_Word *list = desc->constraint.word_list;
++        GVariantBuilder builder;
++
++        g_variant_builder_init (&builder,
++                                desc->type == SANE_TYPE_FIXED ? G_VARIANT_TYPE ("ad") : G_VARIANT_TYPE ("ai"));
++        for (SANE_Word i = 1; i <= list[0]; i++)
++          {
++            if (desc->type == SANE_TYPE_FIXED)
++              g_variant_builder_add (&builder, "d", SANE_UNFIX (list[i]));
++            else
++              g_variant_builder_add (&builder, "i", (gint32) list[i]);
++          }
++        return g_variant_new ("(sv)", "list", g_variant_builder_end (&builder));
++      }
++
++    case SANE_CONSTRAINT_STRING_LIST:
++      {
++        const SANE_String_Const *list = desc->constraint.string_list;
++        GVariantBuilder builder;
++
++        g_variant_builder_init (&builder, G_VARIANT_TYPE ("as"));
++        for (size_t i = 0; list && list[i]; i++)
++          g_variant_builder_add (&builder, "s", list[i]);
++        return g_variant_new ("(sv)", "list", g_variant_builder_end (&builder));
++      }
++
++    case SANE_CONSTRAINT_NONE:
++      break;
++    }
++
++  return g_variant_new ("(sv)", "none", g_variant_new_boolean (FALSE));
++}
++
++static GVariant *
++option_capabilities (SANE_Int cap)
++{
++  GVariantBuilder builder;
++
++  g_variant_builder_init (&builder, G_VARIANT_TYPE ("as"));
++  if (cap & SANE_CAP_SOFT_SELECT) g_variant_builder_add (&builder, "s", "settable");
++  if (cap & SANE_CAP_SOFT_DETECT) g_variant_builder_add (&builder, "s", "readable");
++  if (cap & SANE_CAP_AUTOMATIC) g_variant_builder_add (&builder, "s", "automatic");
++  if (cap & SANE_CAP_INACTIVE) g_variant_builder_add (&builder, "s", "inactive");
++  if (cap & SANE_CAP_ADVANCED) g_variant_builder_add (&builder, "s", "advanced");
++  if (cap & SANE_CAP_EMULATED) g_variant_builder_add (&builder, "s", "emulated");
++  if (cap & SANE_CAP_HARD_SELECT) g_variant_builder_add (&builder, "s", "hardware");
++
++  return g_variant_builder_end (&builder);
++}
++
++static GVariant *
++option_descriptor_to_variant (const SANE_Option_Descriptor *desc)
++{
++  GVariantBuilder builder;
++
++  g_variant_builder_init (&builder, G_VARIANT_TYPE_VARDICT);
++  g_variant_builder_add (&builder, "{sv}", "name", g_variant_new_string (desc->name ? desc->name : ""));
++  g_variant_builder_add (&builder, "{sv}", "title", g_variant_new_string (desc->title ? desc->title : ""));
++  g_variant_builder_add (&builder, "{sv}", "description", g_variant_new_string (desc->desc ? desc->desc : ""));
++  g_variant_builder_add (&builder, "{sv}", "type", g_variant_new_string (option_type_name (desc->type)));
++  g_variant_builder_add (&builder, "{sv}", "unit", g_variant_new_string (option_unit_name (desc->unit)));
++  g_variant_builder_add (&builder, "{sv}", "size", g_variant_new_uint32 (1));
++  g_variant_builder_add (&builder, "{sv}", "constraint", option_constraint (desc));
++  g_variant_builder_add (&builder, "{sv}", "capabilities", option_capabilities (desc->cap));
++
++  return g_variant_builder_end (&builder);
++}
++
++/* The option called name, as its SANE index, or 0 if there is none that applications may use */
++static SANE_Int
++option_find (SANE_Handle                    handle,
++             const char                    *name,
++             const SANE_Option_Descriptor **desc_out)
++{
++  SANE_Int count = option_count (handle);
++
++  if (*name == '\0')
++    return 0;
++
++  for (SANE_Int i = 1; i < count; i++)
++    {
++      const SANE_Option_Descriptor *desc = sane_get_option_descriptor (handle, i);
++
++      if (desc != NULL && desc->name != NULL && strcmp (desc->name, name) == 0 && !option_hidden (desc))
++        {
++          *desc_out = desc;
++          return i;
++        }
++    }
++
++  return 0;
++}
++
++/* The current value of an option, or NULL if it has none that can be read */
++static GVariant *
++option_read_value (SANE_Handle                   handle,
++                   SANE_Int                      index,
++                   const SANE_Option_Descriptor *desc)
++{
++  g_autofree guchar *buffer = NULL;
++
++  if (desc->type == SANE_TYPE_GROUP || desc->type == SANE_TYPE_BUTTON)
++    return NULL;
++
++  buffer = g_malloc0 (desc->size > 0 ? desc->size : sizeof (SANE_Word));
++  if (sane_control_option (handle, index, SANE_ACTION_GET_VALUE, buffer, NULL) != SANE_STATUS_GOOD)
++    return NULL;
++
++  switch (desc->type)
++    {
++    case SANE_TYPE_BOOL: return g_variant_new_boolean (*(SANE_Bool *) buffer);
++    case SANE_TYPE_INT: return g_variant_new_int32 (*(SANE_Int *) buffer);
++    case SANE_TYPE_FIXED: return g_variant_new_double (SANE_UNFIX (*(SANE_Fixed *) buffer));
++    case SANE_TYPE_STRING: return g_variant_new_string ((const char *) buffer);
++    case SANE_TYPE_BUTTON:
++    case SANE_TYPE_GROUP:
++      break;
++    }
++
++  return NULL;
++}
++
++static GVariant *
++handle_get_options (SANE_Handle handle)
++{
++  SANE_Int count = option_count (handle);
++  GVariantBuilder builder;
++
++  g_variant_builder_init (&builder, G_VARIANT_TYPE ("aa{sv}"));
++  for (SANE_Int i = 1; i < count; i++)
++    {
++      const SANE_Option_Descriptor *desc = sane_get_option_descriptor (handle, i);
++
++      if (desc != NULL && !option_hidden (desc))
++        g_variant_builder_add_value (&builder, option_descriptor_to_variant (desc));
++    }
++
++  return g_variant_builder_end (&builder);
++}
++
++static GVariant *
++handle_get_values (SANE_Handle handle)
++{
++  SANE_Int count = option_count (handle);
++  GVariantBuilder builder;
++
++  g_variant_builder_init (&builder, G_VARIANT_TYPE_VARDICT);
++  for (SANE_Int i = 1; i < count; i++)
++    {
++      const SANE_Option_Descriptor *desc = sane_get_option_descriptor (handle, i);
++      GVariant *value;
++
++      if (desc == NULL || option_hidden (desc) || desc->name == NULL || *desc->name == '\0' ||
++          !SANE_OPTION_IS_ACTIVE (desc->cap) || !(desc->cap & SANE_CAP_SOFT_DETECT))
++        continue;
++
++      value = option_read_value (handle, i, desc);
++      if (value != NULL)
++        g_variant_builder_add (&builder, "{sv}", desc->name, value);
++    }
++
++  return g_variant_builder_end (&builder);
++}
++
++/* Sets one option from the variant the application sent. Returns NULL on success, or the reason
++ * as a newly allocated string, with *kind saying whether the application's value was invalid or
++ * the scanner failed. */
++static char *
++option_set (SANE_Handle   handle,
++            const char   *name,
++            GVariant     *value,
++            SANE_Int     *info_flags,
++            const char  **kind)
++{
++  const SANE_Option_Descriptor *desc = NULL;
++  g_autofree guchar *buffer = NULL;
++  SANE_Status status;
++  SANE_Int info = 0;
++  SANE_Int index;
++
++  *kind = "invalid";
++
++  index = option_find (handle, name, &desc);
++  if (index == 0)
++    return g_strdup_printf ("no option named '%s'", name);
++
++  if (!SANE_OPTION_IS_SETTABLE (desc->cap) || !SANE_OPTION_IS_ACTIVE (desc->cap))
++    return g_strdup_printf ("option '%s' cannot be set now", name);
++
++  if (g_variant_is_of_type (value, G_VARIANT_TYPE_VARDICT))
++    {
++      gboolean automatic = FALSE;
++
++      if (!g_variant_lookup (value, "auto", "b", &automatic) || !automatic)
++        return g_strdup ("a vardict value needs 'auto' set to true");
++      if (!(desc->cap & SANE_CAP_AUTOMATIC))
++        return g_strdup_printf ("option '%s' has no automatic value", name);
++
++      status = sane_control_option (handle, index, SANE_ACTION_SET_AUTO, NULL, &info);
++    }
++  else
++    {
++      buffer = g_malloc0 (desc->size > 0 ? desc->size : sizeof (SANE_Word));
++
++      switch (desc->type)
++        {
++        case SANE_TYPE_BOOL:
++          if (!g_variant_is_of_type (value, G_VARIANT_TYPE_BOOLEAN))
++            return g_strdup_printf ("wrong value type for option '%s'", name);
++          *(SANE_Bool *) buffer = g_variant_get_boolean (value) ? SANE_TRUE : SANE_FALSE;
++          break;
++
++        case SANE_TYPE_INT:
++          if (g_variant_is_of_type (value, G_VARIANT_TYPE_INT32))
++            *(SANE_Int *) buffer = g_variant_get_int32 (value);
++          else if (g_variant_is_of_type (value, G_VARIANT_TYPE_UINT32) &&
++                   g_variant_get_uint32 (value) <= G_MAXINT32)
++            *(SANE_Int *) buffer = (SANE_Int) g_variant_get_uint32 (value);
++          else
++            return g_strdup_printf ("wrong value type for option '%s'", name);
++          break;
++
++        case SANE_TYPE_FIXED:
++          /* Clients often send 2 for 2.0, so integers are accepted */
++          if (g_variant_is_of_type (value, G_VARIANT_TYPE_DOUBLE))
++            *(SANE_Fixed *) buffer = SANE_FIX (g_variant_get_double (value));
++          else if (g_variant_is_of_type (value, G_VARIANT_TYPE_INT32))
++            *(SANE_Fixed *) buffer = SANE_FIX ((double) g_variant_get_int32 (value));
++          else
++            return g_strdup_printf ("wrong value type for option '%s'", name);
++          break;
++
++        case SANE_TYPE_STRING:
++          {
++            const char *string;
++
++            if (!g_variant_is_of_type (value, G_VARIANT_TYPE_STRING))
++              return g_strdup_printf ("wrong value type for option '%s'", name);
++            string = g_variant_get_string (value, NULL);
++            if (strlen (string) >= (size_t) desc->size)
++              return g_strdup_printf ("value for option '%s' is too long", name);
++            strcpy ((char *) buffer, string);
++          }
++          break;
++
++        case SANE_TYPE_BUTTON:
++          /* A button takes true, and nothing else is stored */
++          break;
++
++        case SANE_TYPE_GROUP:
++          return g_strdup_printf ("'%s' is a group and has no value", name);
++        }
++
++      status = sane_control_option (handle, index, SANE_ACTION_SET_VALUE,
++                                    desc->type == SANE_TYPE_BUTTON ? NULL : buffer, &info);
++    }
++
++  if (status != SANE_STATUS_GOOD)
++    {
++      if (status != SANE_STATUS_INVAL)
++        *kind = "failed";
++      return g_strdup_printf ("'%s': %s", name, sane_strstatus (status));
++    }
++
++  *info_flags |= info;
++
++  return NULL;
++}
++
++/* Applies the options in order, since the order matters to SANE (mode before resolution, for
++ * example). Stops at the first that fails. On success returns (a{sv}, as): what each option
++ * ended up as and the flags. On failure returns NULL with *kind and *message set. */
++static GVariant *
++handle_set_options (SANE_Handle   handle,
++                    GVariant     *values,
++                    const char  **kind,
++                    char        **message)
++{
++  g_autoptr(GPtrArray) names = g_ptr_array_new_with_free_func (g_free);
++  GVariantBuilder applied;
++  GVariantBuilder flags;
++  GVariantIter iter;
++  SANE_Int info = 0;
++  const char *name;
++  GVariant *value;
++
++  g_variant_iter_init (&iter, values);
++  while (g_variant_iter_next (&iter, "(&sv)", &name, &value))
++    {
++      char *error = option_set (handle, name, value, &info, kind);
++
++      g_variant_unref (value);
++      if (error != NULL)
++        {
++          *message = error;
++          return NULL;
++        }
++      g_ptr_array_add (names, g_strdup (name));
++    }
++
++  g_variant_builder_init (&applied, G_VARIANT_TYPE_VARDICT);
++  for (guint i = 0; i < names->len; i++)
++    {
++      const SANE_Option_Descriptor *desc = NULL;
++      SANE_Int index = option_find (handle, g_ptr_array_index (names, i), &desc);
++      GVariant *current = index ? option_read_value (handle, index, desc) : NULL;
++
++      if (current != NULL)
++        g_variant_builder_add (&applied, "{sv}", g_ptr_array_index (names, i), current);
++    }
++
++  g_variant_builder_init (&flags, G_VARIANT_TYPE ("as"));
++  if (info & SANE_INFO_INEXACT)
++    g_variant_builder_add (&flags, "s", "inexact");
++  if (info & SANE_INFO_RELOAD_OPTIONS)
++    g_variant_builder_add (&flags, "s", "reload-options");
++  if (info & SANE_INFO_RELOAD_PARAMS)
++    g_variant_builder_add (&flags, "s", "reload-params");
++
++  return g_variant_new ("(@a{sv}@as)", g_variant_builder_end (&applied), g_variant_builder_end (&flags));
++}
++
+ static int
+ run_session (const char *name)
+ {
+@@ -207,6 +614,7 @@ run_session (const char *name)
+     {
+       g_autoptr(GVariant) request = NULL;
+       g_autoptr(GError) error = NULL;
++      g_autoptr(GVariant) args = NULL;
+       const char *method;
+       guint32 serial;
+ 
+@@ -222,13 +630,37 @@ run_session (const char *name)
+           break;
+         }
+ 
+-      g_variant_get (request, "(u&sv)", &serial, &method, NULL);
++      g_variant_get (request, "(u&sv)", &serial, &method, &args);
+ 
+       if (strcmp (method, "close") == 0)
+         {
+           send_reply (serial, TRUE, g_variant_new_string (""));
+           running = FALSE;
+         }
++      else if (strcmp (method, "get_options") == 0)
++        {
++          send_reply (serial, TRUE, handle_get_options (handle));
++        }
++      else if (strcmp (method, "get_values") == 0)
++        {
++          send_reply (serial, TRUE, handle_get_values (handle));
++        }
++      else if (strcmp (method, "set_options") == 0)
++        {
++          const char *kind = "invalid";
++          g_autofree char *message = NULL;
++          GVariant *result = NULL;
++
++          if (g_variant_is_of_type (args, G_VARIANT_TYPE ("a(sv)")))
++            result = handle_set_options (handle, args, &kind, &message);
++          else
++            message = g_strdup ("Malformed arguments");
++
++          if (result != NULL)
++            send_reply (serial, TRUE, result);
++          else
++            send_failure (serial, kind, message);
++        }
+       else
+         {
+           send_failure (serial, "failed", "Unknown method");
+diff --git a/desktop-portal/scanner.c b/desktop-portal/scanner.c
+index 13cbdbe..5b30264 100644
+--- a/desktop-portal/scanner.c
++++ b/desktop-portal/scanner.c
+@@ -59,6 +59,10 @@ struct _XdpScannerSession
+   GSubprocess *helper;
+   int fd;
+   gboolean stopping;
++
++  /* One request to the helper at a time, since a reply is matched to its request by order */
++  GMutex call_lock;
++  guint32 serial;
+ };
+ 
+ #define XDP_TYPE_SCANNER_SESSION (xdp_scanner_session_get_type ())
+@@ -595,11 +599,10 @@ scanner_session_stop_helper (XdpScannerSession *self)
+ {
+   self->stopping = TRUE;
+ 
++  /* Shut down, not close: that ends the helper and any call waiting on it, and the descriptor
++   * stays valid for a call that is using it. It is closed when the session is finalized. */
+   if (self->fd >= 0)
+-    {
+-      close (self->fd);
+-      self->fd = -1;
+-    }
++    shutdown (self->fd, SHUT_RDWR);
+ 
+   if (self->helper != NULL)
+     {
+@@ -649,6 +652,18 @@ xdp_scanner_session_dispose (GObject *object)
+   G_OBJECT_CLASS (xdp_scanner_session_parent_class)->dispose (object);
+ }
+ 
++static void
++xdp_scanner_session_finalize (GObject *object)
++{
++  XdpScannerSession *self = XDP_SCANNER_SESSION (object);
++
++  if (self->fd >= 0)
++    close (self->fd);
++  g_mutex_clear (&self->call_lock);
++
++  G_OBJECT_CLASS (xdp_scanner_session_parent_class)->finalize (object);
++}
++
+ static void
+ xdp_scanner_session_class_init (XdpScannerSessionClass *klass)
+ {
+@@ -656,6 +671,7 @@ xdp_scanner_session_class_init (XdpScannerSessionClass *klass)
+   XdpSessionClass *session_class = (XdpSessionClass *) klass;
+ 
+   object_class->dispose = xdp_scanner_session_dispose;
++  object_class->finalize = xdp_scanner_session_finalize;
+   session_class->close = xdp_scanner_session_close;
+ }
+ 
+@@ -663,6 +679,7 @@ static void
+ xdp_scanner_session_init (XdpScannerSession *self)
+ {
+   self->fd = -1;
++  g_mutex_init (&self->call_lock);
+ }
+ 
+ static XdpScannerSession *
+@@ -908,12 +925,183 @@ handle_open_scanner (XdpDbusScanner         *object,
+   return G_DBUS_METHOD_INVOCATION_HANDLED;
+ }
+ 
++/* ---- Calls to the helper ---- */
++
++#define HELPER_CALL_TIMEOUT_MS 60000
++
++/* Sends one request to the helper and returns its result, or NULL with the error the application
++ * should get: a kind of "invalid" is its own mistake, "busy" and anything else are not. */
++static GVariant *
++scanner_session_call (XdpScannerSession  *self,
++                      const char         *method,
++                      GVariant           *args,
++                      GError            **error)
++{
++  g_autoptr(GVariant) request = NULL;
++  g_autoptr(GVariant) reply = NULL;
++  g_autoptr(GVariant) result = NULL;
++  g_autoptr(GMutexLocker) call_locker = g_mutex_locker_new (&self->call_lock);
++  g_autoptr(GError) local_error = NULL;
++  gboolean ok = FALSE;
++  guint32 serial;
++  guint32 reply_serial;
++  int fd;
++
++  g_mutex_lock (&self->scanner->mutex);
++  fd = self->stopping ? -1 : self->fd;
++  serial = ++self->serial;
++  g_mutex_unlock (&self->scanner->mutex);
++
++  if (fd < 0)
++    {
++      g_variant_unref (g_variant_ref_sink (args));
++      g_set_error (error, XDG_DESKTOP_PORTAL_ERROR, XDG_DESKTOP_PORTAL_ERROR_FAILED,
++                   "The session is closed");
++      return NULL;
++    }
++
++  request = g_variant_ref_sink (g_variant_new ("(usv)", serial, method, args));
++  if (!scanner_protocol_write (fd, request, &local_error) ||
++      (reply = scanner_protocol_read (fd, G_VARIANT_TYPE ("(ubv)"), HELPER_CALL_TIMEOUT_MS,
++                                      &local_error)) == NULL)
++    {
++      g_set_error (error, XDG_DESKTOP_PORTAL_ERROR, XDG_DESKTOP_PORTAL_ERROR_FAILED,
++                   "The scanner helper did not answer: %s", local_error->message);
++      return NULL;
++    }
++
++  g_variant_get (reply, "(ub@v)", &reply_serial, &ok, &result);
++  if (reply_serial != serial)
++    {
++      g_set_error (error, XDG_DESKTOP_PORTAL_ERROR, XDG_DESKTOP_PORTAL_ERROR_FAILED,
++                   "The scanner helper answered out of order");
++      return NULL;
++    }
++
++  if (!ok)
++    {
++      g_autoptr(GVariant) inner = g_variant_get_variant (result);
++      const char *kind = NULL;
++      const char *message = NULL;
++      int code = XDG_DESKTOP_PORTAL_ERROR_FAILED;
++
++      if (g_variant_is_of_type (inner, G_VARIANT_TYPE ("(ss)")))
++        g_variant_get (inner, "(&s&s)", &kind, &message);
++
++      if (g_strcmp0 (kind, "invalid") == 0)
++        code = XDG_DESKTOP_PORTAL_ERROR_INVALID_ARGUMENT;
++      else if (g_strcmp0 (kind, "busy") == 0)
++        code = XDG_DESKTOP_PORTAL_ERROR_BUSY;
++
++      g_set_error_literal (error, XDG_DESKTOP_PORTAL_ERROR, code,
++                           message ? message : "The scanner failed");
++      return NULL;
++    }
++
++  return g_variant_get_variant (result);
++}
++
++/* The session the application named, which has to be its own and an open scanner. Replies to the
++ * invocation with the error itself if not. */
++static XdpScannerSession *
++scanner_session_from_invocation (GDBusMethodInvocation *invocation,
++                                 const char            *session_handle)
++{
++  XdpAppInfo *app_info = xdp_invocation_get_app_info (invocation);
++  g_autoptr(XdpSession) session = xdp_session_from_app_info (session_handle, app_info);
++
++  if (session == NULL || !XDP_IS_SCANNER_SESSION (session))
++    {
++      g_dbus_method_invocation_return_error (invocation, G_DBUS_ERROR, G_DBUS_ERROR_ACCESS_DENIED,
++                                             "Invalid session");
++      return NULL;
++    }
++
++  return XDP_SCANNER_SESSION (g_steal_pointer (&session));
++}
++
++static gboolean
++handle_get_options (XdpDbusScanner         *object,
++                    GDBusMethodInvocation  *invocation,
++                    const char             *arg_session_handle,
++                    GVariant               *arg_options)
++{
++  g_autoptr(XdpScannerSession) session = scanner_session_from_invocation (invocation, arg_session_handle);
++  g_autoptr(GVariant) result = NULL;
++  g_autoptr(GError) error = NULL;
++
++  if (session == NULL)
++    return G_DBUS_METHOD_INVOCATION_HANDLED;
++
++  result = scanner_session_call (session, "get_options", g_variant_new_string (""), &error);
++  if (result == NULL)
++    g_dbus_method_invocation_return_gerror (invocation, error);
++  else
++    xdp_dbus_scanner_complete_get_options (object, invocation, result);
++
++  return G_DBUS_METHOD_INVOCATION_HANDLED;
++}
++
++static gboolean
++handle_get_option_values (XdpDbusScanner         *object,
++                          GDBusMethodInvocation  *invocation,
++                          const char             *arg_session_handle,
++                          GVariant               *arg_options)
++{
++  g_autoptr(XdpScannerSession) session = scanner_session_from_invocation (invocation, arg_session_handle);
++  g_autoptr(GVariant) result = NULL;
++  g_autoptr(GError) error = NULL;
++
++  if (session == NULL)
++    return G_DBUS_METHOD_INVOCATION_HANDLED;
++
++  result = scanner_session_call (session, "get_values", g_variant_new_string (""), &error);
++  if (result == NULL)
++    g_dbus_method_invocation_return_gerror (invocation, error);
++  else
++    xdp_dbus_scanner_complete_get_option_values (object, invocation, result);
++
++  return G_DBUS_METHOD_INVOCATION_HANDLED;
++}
++
++static gboolean
++handle_set_options (XdpDbusScanner         *object,
++                    GDBusMethodInvocation  *invocation,
++                    const char             *arg_session_handle,
++                    GVariant               *arg_values,
++                    GVariant               *arg_options)
++{
++  g_autoptr(XdpScannerSession) session = scanner_session_from_invocation (invocation, arg_session_handle);
++  g_autoptr(GVariant) result = NULL;
++  g_autoptr(GError) error = NULL;
++  g_autoptr(GVariant) applied = NULL;
++  g_autofree const char **flags = NULL;
++
++  if (session == NULL)
++    return G_DBUS_METHOD_INVOCATION_HANDLED;
++
++  result = scanner_session_call (session, "set_options", g_variant_ref (arg_values), &error);
++  if (result == NULL)
++    {
++      g_dbus_method_invocation_return_gerror (invocation, error);
++      return G_DBUS_METHOD_INVOCATION_HANDLED;
++    }
++
++  g_variant_get (result, "(@a{sv}^a&s)", &applied, &flags);
++  xdp_dbus_scanner_complete_set_options (object, invocation, applied, flags);
++
++  return G_DBUS_METHOD_INVOCATION_HANDLED;
++}
++
+ static void
+ xdp_scanner_iface_init (XdpDbusScannerIface *iface)
+ {
+   iface->handle_list_scanners = handle_list_scanners;
+   iface->handle_select_scanners = handle_select_scanners;
+   iface->handle_open_scanner = handle_open_scanner;
++  iface->handle_get_options = handle_get_options;
++  iface->handle_get_option_values = handle_get_option_values;
++  iface->handle_set_options = handle_set_options;
+ }
+ 
+ static void

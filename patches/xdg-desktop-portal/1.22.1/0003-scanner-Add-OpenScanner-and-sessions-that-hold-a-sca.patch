@@ -1,0 +1,842 @@
+From 5aed6276de1b68650648b89455e1e518bc34c2eb Mon Sep 17 00:00:00 2001
+From: "Christian F.K. Schaller" <christian.schaller@gmail.com>
+Date: Mon, 26 Oct 2026 11:21:14 -0400
+Subject: [PATCH] scanner: Add OpenScanner and sessions that hold a scanner
+ open
+
+This commit adds OpenScanner, which turns a granted scanner into a
+Session. The helper gets a second mode, session NAME, in which it opens
+the scanner, says whether that worked, and then serves requests from the
+portal on file descriptor 3 until the portal closes the socket, when it
+cancels and closes the scanner and exits. The two sides talk in
+GVariants framed by their size, defined in scanner-protocol.h, which
+sends with MSG_NOSIGNAL so that a helper that has gone away is an error
+and not a SIGPIPE that would end the portal.
+
+OpenScanner checks that the id was granted to the application, finds
+the scanner's current SANE name (a USB scanner that was plugged in again
+has a new one), and takes the host's exclusive lock before it starts the
+helper, so that two applications asking at once cannot both open it. A
+scanner that is open fails with the new Busy error, one that is not
+granted with NotAllowed. Closing the session, the application leaving
+the bus, or the helper exiting on its own releases the lock; in the last
+case the application is sent Session.Closed. A helper that does not exit
+within five seconds of its socket closing is killed.
+
+Busy is a new error, org.freedesktop.portal.Error.Busy. A locked
+scanner is an ordinary condition that an application handles
+differently from a failure.
+
+Sessions need a handle token, which other portals take from a
+session_handle_token option. It is optional here and defaults to the
+one that requests default to, with the portal making the handle unique
+if it is taken, so an application that does not care gets a working
+handle.
+
+Tested through the frontend and the helper on a private bus with SANE's
+test backend: another connection cannot open a granted scanner, an open
+starts one helper, a second open is Busy, an unknown id is NotAllowed,
+Session.Close ends the helper and releases the lock, a reopen works, and
+the helper exits when the application leaves the bus. The helper was
+also tested over a socketpair on its own: open, close, an unknown method,
+the socket closing, and a device that is not there. Not tested: a helper
+that crashes during a session, the forced kill, and two simultaneous
+opens.
+---
+ data/org.freedesktop.portal.Scanner.xml |  12 +-
+ src/meson.build                         |   2 +-
+ src/scanner-helper.c                    | 104 ++++++-
+ src/scanner-protocol.h                  | 146 +++++++++
+ src/scanner.c                           | 376 ++++++++++++++++++++++++
+ src/xdp-utils.c                         |   3 +-
+ src/xdp-utils.h                         |   3 +-
+ 7 files changed, 640 insertions(+), 6 deletions(-)
+ create mode 100644 src/scanner-protocol.h
+
+diff --git a/data/org.freedesktop.portal.Scanner.xml b/data/org.freedesktop.portal.Scanner.xml
+index f06bd36..6cb7c51 100644
+--- a/data/org.freedesktop.portal.Scanner.xml
++++ b/data/org.freedesktop.portal.Scanner.xml
+@@ -183,10 +183,18 @@
+     <!--
+         OpenScanner:
+         @scanner_id: A scanner id granted to the application
+-        @options: Vardict with optional further information. There is
+-        currently no option supported.
++        @options: Vardict with optional further information
+         @session_handle: Object path for the :ref:`org.freedesktop.portal.Session` of the open scanner
+ 
++        Supported keys in the @options vardict:
++
++        * ``session_handle_token`` (``s``)
++
++          A string that will be used as the last element of the session
++          handle. Must be a valid object path element. Optional: without
++          it the portal picks one, and it makes the handle unique if the
++          token is already taken.
++
+         Opens a granted scanner and takes the host's exclusive lock on it.
+         Fails with ``org.freedesktop.portal.Error.NotAllowed`` if the id was
+         not granted, ``org.freedesktop.portal.Error.Busy`` if it is
+diff --git a/src/meson.build b/src/meson.build
+index ec5a191..d2b0329 100644
+--- a/src/meson.build
++++ b/src/meson.build
+@@ -229,7 +229,7 @@ if sane_dep.found()
+   xdp_scanner_helper = executable(
+     'xdg-desktop-portal-scanner-helper',
+     'scanner-helper.c',
+-    dependencies: [glib_dep, sane_dep],
++    dependencies: [glib_dep, gio_dep, sane_dep],
+     install: true,
+     install_dir: libexecdir,
+   )
+diff --git a/src/scanner-helper.c b/src/scanner-helper.c
+index 28cbd49..a50061f 100644
+--- a/src/scanner-helper.c
++++ b/src/scanner-helper.c
+@@ -9,6 +9,11 @@
+  *     Asks libsane for the scanners and writes them to stdout as a serialized GVariant of type
+  *     a(ssa{sv}): an opaque id, the SANE device name, and the information the portal gives to
+  *     applications. The SANE name stays inside the portal; applications only get the id.
++ *
++ * xdg-desktop-portal-scanner-helper session NAME
++ *     Opens the scanner NAME and serves requests from the portal on file descriptor 3, as
++ *     described in scanner-protocol.h, until the portal closes it. The first reply says whether
++ *     the scanner could be opened.
+  */
+ 
+ #include <stdio.h>
+@@ -18,6 +23,8 @@
+ #include <glib.h>
+ #include <sane/sane.h>
+ 
++#include "scanner-protocol.h"
++
+ /* A stable token for a SANE device name. Not security relevant, only opaque to applications. */
+ static char *
+ scanner_id_for_name (const char *name)
+@@ -143,12 +150,107 @@ run_list (void)
+   return 0;
+ }
+ 
++static gboolean
++send_reply (guint32   serial,
++            gboolean  ok,
++            GVariant *result)
++{
++  g_autoptr(GError) error = NULL;
++
++  if (!scanner_protocol_write (SCANNER_HELPER_FD,
++                               g_variant_new ("(ubv)", serial, ok, result),
++                               &error))
++    {
++      g_printerr ("scanner-helper: %s\n", error->message);
++      return FALSE;
++    }
++
++  return TRUE;
++}
++
++static gboolean
++send_failure (guint32      serial,
++              const char  *kind,
++              const char  *message)
++{
++  return send_reply (serial, FALSE, g_variant_new ("(ss)", kind, message));
++}
++
++static int
++run_session (const char *name)
++{
++  SANE_Handle handle = NULL;
++  SANE_Status status;
++  gboolean running = TRUE;
++  int exit_code = 0;
++
++  status = sane_init (NULL, NULL);
++  if (status != SANE_STATUS_GOOD)
++    {
++      send_failure (0, "failed", sane_strstatus (status));
++      return 1;
++    }
++
++  status = sane_open (name, &handle);
++  if (status != SANE_STATUS_GOOD)
++    {
++      send_failure (0, status == SANE_STATUS_DEVICE_BUSY ? "busy" : "failed",
++                    sane_strstatus (status));
++      sane_exit ();
++      return 1;
++    }
++
++  if (!send_reply (0, TRUE, g_variant_new_string ("")))
++    running = FALSE;
++
++  while (running)
++    {
++      g_autoptr(GVariant) request = NULL;
++      g_autoptr(GError) error = NULL;
++      const char *method;
++      guint32 serial;
++
++      request = scanner_protocol_read (SCANNER_HELPER_FD, G_VARIANT_TYPE ("(usv)"), -1, &error);
++      if (request == NULL)
++        {
++          /* The portal closing the socket is how a session ends, so that is not an error */
++          if (!g_error_matches (error, G_IO_ERROR, G_IO_ERROR_CLOSED))
++            {
++              g_printerr ("scanner-helper: %s\n", error->message);
++              exit_code = 1;
++            }
++          break;
++        }
++
++      g_variant_get (request, "(u&sv)", &serial, &method, NULL);
++
++      if (strcmp (method, "close") == 0)
++        {
++          send_reply (serial, TRUE, g_variant_new_string (""));
++          running = FALSE;
++        }
++      else
++        {
++          send_failure (serial, "failed", "Unknown method");
++        }
++    }
++
++  sane_cancel (handle);
++  sane_close (handle);
++  sane_exit ();
++
++  return exit_code;
++}
++
+ int
+ main (int argc, char *argv[])
+ {
+   if (argc == 2 && strcmp (argv[1], "list") == 0)
+     return run_list ();
+ 
+-  g_printerr ("usage: %s list\n", argv[0]);
++  if (argc == 3 && strcmp (argv[1], "session") == 0)
++    return run_session (argv[2]);
++
++  g_printerr ("usage: %s list | session NAME\n", argv[0]);
+   return 2;
+ }
+diff --git a/src/scanner-protocol.h b/src/scanner-protocol.h
+new file mode 100644
+index 0000000..cb76736
+--- /dev/null
++++ b/src/scanner-protocol.h
+@@ -0,0 +1,146 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later
++ * SPDX-FileCopyrightText: Copyright © the xdg-desktop-portal contributors
++ */
++
++/* How the portal and its scanner helper talk over the socket the portal passes to the helper as
++ * file descriptor 3. A message is a GVariant, sent as its size in bytes (a 32-bit integer in
++ * host byte order, both sides being on one machine) and then its serialized form.
++ *
++ * Requests, from the portal:  (usv)  serial, method, arguments
++ * Replies, from the helper:   (ubv)  serial, success, result; on failure the result is (ss), a kind,
++ *                              "busy" or "failed", and a message
++ *
++ * The helper exits when the socket closes, after cancelling and closing the scanner.
++ */
++
++#pragma once
++
++#include <errno.h>
++#include <poll.h>
++#include <string.h>
++#include <sys/socket.h>
++#include <unistd.h>
++
++#include <gio/gio.h>
++
++#define SCANNER_HELPER_FD 3
++#define SCANNER_PROTOCOL_MAX_MESSAGE (16 * 1024 * 1024)
++
++/* Reads exactly size bytes. Returns FALSE with G_IO_ERROR_CLOSED on end of file, and with
++ * G_IO_ERROR_TIMED_OUT when nothing arrived within timeout_ms (negative waits for ever). */
++static inline gboolean
++scanner_protocol_read_exact (int       fd,
++                             guchar   *buffer,
++                             gsize     size,
++                             int       timeout_ms,
++                             GError  **error)
++{
++  gsize done = 0;
++
++  while (done < size)
++    {
++      struct pollfd pfd = { .fd = fd, .events = POLLIN };
++      ssize_t n;
++      int r = poll (&pfd, 1, timeout_ms);
++
++      if (r < 0 && errno == EINTR)
++        continue;
++      if (r < 0)
++        {
++          g_set_error (error, G_IO_ERROR, g_io_error_from_errno (errno), "poll: %s", g_strerror (errno));
++          return FALSE;
++        }
++      if (r == 0)
++        {
++          g_set_error_literal (error, G_IO_ERROR, G_IO_ERROR_TIMED_OUT, "Timed out");
++          return FALSE;
++        }
++
++      n = read (fd, buffer + done, size - done);
++      if (n < 0 && errno == EINTR)
++        continue;
++      if (n < 0)
++        {
++          g_set_error (error, G_IO_ERROR, g_io_error_from_errno (errno), "read: %s", g_strerror (errno));
++          return FALSE;
++        }
++      if (n == 0)
++        {
++          g_set_error_literal (error, G_IO_ERROR, G_IO_ERROR_CLOSED, "Closed");
++          return FALSE;
++        }
++      done += n;
++    }
++
++  return TRUE;
++}
++
++/* Reads one message and returns it, checked to be of the given type and in normal form, or NULL
++ * with an error set. */
++static inline GVariant *
++scanner_protocol_read (int                  fd,
++                       const GVariantType  *type,
++                       int                  timeout_ms,
++                       GError             **error)
++{
++  guint32 size;
++  g_autofree guchar *data = NULL;
++  g_autoptr(GBytes) bytes = NULL;
++  g_autoptr(GVariant) message = NULL;
++
++  if (!scanner_protocol_read_exact (fd, (guchar *) &size, sizeof size, timeout_ms, error))
++    return NULL;
++
++  if (size == 0 || size > SCANNER_PROTOCOL_MAX_MESSAGE)
++    {
++      g_set_error (error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA, "Bad message size %u", size);
++      return NULL;
++    }
++
++  data = g_malloc (size);
++  if (!scanner_protocol_read_exact (fd, data, size, timeout_ms, error))
++    return NULL;
++
++  bytes = g_bytes_new_take (g_steal_pointer (&data), size);
++  message = g_variant_ref_sink (g_variant_new_from_bytes (type, bytes, FALSE));
++  if (!g_variant_is_normal_form (message))
++    {
++      g_set_error_literal (error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA, "Malformed message");
++      return NULL;
++    }
++
++  return g_steal_pointer (&message);
++}
++
++static inline gboolean
++scanner_protocol_write (int        fd,
++                        GVariant  *message,
++                        GError   **error)
++{
++  g_autoptr(GVariant) normal = g_variant_get_normal_form (message);
++  guint32 size = g_variant_get_size (normal);
++  const guchar *data = g_variant_get_data (normal);
++  g_autofree guchar *buffer = g_malloc (sizeof size + size);
++  gsize done = 0;
++
++  memcpy (buffer, &size, sizeof size);
++  memcpy (buffer + sizeof size, data, size);
++
++  while (done < sizeof size + size)
++    {
++      /* send(), not write(), so that a helper that has gone away is an error, not a SIGPIPE that
++       * would take the portal with it */
++      ssize_t n = send (fd, buffer + done, sizeof size + size - done, MSG_NOSIGNAL);
++
++      if (n < 0 && errno == EINTR)
++        continue;
++      if (n < 0)
++        {
++          g_set_error (error, G_IO_ERROR, g_io_error_from_errno (errno), "send: %s", g_strerror (errno));
++          return FALSE;
++        }
++      done += n;
++    }
++
++  return TRUE;
++}
+diff --git a/src/scanner.c b/src/scanner.c
+index 471b1c6..02dab39 100644
+--- a/src/scanner.c
++++ b/src/scanner.c
+@@ -7,14 +7,20 @@
+ #include "scanner.h"
+ 
+ #include <string.h>
++#include <sys/socket.h>
++#include <sys/types.h>
++#include <unistd.h>
+ 
+ #include <gio/gio.h>
++#include <gio/gunixfdlist.h>
+ 
+ #include "xdp-context.h"
+ #include "xdp-dbus.h"
+ #include "xdp-impl-dbus.h"
+ #include "xdp-portal-config.h"
++#include "scanner-protocol.h"
+ #include "xdp-request.h"
++#include "xdp-session.h"
+ #include "xdp-utils.h"
+ 
+ /* Scanners are listed by id, and an application only ever sees the ones the user chose for it.
+@@ -28,6 +34,10 @@ struct _XdpScanner
+   XdpDbusImplScanner *impl;
+ 
+   GMutex mutex;
++
++  /* The scanners that are open, by id. This is the host's exclusive lock: one application at a
++   * time has a scanner. The sessions are not owned; a session removes itself when it closes. */
++  GHashTable *open_scanners;
+ };
+ 
+ #define XDP_TYPE_SCANNER (xdp_scanner_get_type ())
+@@ -38,6 +48,24 @@ static void xdp_scanner_iface_init (XdpDbusScannerIface *iface);
+ G_DEFINE_FINAL_TYPE_WITH_CODE (XdpScanner, xdp_scanner, XDP_DBUS_TYPE_SCANNER_SKELETON,
+                                G_IMPLEMENT_INTERFACE (XDP_DBUS_TYPE_SCANNER, xdp_scanner_iface_init));
+ 
++struct _XdpScannerSession
++{
++  XdpSession parent;
++
++  XdpScanner *scanner;
++  char *scanner_id;
++
++  /* The helper that holds the scanner open, and our end of the socket we talk to it over */
++  GSubprocess *helper;
++  int fd;
++  gboolean stopping;
++};
++
++#define XDP_TYPE_SCANNER_SESSION (xdp_scanner_session_get_type ())
++G_DECLARE_FINAL_TYPE (XdpScannerSession, xdp_scanner_session, XDP, SCANNER_SESSION, XdpSession);
++
++G_DEFINE_FINAL_TYPE (XdpScannerSession, xdp_scanner_session, xdp_session_get_type ())
++
+ #define GRANTS_KEY "-xdp-scanner-grants"
+ 
+ /* The scanners the user has chosen for one application: a set of ids */
+@@ -538,11 +566,357 @@ handle_select_scanners (XdpDbusScanner         *object,
+   return G_DBUS_METHOD_INVOCATION_HANDLED;
+ }
+ 
++/* ---- Sessions: an open scanner ---- */
++
++#define HELPER_OPEN_TIMEOUT_MS 60000
++#define HELPER_EXIT_GRACE_SECONDS 5
++
++static gboolean
++helper_force_exit_cb (gpointer data)
++{
++  GSubprocess *helper = data;
++
++  /* The helper exits by itself when its socket closes; this is for one that does not */
++  if (!g_subprocess_get_if_exited (helper))
++    {
++      g_warning ("[scanner] The scanner helper did not exit, killing it");
++      g_subprocess_force_exit (helper);
++    }
++
++  g_object_unref (helper);
++
++  return G_SOURCE_REMOVE;
++}
++
++/* Closes the socket, which makes the helper cancel and close the scanner and exit, and makes
++ * sure it does. Called with the scanner mutex held. */
++static void
++scanner_session_stop_helper (XdpScannerSession *self)
++{
++  self->stopping = TRUE;
++
++  if (self->fd >= 0)
++    {
++      close (self->fd);
++      self->fd = -1;
++    }
++
++  if (self->helper != NULL)
++    {
++      g_timeout_add_seconds (HELPER_EXIT_GRACE_SECONDS, helper_force_exit_cb,
++                             g_object_ref (self->helper));
++      g_clear_object (&self->helper);
++    }
++}
++
++static void
++scanner_session_release_lock (XdpScannerSession *self)
++{
++  if (g_hash_table_lookup (self->scanner->open_scanners, self->scanner_id) == self)
++    g_hash_table_remove (self->scanner->open_scanners, self->scanner_id);
++}
++
++static void
++xdp_scanner_session_close (XdpSession *session)
++{
++  XdpScannerSession *self = XDP_SCANNER_SESSION (session);
++  XdpScanner *scanner = self->scanner;
++
++  g_debug ("[scanner] Session '%s' closed", session->id);
++
++  g_mutex_lock (&scanner->mutex);
++  scanner_session_stop_helper (self);
++  scanner_session_release_lock (self);
++  g_mutex_unlock (&scanner->mutex);
++}
++
++static void
++xdp_scanner_session_dispose (GObject *object)
++{
++  XdpScannerSession *self = XDP_SCANNER_SESSION (object);
++
++  if (self->scanner != NULL)
++    {
++      g_mutex_lock (&self->scanner->mutex);
++      scanner_session_stop_helper (self);
++      scanner_session_release_lock (self);
++      g_mutex_unlock (&self->scanner->mutex);
++    }
++
++  g_clear_object (&self->scanner);
++  g_clear_pointer (&self->scanner_id, g_free);
++
++  G_OBJECT_CLASS (xdp_scanner_session_parent_class)->dispose (object);
++}
++
++static void
++xdp_scanner_session_class_init (XdpScannerSessionClass *klass)
++{
++  GObjectClass *object_class = G_OBJECT_CLASS (klass);
++  XdpSessionClass *session_class = (XdpSessionClass *) klass;
++
++  object_class->dispose = xdp_scanner_session_dispose;
++  session_class->close = xdp_scanner_session_close;
++}
++
++static void
++xdp_scanner_session_init (XdpScannerSession *self)
++{
++  self->fd = -1;
++}
++
++static XdpScannerSession *
++xdp_scanner_session_new (XdpScanner       *scanner,
++                         GDBusConnection  *connection,
++                         const char       *sender,
++                         XdpAppInfo       *app_info,
++                         const char       *scanner_id,
++                         const char       *token,
++                         GError          **error)
++{
++  XdpSession *session;
++  XdpScannerSession *scanner_session;
++
++  session = g_initable_new (XDP_TYPE_SCANNER_SESSION,
++                            NULL, error,
++                            "context", scanner->context,
++                            "sender", sender,
++                            "app-id", xdp_app_info_get_id (app_info),
++                            "connection", connection,
++                            "token", token,
++                            NULL);
++  if (session == NULL)
++    return NULL;
++
++  scanner_session = XDP_SCANNER_SESSION (session);
++  scanner_session->scanner = g_object_ref (scanner);
++  scanner_session->scanner_id = g_strdup (scanner_id);
++
++  return scanner_session;
++}
++
++/* The helper went away. If the session did not ask for that, tell the application. */
++static void
++helper_exited_cb (GObject      *source_object,
++                  GAsyncResult *result,
++                  gpointer      user_data)
++{
++  g_autoptr(XdpScannerSession) self = user_data;
++  gboolean stopping;
++
++  g_subprocess_wait_finish (G_SUBPROCESS (source_object), result, NULL);
++
++  g_mutex_lock (&self->scanner->mutex);
++  stopping = self->stopping;
++  g_mutex_unlock (&self->scanner->mutex);
++
++  if (!stopping)
++    {
++      g_warning ("[scanner] The scanner helper for session '%s' exited, closing the session",
++                 XDP_SESSION (self)->id);
++      xdp_session_close (XDP_SESSION (self), TRUE);
++    }
++}
++
++/* Starts the helper for one scanner and waits for it to say whether it opened. The scanner
++ * mutex is not held, since opening can take a while. */
++static gboolean
++scanner_session_open (XdpScannerSession  *self,
++                      const char         *sane_name,
++                      GError            **error)
++{
++  g_autoptr(GSubprocessLauncher) launcher = NULL;
++  g_autoptr(GSubprocess) helper = NULL;
++  g_autoptr(GVariant) reply = NULL;
++  g_autoptr(GVariant) result = NULL;
++  const char *helper_path = g_getenv ("XDP_SCANNER_HELPER");
++  const char *kind = NULL;
++  const char *message = NULL;
++  gboolean ok = FALSE;
++  guint32 serial;
++  int fds[2];
++
++  if (helper_path == NULL)
++    helper_path = LIBEXECDIR "/xdg-desktop-portal-scanner-helper";
++
++  if (socketpair (AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, fds) < 0)
++    {
++      g_set_error (error, XDG_DESKTOP_PORTAL_ERROR, XDG_DESKTOP_PORTAL_ERROR_FAILED,
++                   "Failed to create a socket: %s", g_strerror (errno));
++      return FALSE;
++    }
++
++  launcher = g_subprocess_launcher_new (G_SUBPROCESS_FLAGS_NONE);
++  g_subprocess_launcher_take_fd (launcher, fds[1], SCANNER_HELPER_FD);
++
++  helper = g_subprocess_launcher_spawn (launcher, error, helper_path, "session", sane_name, NULL);
++  if (helper == NULL)
++    {
++      close (fds[0]);
++      return FALSE;
++    }
++
++  reply = scanner_protocol_read (fds[0], G_VARIANT_TYPE ("(ubv)"), HELPER_OPEN_TIMEOUT_MS, error);
++  if (reply == NULL)
++    {
++      g_prefix_error (error, "The scanner helper did not answer: ");
++      g_subprocess_force_exit (helper);
++      close (fds[0]);
++      return FALSE;
++    }
++
++  g_variant_get (reply, "(ub@v)", &serial, &ok, &result);
++  if (!ok)
++    {
++      g_autoptr(GVariant) inner = g_variant_get_variant (result);
++
++      if (g_variant_is_of_type (inner, G_VARIANT_TYPE ("(ss)")))
++        g_variant_get (inner, "(&s&s)", &kind, &message);
++
++      g_set_error (error, XDG_DESKTOP_PORTAL_ERROR,
++                   g_strcmp0 (kind, "busy") == 0 ? XDG_DESKTOP_PORTAL_ERROR_BUSY
++                                                  : XDG_DESKTOP_PORTAL_ERROR_FAILED,
++                   "Could not open the scanner: %s", message ? message : "unknown error");
++      g_subprocess_force_exit (helper);
++      close (fds[0]);
++      return FALSE;
++    }
++
++  g_mutex_lock (&self->scanner->mutex);
++  self->fd = fds[0];
++  self->helper = g_object_ref (helper);
++  g_mutex_unlock (&self->scanner->mutex);
++
++  g_subprocess_wait_async (helper, NULL, helper_exited_cb, g_object_ref (self));
++
++  return TRUE;
++}
++
++static gboolean
++handle_open_scanner (XdpDbusScanner         *object,
++                     GDBusMethodInvocation  *invocation,
++                     const char             *arg_scanner_id,
++                     GVariant               *arg_options)
++{
++  XdpScanner *self = XDP_SCANNER (object);
++  XdpAppInfo *app_info = xdp_invocation_get_app_info (invocation);
++  g_autoptr(GPtrArray) devices = NULL;
++  g_autoptr(XdpScannerSession) session = NULL;
++  g_autoptr(GError) error = NULL;
++  g_autoptr(GVariant) options = NULL;
++  GVariantBuilder options_builder;
++  ScannerDevice *device = NULL;
++  const char *token;
++  gboolean granted;
++
++  static const XdpOptionKey scanner_open_options[] = {
++    { "session_handle_token", G_VARIANT_TYPE_STRING, NULL },
++  };
++
++  g_debug ("[scanner] Handling OpenScanner");
++
++  g_variant_builder_init (&options_builder, G_VARIANT_TYPE_VARDICT);
++  if (!xdp_filter_options (arg_options, &options_builder,
++                           scanner_open_options, G_N_ELEMENTS (scanner_open_options),
++                           NULL, &error))
++    {
++      g_variant_builder_clear (&options_builder);
++      g_dbus_method_invocation_return_gerror (invocation, error);
++      return G_DBUS_METHOD_INVOCATION_HANDLED;
++    }
++  options = g_variant_ref_sink (g_variant_builder_end (&options_builder));
++
++  /* Like a request's handle_token, the token is optional here; the portal makes the handle
++   * unique if the application's token is taken. */
++  token = lookup_session_token (options);
++  if (token == NULL)
++    token = "t";
++
++  g_mutex_lock (&self->mutex);
++  granted = g_hash_table_contains (scanner_grants_from_app_info (app_info), arg_scanner_id);
++  g_mutex_unlock (&self->mutex);
++
++  if (!granted)
++    {
++      g_dbus_method_invocation_return_error (invocation, XDG_DESKTOP_PORTAL_ERROR,
++                                             XDG_DESKTOP_PORTAL_ERROR_NOT_ALLOWED,
++                                             "The scanner was not granted to this application");
++      return G_DBUS_METHOD_INVOCATION_HANDLED;
++    }
++
++  /* Where the scanner is now, since a USB scanner that was unplugged and plugged in again has a
++   * new SANE name */
++  devices = scanner_enumerate (self);
++  for (guint i = 0; i < devices->len; i++)
++    {
++      ScannerDevice *candidate = g_ptr_array_index (devices, i);
++
++      if (g_strcmp0 (candidate->id, arg_scanner_id) == 0)
++        {
++          device = candidate;
++          break;
++        }
++    }
++
++  if (device == NULL || device->sane_name == NULL)
++    {
++      g_dbus_method_invocation_return_error (invocation, XDG_DESKTOP_PORTAL_ERROR,
++                                             XDG_DESKTOP_PORTAL_ERROR_FAILED,
++                                             "The scanner is not available");
++      return G_DBUS_METHOD_INVOCATION_HANDLED;
++    }
++
++  session = xdp_scanner_session_new (self, g_dbus_method_invocation_get_connection (invocation),
++                                     g_dbus_method_invocation_get_sender (invocation),
++                                     app_info, arg_scanner_id, token, &error);
++  if (session == NULL)
++    {
++      g_dbus_method_invocation_return_gerror (invocation, error);
++      return G_DBUS_METHOD_INVOCATION_HANDLED;
++    }
++
++  /* Take the lock before opening, so that two applications asking at once cannot both open it */
++  g_mutex_lock (&self->mutex);
++  if (g_hash_table_contains (self->open_scanners, arg_scanner_id))
++    {
++      g_mutex_unlock (&self->mutex);
++      g_dbus_method_invocation_return_error (invocation, XDG_DESKTOP_PORTAL_ERROR,
++                                             XDG_DESKTOP_PORTAL_ERROR_BUSY,
++                                             "The scanner is in use");
++      return G_DBUS_METHOD_INVOCATION_HANDLED;
++    }
++  g_hash_table_insert (self->open_scanners, g_strdup (arg_scanner_id), session);
++  g_mutex_unlock (&self->mutex);
++
++  if (!scanner_session_open (session, device->sane_name, &error))
++    {
++      /* Never exported or registered: dropping the last reference releases the lock */
++      g_dbus_method_invocation_return_gerror (invocation, error);
++      return G_DBUS_METHOD_INVOCATION_HANDLED;
++    }
++
++  if (!xdp_session_export (XDP_SESSION (session), &error))
++    {
++      g_dbus_method_invocation_return_gerror (invocation, error);
++      xdp_session_close (XDP_SESSION (g_steal_pointer (&session)), FALSE);
++      return G_DBUS_METHOD_INVOCATION_HANDLED;
++    }
++
++  xdp_session_register (XDP_SESSION (session));
++
++  g_debug ("[scanner] Opened %s as session %s", arg_scanner_id, XDP_SESSION (session)->id);
++
++  xdp_dbus_scanner_complete_open_scanner (object, invocation, XDP_SESSION (session)->id);
++
++  return G_DBUS_METHOD_INVOCATION_HANDLED;
++}
++
+ static void
+ xdp_scanner_iface_init (XdpDbusScannerIface *iface)
+ {
+   iface->handle_list_scanners = handle_list_scanners;
+   iface->handle_select_scanners = handle_select_scanners;
++  iface->handle_open_scanner = handle_open_scanner;
+ }
+ 
+ static void
+@@ -551,6 +925,7 @@ xdp_scanner_dispose (GObject *object)
+   XdpScanner *self = XDP_SCANNER (object);
+ 
+   g_clear_object (&self->impl);
++  g_clear_pointer (&self->open_scanners, g_hash_table_unref);
+   g_mutex_clear (&self->mutex);
+ 
+   G_OBJECT_CLASS (xdp_scanner_parent_class)->dispose (object);
+@@ -568,6 +943,7 @@ static void
+ xdp_scanner_init (XdpScanner *self)
+ {
+   g_mutex_init (&self->mutex);
++  self->open_scanners = g_hash_table_new_full (g_str_hash, g_str_equal, g_free, NULL);
+ }
+ 
+ static XdpScanner *
+diff --git a/src/xdp-utils.c b/src/xdp-utils.c
+index 706c5f0..7a92a59 100644
+--- a/src/xdp-utils.c
++++ b/src/xdp-utils.c
+@@ -329,7 +329,8 @@ static const GDBusErrorEntry xdg_desktop_portal_error_entries[] = {
+   { XDG_DESKTOP_PORTAL_ERROR_EXISTS,           "org.freedesktop.portal.Error.Exists" },
+   { XDG_DESKTOP_PORTAL_ERROR_NOT_ALLOWED,      "org.freedesktop.portal.Error.NotAllowed" },
+   { XDG_DESKTOP_PORTAL_ERROR_CANCELLED,        "org.freedesktop.portal.Error.Cancelled" },
+-  { XDG_DESKTOP_PORTAL_ERROR_WINDOW_DESTROYED, "org.freedesktop.portal.Error.WindowDestroyed" }
++  { XDG_DESKTOP_PORTAL_ERROR_WINDOW_DESTROYED, "org.freedesktop.portal.Error.WindowDestroyed" },
++  { XDG_DESKTOP_PORTAL_ERROR_BUSY,             "org.freedesktop.portal.Error.Busy" }
+ };
+ 
+ GQuark
+diff --git a/src/xdp-utils.h b/src/xdp-utils.h
+index f4c444c..1fc0b8c 100644
+--- a/src/xdp-utils.h
++++ b/src/xdp-utils.h
+@@ -109,7 +109,8 @@ typedef enum {
+   XDG_DESKTOP_PORTAL_ERROR_EXISTS,
+   XDG_DESKTOP_PORTAL_ERROR_NOT_ALLOWED,
+   XDG_DESKTOP_PORTAL_ERROR_CANCELLED,
+-  XDG_DESKTOP_PORTAL_ERROR_WINDOW_DESTROYED
++  XDG_DESKTOP_PORTAL_ERROR_WINDOW_DESTROYED,
++  XDG_DESKTOP_PORTAL_ERROR_BUSY
+ } XdgDesktopPortalErrorEnum;
+ 
+ #define XDG_DESKTOP_PORTAL_ERROR xdg_desktop_portal_error_quark ()

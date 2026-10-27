@@ -1,0 +1,155 @@
+From 17b80415e4b7e4a0c6caa106af5f4ab053c1e04c Mon Sep 17 00:00:00 2001
+From: "Christian F.K. Schaller" <christian.schaller@gmail.com>
+Date: Mon, 26 Oct 2026 12:08:06 -0400
+Subject: [PATCH] scanner: End a frame that is stuck in a read
+
+This commit makes the helper able to end a frame whose thread is inside
+a call to libsane that does not return. The thread looks at the cancel
+flag between reads, but a read can wait for data that does not come, and
+then Cancel could not stop the frame, and closing the session left the
+helper waiting for the thread for ever, holding the scanner open after
+the portal had gone.
+
+Cancel and closing the session now give the frame a second to notice,
+and then call sane_cancel from the thread that serves requests. SANE
+allows that from another thread, and it makes a blocked read return.
+It is done only when the flag was not enough, since a backend's reading
+and cancelling at once is less tested than its cancelling between
+reads. When the session is closing and the frame still has not ended
+three seconds later, the helper exits, since nobody is waiting for it.
+
+A backend that is cancelled while it waits for data reports the end of
+the data, so a frame that was asked to stop and is not all there is now
+reported as cancelled, not finished. Whether it is all there is known
+from the layout, or not known when the height is, in which case it was
+cancelled.
+
+The helper no longer prints a message when it cannot send because the
+portal has closed the socket, which is how a session ends.
+
+Found by running the scenario checks against the frontend: a session
+that starts from the test backend's own defaults has a one-pixel-wide
+frame of unknown height, and its read never returns. Tested on the
+helper alone with that frame: Cancel gives a cancelled event after the
+second and the session stays usable, the helper exits 1.1 s after the
+socket closes, and the earlier frame and option tests (22 and 16
+checks) still pass. Not tested on the 8200i, where a read returns
+regularly and the flag is enough.
+---
+ src/scanner-helper.c | 70 +++++++++++++++++++++++++++++++++++++++++---
+ 1 file changed, 66 insertions(+), 4 deletions(-)
+
+diff --git a/src/scanner-helper.c b/src/scanner-helper.c
+index 6416598..9e9c52b 100644
+--- a/src/scanner-helper.c
++++ b/src/scanner-helper.c
+@@ -174,7 +174,10 @@ send_reply (guint32   serial,
+ 
+   if (!written)
+     {
+-      g_printerr ("scanner-helper: %s\n", error->message);
++      /* The portal having closed the socket is how a session ends, and events can still be on
++       * their way then */
++      if (!g_error_matches (error, G_IO_ERROR, G_IO_ERROR_BROKEN_PIPE))
++        g_printerr ("scanner-helper: %s\n", error->message);
+       return FALSE;
+     }
+ 
+@@ -814,6 +817,7 @@ frame_thread (gpointer data)
+   SANE_Status status;
+   const char *format;
+   g_autofree guchar *buffer = g_malloc (64 * 1024);
++  gint64 written = 0;
+   int flags;
+ 
+   /* A new scan: clear anything left over */
+@@ -871,8 +875,21 @@ frame_thread (gpointer data)
+           break;
+         }
+ 
++      if (length > 0)
++        written += length;
++
+       if (status == SANE_STATUS_EOF)
+         {
++          /* A backend that is cancelled while it waits for data reports the end of the data, so
++           * a frame that was asked to stop and is not all there was cancelled, not finished */
++          if (g_atomic_int_get (&session->cancel) &&
++              (params.lines < 0 || written < (gint64) params.bytes_per_line * params.lines))
++            {
++              sane_cancel (handle);
++              finish_frame (job, "cancelled", NULL, FALSE);
++              break;
++            }
++
+           if (params.last_frame)
+             sane_cancel (handle);
+           finish_frame (job, "finished", NULL, !params.last_frame);
+@@ -926,10 +943,55 @@ start_frame (Session *session,
+   return TRUE;
+ }
+ 
++/* How long a frame is given to notice that it is cancelled, which it does between reads, before
++ * libsane is told to cancel, and then how long to end after that */
++#define FRAME_CANCEL_GRACE_MS 1000
++#define FRAME_CANCEL_FORCED_MS 3000
++
++/* Waits for the frame in progress to end, for at most timeout_ms. Returns whether it has. */
++static gboolean
++wait_for_frame_end (Session *session,
++                    int      timeout_ms)
++{
++  for (int waited = 0; g_atomic_int_get (&session->busy) && waited < timeout_ms; waited += 20)
++    g_usleep (20 * 1000);
++
++  return !g_atomic_int_get (&session->busy);
++}
++
++/* Cancels the frame in progress and waits for its thread to end. The thread looks at the flag
++ * between reads, but a read can wait for data that does not come (a scanner that has stopped
++ * answering, a degenerate frame). sane_cancel may be called from another thread and makes such a
++ * read return, so it is used when the flag is not enough, and not before, since a backend's
++ * reading and cancelling at once is less tested than its cancelling between reads. */
+ static void
+-stop_frame (Session *session)
++cancel_frame (Session *session)
+ {
+   g_atomic_int_set (&session->cancel, 1);
++
++  if (!wait_for_frame_end (session, FRAME_CANCEL_GRACE_MS))
++    {
++      g_printerr ("scanner-helper: the frame did not stop, cancelling in libsane\n");
++      sane_cancel (session->handle);
++    }
++}
++
++static void
++stop_frame (Session *session)
++{
++  if (g_atomic_int_get (&session->busy))
++    {
++      cancel_frame (session);
++
++      /* The session is over and nobody is waiting for the helper, so as a last resort it ends,
++       * rather than stay for ever holding the scanner open */
++      if (!wait_for_frame_end (session, FRAME_CANCEL_FORCED_MS))
++        {
++          g_printerr ("scanner-helper: the frame did not end, exiting\n");
++          _exit (1);
++        }
++    }
++
+   if (session->thread != NULL)
+     g_thread_join (g_steal_pointer (&session->thread));
+ }
+@@ -1002,8 +1064,8 @@ run_session (const char *name)
+         {
+           if (busy)
+             {
+-              /* The frame's thread ends with a cancelled event */
+-              g_atomic_int_set (&session.cancel, 1);
++              /* The frame's thread ends with a cancelled event, before the reply */
++              cancel_frame (&session);
+             }
+           else
+             {

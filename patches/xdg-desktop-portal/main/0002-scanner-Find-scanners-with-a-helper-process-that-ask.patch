@@ -1,0 +1,492 @@
+From eafd605fdfd57e7e1db4c1fa271741f2d6e06674 Mon Sep 17 00:00:00 2001
+From: "Christian F.K. Schaller" <christian.schaller@gmail.com>
+Date: Mon, 26 Oct 2026 11:04:02 -0400
+Subject: [PATCH] scanner: Find scanners with a helper process that asks
+ libsane
+
+This commit replaces the stand-in list of scanners with the real thing.
+A new program, xdg-desktop-portal-scanner-helper, runs in its own
+process and asks libsane for the devices, so that libsane and the
+drivers it loads, which block and sometimes crash, stay out of the
+portal. For now it has one mode, list, which writes the scanners to
+standard output as a GVariant of type a(ssa{sv}): an opaque id, the
+SANE device name and the information that applications get. The SANE
+name stays inside the portal, since some backends read it as a path or
+an address, and applications only ever see the id.
+
+The frontend runs the helper for SelectScanners, so the dialog lists
+what is there, and for ListScanners only when the application has been
+granted something. Probing can take seconds and some backends reset the
+scanner they find, so an application with no grants does not cause one.
+The helper gets 30 seconds, its output is checked for type and encoding
+before it is used, and a failure gives an empty list and a warning.
+XDP_SCANNER_HELPER overrides the path, for tests.
+
+Webcams from SANE's v4l backend are left out. The connection and the
+capabilities are worked out from the device name and SANE's device type
+string, as hints only.
+
+The scanner portal is only offered when libsane is present, through a
+new sane build option that is auto by default, like geoclue and gudev.
+XDG_DESKTOP_PORTAL_SCANNER_FAKE=1 still gives two made-up scanners, for
+trying the dialog without drivers.
+
+Tested with the helper on its own against SANE's test backend, and
+through the frontend, the helper and the xdg-desktop-portal-gnome
+dialog on a private bus: the dialog listed the two test devices, the
+choice came back with libsane's vendor and model, and a second
+connection saw no grants. Not tested: the helper timeout, a helper that
+fails, and that an application without grants causes no probe.
+---
+ desktop-portal/meson.build      |  10 +++
+ desktop-portal/scanner-helper.c | 154 ++++++++++++++++++++++++++++++++
+ desktop-portal/scanner.c        | 154 ++++++++++++++++++++++++++++----
+ desktop-portal/xdp-context.c    |   2 +
+ meson.build                     |   4 +
+ meson.options                   |   4 +
+ 6 files changed, 312 insertions(+), 16 deletions(-)
+ create mode 100644 desktop-portal/scanner-helper.c
+
+diff --git a/desktop-portal/meson.build b/desktop-portal/meson.build
+index 9e89269..5b9702a 100644
+--- a/desktop-portal/meson.build
++++ b/desktop-portal/meson.build
+@@ -230,6 +230,16 @@ xdp_validate_sound = executable(
+   install_dir: libexecdir,
+ )
+ 
++if sane_dep.found()
++  xdp_scanner_helper = executable(
++    'xdg-desktop-portal-scanner-helper',
++    'scanner-helper.c',
++    dependencies: [glib_dep, sane_dep],
++    install: true,
++    install_dir: libexecdir,
++  )
++endif
++
+ configure_file(
+   input: 'xdg-desktop-portal-rewrite-launchers.service.in',
+   output: '@BASENAME@',
+diff --git a/desktop-portal/scanner-helper.c b/desktop-portal/scanner-helper.c
+new file mode 100644
+index 0000000..28cbd49
+--- /dev/null
++++ b/desktop-portal/scanner-helper.c
+@@ -0,0 +1,154 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later
++ * SPDX-FileCopyrightText: Copyright © the xdg-desktop-portal contributors
++ */
++
++/* The process that talks to libsane for the scanner portal, so that libsane and its backends,
++ * which load drivers, block, and sometimes crash, stay out of the portal itself.
++ *
++ * xdg-desktop-portal-scanner-helper list
++ *     Asks libsane for the scanners and writes them to stdout as a serialized GVariant of type
++ *     a(ssa{sv}): an opaque id, the SANE device name, and the information the portal gives to
++ *     applications. The SANE name stays inside the portal; applications only get the id.
++ */
++
++#include <stdio.h>
++#include <string.h>
++#include <unistd.h>
++
++#include <glib.h>
++#include <sane/sane.h>
++
++/* A stable token for a SANE device name. Not security relevant, only opaque to applications. */
++static char *
++scanner_id_for_name (const char *name)
++{
++  g_autofree char *sum = g_compute_checksum_for_string (G_CHECKSUM_SHA256, name, -1);
++
++  return g_strdup_printf ("sane-%.16s", sum);
++}
++
++/* How the scanner is connected, as far as the device name shows. */
++static const char *
++scanner_kind (const char *name)
++{
++  if (g_str_has_prefix (name, "net:") || g_str_has_prefix (name, "airscan:") ||
++      strstr (name, "/net/") != NULL || strstr (name, "ip=") != NULL)
++    return "network";
++  if (strstr (name, "usb") != NULL)
++    return "usb";
++  return "other";
++}
++
++/* What the scanner can do, from SANE's device type string. A hint only: the option list of an
++ * opened scanner is authoritative. */
++static const char **
++scanner_capabilities (const char *type)
++{
++  g_autofree char *t = g_ascii_strdown (type ? type : "", -1);
++  GPtrArray *caps = g_ptr_array_new ();
++
++  if (strstr (t, "film") || strstr (t, "slide"))
++    g_ptr_array_add (caps, "film");
++  if (strstr (t, "flatbed") || strstr (t, "multi-function") || strstr (t, "all-in-one"))
++    g_ptr_array_add (caps, "flatbed");
++  if (strstr (t, "sheet") || strstr (t, "adf"))
++    g_ptr_array_add (caps, "adf");
++  g_ptr_array_add (caps, NULL);
++
++  return (const char **) g_ptr_array_free (caps, FALSE);
++}
++
++/* Webcams come through SANE's v4l backend and cannot scan anything a user would call a scan */
++static gboolean
++is_webcam (const SANE_Device *device)
++{
++  g_autofree char *type = g_ascii_strdown (device->type ? device->type : "", -1);
++
++  return g_str_has_prefix (device->name, "v4l:") || strstr (type, "camera") != NULL;
++}
++
++static GVariant *
++scanner_to_variant (const SANE_Device *device)
++{
++  g_autofree char *id = scanner_id_for_name (device->name);
++  g_autofree char *name = NULL;
++  g_autofree char *backend = NULL;
++  g_autofree const char **caps = scanner_capabilities (device->type);
++  const char *colon = strchr (device->name, ':');
++  GVariantBuilder info;
++
++  name = g_strstrip (g_strdup_printf ("%s %s", device->vendor ? device->vendor : "",
++                                      device->model ? device->model : ""));
++  backend = colon ? g_strndup (device->name, colon - device->name) : g_strdup (device->name);
++
++  g_variant_builder_init (&info, G_VARIANT_TYPE_VARDICT);
++  g_variant_builder_add (&info, "{sv}", "name", g_variant_new_string (name));
++  g_variant_builder_add (&info, "{sv}", "vendor",
++                         g_variant_new_string (device->vendor ? device->vendor : ""));
++  g_variant_builder_add (&info, "{sv}", "model",
++                         g_variant_new_string (device->model ? device->model : ""));
++  g_variant_builder_add (&info, "{sv}", "backend", g_variant_new_string (backend));
++  g_variant_builder_add (&info, "{sv}", "kind", g_variant_new_string (scanner_kind (device->name)));
++  g_variant_builder_add (&info, "{sv}", "type",
++                         g_variant_new_string (device->type ? device->type : ""));
++  g_variant_builder_add (&info, "{sv}", "capabilities", g_variant_new_strv (caps, -1));
++  g_variant_builder_add (&info, "{sv}", "available", g_variant_new_boolean (TRUE));
++
++  return g_variant_new ("(ss@a{sv})", id, device->name, g_variant_builder_end (&info));
++}
++
++static int
++run_list (void)
++{
++  const SANE_Device **devices = NULL;
++  GVariantBuilder builder;
++  g_autoptr(GVariant) result = NULL;
++  SANE_Status status;
++  gsize size;
++  const guchar *data;
++
++  status = sane_init (NULL, NULL);
++  if (status != SANE_STATUS_GOOD)
++    {
++      g_printerr ("scanner-helper: sane_init failed: %s\n", sane_strstatus (status));
++      return 1;
++    }
++
++  status = sane_get_devices (&devices, SANE_FALSE);
++  if (status != SANE_STATUS_GOOD)
++    {
++      g_printerr ("scanner-helper: sane_get_devices failed: %s\n", sane_strstatus (status));
++      sane_exit ();
++      return 1;
++    }
++
++  g_variant_builder_init (&builder, G_VARIANT_TYPE ("a(ssa{sv})"));
++  for (size_t i = 0; devices && devices[i]; i++)
++    {
++      if (!is_webcam (devices[i]))
++        g_variant_builder_add_value (&builder, scanner_to_variant (devices[i]));
++    }
++  result = g_variant_ref_sink (g_variant_builder_end (&builder));
++
++  sane_exit ();
++
++  data = g_variant_get_data (result);
++  size = g_variant_get_size (result);
++  if (fwrite (data, 1, size, stdout) != size || fflush (stdout) != 0)
++    {
++      g_printerr ("scanner-helper: failed to write the scanner list\n");
++      return 1;
++    }
++
++  return 0;
++}
++
++int
++main (int argc, char *argv[])
++{
++  if (argc == 2 && strcmp (argv[1], "list") == 0)
++    return run_list ();
++
++  g_printerr ("usage: %s list\n", argv[0]);
++  return 2;
++}
+diff --git a/desktop-portal/scanner.c b/desktop-portal/scanner.c
+index 76f38e7..2ae8253 100644
+--- a/desktop-portal/scanner.c
++++ b/desktop-portal/scanner.c
+@@ -65,6 +65,7 @@ scanner_grants_from_app_info (XdpAppInfo *app_info)
+ typedef struct
+ {
+   char *id;
++  char *sane_name; /* what libsane calls it; never given to an application */
+   GVariant *info; /* a{sv}, floating reference sunk */
+   GStrv capabilities;
+ } ScannerDevice;
+@@ -73,6 +74,7 @@ static void
+ scanner_device_free (ScannerDevice *device)
+ {
+   g_free (device->id);
++  g_free (device->sane_name);
+   g_clear_pointer (&device->info, g_variant_unref);
+   g_strfreev (device->capabilities);
+   g_free (device);
+@@ -80,6 +82,32 @@ scanner_device_free (ScannerDevice *device)
+ 
+ G_DEFINE_AUTOPTR_CLEANUP_FUNC (ScannerDevice, scanner_device_free)
+ 
++/* From one entry of the helper's list: an id, the SANE name and the information vardict */
++static ScannerDevice *
++scanner_device_new_from_helper (const char *id,
++                                const char *sane_name,
++                                GVariant   *info)
++{
++  ScannerDevice *device = g_new0 (ScannerDevice, 1);
++  const char **caps = NULL;
++
++  device->id = g_strdup (id);
++  device->sane_name = g_strdup (sane_name);
++  device->info = g_variant_ref (info);
++
++  if (g_variant_lookup (info, "capabilities", "^a&s", &caps))
++    {
++      device->capabilities = g_strdupv ((char **) caps);
++      g_free (caps);
++    }
++  else
++    {
++      device->capabilities = g_new0 (char *, 1);
++    }
++
++  return device;
++}
++
+ static ScannerDevice *
+ scanner_device_new (const char *id,
+                     const char *name,
+@@ -107,29 +135,112 @@ scanner_device_new (const char *id,
+   return device;
+ }
+ 
+-/* The scanners that exist right now, as a list of ScannerDevice. This stands in for the helper
+- * that will ask libsane; until then XDG_DESKTOP_PORTAL_SCANNER_FAKE=1 gives two made-up ones. */
++#define HELPER_TIMEOUT_SECONDS 30
++
++static gboolean
++helper_timed_out (gpointer data)
++{
++  g_cancellable_cancel (G_CANCELLABLE (data));
++
++  return G_SOURCE_REMOVE;
++}
++
++/* Runs the helper to ask libsane for the scanners. Probing can take seconds, and some backends
++ * reset the scanner they find, so callers should not do this more than they have to. */
+ static GPtrArray *
+-scanner_enumerate (XdpScanner *self)
++scanner_enumerate_with_helper (void)
+ {
+-  GPtrArray *devices = g_ptr_array_new_with_free_func ((GDestroyNotify) scanner_device_free);
++  g_autoptr(GPtrArray) devices = g_ptr_array_new_with_free_func ((GDestroyNotify) scanner_device_free);
++  g_autoptr(GSubprocess) subprocess = NULL;
++  g_autoptr(GCancellable) cancellable = g_cancellable_new ();
++  g_autoptr(GBytes) stdout_bytes = NULL;
++  g_autoptr(GBytes) stderr_bytes = NULL;
++  g_autoptr(GVariant) list = NULL;
++  g_autoptr(GError) error = NULL;
++  const char *helper = g_getenv ("XDP_SCANNER_HELPER");
++  GVariantIter iter;
++  const char *id;
++  const char *sane_name;
++  GVariant *info;
++  guint timeout_id;
++
++  if (helper == NULL)
++    helper = LIBEXECDIR "/xdg-desktop-portal-scanner-helper";
++
++  subprocess = g_subprocess_new (G_SUBPROCESS_FLAGS_STDOUT_PIPE | G_SUBPROCESS_FLAGS_STDERR_PIPE,
++                                 &error, helper, "list", NULL);
++  if (subprocess == NULL)
++    {
++      g_warning ("[scanner] Failed to run %s: %s", helper, error->message);
++      return g_steal_pointer (&devices);
++    }
+ 
+-  if (g_strcmp0 (g_getenv ("XDG_DESKTOP_PORTAL_SCANNER_FAKE"), "1") == 0)
++  timeout_id = g_timeout_add_seconds (HELPER_TIMEOUT_SECONDS, helper_timed_out, cancellable);
++
++  if (!g_subprocess_communicate (subprocess, NULL, cancellable, &stdout_bytes, &stderr_bytes, &error))
+     {
+-      static const char * const film[] = { "film", "infrared", "color", NULL };
+-      static const char * const mfp[] = { "flatbed", "adf", "color", NULL };
+-
+-      g_ptr_array_add (devices,
+-                       scanner_device_new ("fake-film", "Fake Film Scanner", "usb",
+-                                           "film scanner", film, TRUE));
+-      g_ptr_array_add (devices,
+-                       scanner_device_new ("fake-mfp", "Fake Office Printer", "network",
+-                                           "multi-function peripheral", mfp, TRUE));
++      g_warning ("[scanner] The scanner helper did not finish: %s", error->message);
++      g_subprocess_force_exit (subprocess);
+     }
++  g_source_remove (timeout_id);
++
++  if (stdout_bytes == NULL || !g_subprocess_get_if_exited (subprocess) ||
++      g_subprocess_get_exit_status (subprocess) != 0)
++    {
++      if (stderr_bytes != NULL && g_bytes_get_size (stderr_bytes) > 0)
++        g_warning ("[scanner] The scanner helper failed: %.*s",
++                   (int) g_bytes_get_size (stderr_bytes),
++                   (const char *) g_bytes_get_data (stderr_bytes, NULL));
++      return g_steal_pointer (&devices);
++    }
++
++  /* The helper is part of the portal, but what it read from drivers is not trusted to be well
++   * formed, so check the type and the encoding before using it */
++  list = g_variant_ref_sink (g_variant_new_from_bytes (G_VARIANT_TYPE ("a(ssa{sv})"), stdout_bytes, FALSE));
++  if (!g_variant_is_normal_form (list))
++    {
++      g_warning ("[scanner] The scanner helper returned a malformed list");
++      return g_steal_pointer (&devices);
++    }
++
++  g_variant_iter_init (&iter, list);
++  while (g_variant_iter_next (&iter, "(&s&s@a{sv})", &id, &sane_name, &info))
++    {
++      g_ptr_array_add (devices, scanner_device_new_from_helper (id, sane_name, info));
++      g_variant_unref (info);
++    }
++
++  return g_steal_pointer (&devices);
++}
++
++/* Two made-up scanners, for trying the dialog without hardware or drivers */
++static GPtrArray *
++scanner_enumerate_fake (void)
++{
++  GPtrArray *devices = g_ptr_array_new_with_free_func ((GDestroyNotify) scanner_device_free);
++  static const char * const film[] = { "film", "infrared", "color", NULL };
++  static const char * const mfp[] = { "flatbed", "adf", "color", NULL };
++
++  g_ptr_array_add (devices,
++                   scanner_device_new ("fake-film", "Fake Film Scanner", "usb",
++                                       "film scanner", film, TRUE));
++  g_ptr_array_add (devices,
++                   scanner_device_new ("fake-mfp", "Fake Office Printer", "network",
++                                       "multi-function peripheral", mfp, TRUE));
+ 
+   return devices;
+ }
+ 
++/* The scanners that exist right now, as a list of ScannerDevice */
++static GPtrArray *
++scanner_enumerate (XdpScanner *self)
++{
++  if (g_strcmp0 (g_getenv ("XDG_DESKTOP_PORTAL_SCANNER_FAKE"), "1") == 0)
++    return scanner_enumerate_fake ();
++
++  return scanner_enumerate_with_helper ();
++}
++
+ static gboolean
+ scanner_device_has_capabilities (ScannerDevice       *device,
+                                  const char * const  *required)
+@@ -163,6 +274,7 @@ handle_list_scanners (XdpDbusScanner         *object,
+   GVariantBuilder options_builder;
+   GVariantBuilder scanners_builder;
+   GHashTable *grants;
++  gboolean has_grants;
+ 
+   g_debug ("[scanner] Handling ListScanners");
+ 
+@@ -175,10 +287,20 @@ handle_list_scanners (XdpDbusScanner         *object,
+     }
+   g_variant_builder_clear (&options_builder);
+ 
+-  devices = scanner_enumerate (self);
+-
+   g_variant_builder_init (&scanners_builder, G_VARIANT_TYPE ("a(sa{sv})"));
+ 
++  /* Asking libsane can take seconds and some backends reset the scanner they find, so an
++   * application that has been granted nothing does not cause a probe. */
++  g_mutex_lock (&self->mutex);
++  grants = scanner_grants_from_app_info (app_info);
++  has_grants = g_hash_table_size (grants) > 0;
++  g_mutex_unlock (&self->mutex);
++
++  if (has_grants)
++    devices = scanner_enumerate (self);
++  else
++    devices = g_ptr_array_new_with_free_func ((GDestroyNotify) scanner_device_free);
++
+   g_mutex_lock (&self->mutex);
+   grants = scanner_grants_from_app_info (app_info);
+   for (guint i = 0; i < devices->len; i++)
+diff --git a/desktop-portal/xdp-context.c b/desktop-portal/xdp-context.c
+index 7141a9b..5ada8e9 100644
+--- a/desktop-portal/xdp-context.c
++++ b/desktop-portal/xdp-context.c
+@@ -528,7 +528,9 @@ xdp_context_register (XdpContext       *context,
+ #if HAVE_GUDEV
+   init_usb (context);
+ #endif
++#if HAVE_SANE
+   init_scanner (context);
++#endif
+   init_registry (context);
+ 
+   await_pending_inits (context);
+diff --git a/meson.build b/meson.build
+index c527011..25de06c 100644
+--- a/meson.build
++++ b/meson.build
+@@ -165,6 +165,7 @@ libdbus_dep = dependency('dbus-1')
+ wireplumber_dep = dependency(wireplumber_dep_name)
+ libsystemd_dep = dependency('libsystemd', required: get_option('systemd'))
+ gudev_dep = dependency('gudev-1.0', required: get_option('gudev'))
++sane_dep = dependency('sane-backends', required: get_option('sane'))
+ umockdev_dep = dependency('umockdev-1.0', required: get_option('tests'))
+ libglnx_dep = dependency('libglnx')
+ gvdb_dep = dependency('gvdb')
+@@ -210,6 +211,9 @@ config_h.set10('HAVE_GEOCLUE', have_geoclue)
+ have_libsystemd = libsystemd_dep.found()
+ config_h.set10('HAVE_LIBSYSTEMD', have_libsystemd)
+ 
++have_sane = sane_dep.found()
++config_h.set10('HAVE_SANE', have_sane)
++
+ have_gudev = gudev_dep.found()
+ config_h.set10('HAVE_GUDEV', have_gudev)
+ 
+diff --git a/meson.options b/meson.options
+index 4e88a34..cc80bd3 100644
+--- a/meson.options
++++ b/meson.options
+@@ -21,6 +21,10 @@ option('geoclue',
+        type: 'feature',
+        value: 'auto',
+        description: 'Enable Geoclue support. Needed for location portal')
++option('sane',
++       type: 'feature',
++       value: 'auto',
++       description: 'Enable SANE support. Needed for the scanner portal')
+ option('gudev',
+        type: 'feature',
+        value: 'auto',

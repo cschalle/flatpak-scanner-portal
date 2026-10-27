@@ -1,0 +1,1160 @@
+From 9ac2aae601285468dd6a9232896d39b66c5ca8a1 Mon Sep 17 00:00:00 2001
+From: "Christian F.K. Schaller" <christian.schaller@gmail.com>
+Date: Mon, 26 Oct 2026 11:32:34 -0400
+Subject: [PATCH] scanner: Add GetFrameParameters, StartFrame and Cancel
+
+This commit adds the frames: StartFrame returns the read end of a pipe
+that carries the frame's pixels, FrameEvent reports the frame's progress,
+Cancel stops it, and GetFrameParameters gives the layout the next frame
+would have.
+
+The portal creates the pipe and passes the write end to the helper over
+the socket as a file descriptor, so the pixels do not pass through the
+portal. Its own copy is closed at once, so that the application sees the
+end of the data when the helper closes its.
+
+The helper scans a frame in a thread of its own and goes on reading
+requests, a Cancel above all. Only one thread talks to libsane at a
+time, so while a frame is in progress the requests that need libsane
+(GetOptions, GetOptionValues, SetOptions, GetFrameParameters and another
+StartFrame) are refused as Busy. This is new for GetOptions and
+GetOptionValues, and both draft interface files now say so. A frame
+that is not the last of its scan is continued with sane_start and no
+sane_cancel in between, since a real driver starts the scan over after a
+cancel. The pipe is not blocking, so that an application that is not
+reading cannot hold the thread past a Cancel. The application closing
+its end of the pipe cancels the frame.
+
+Events are sent by the helper as messages with serial 0 and read, with
+the replies, by a reader thread per session that hands each reply to
+the call waiting for it and turns each event into a FrameEvent signal
+for the application that owns the session. Every event carries the
+number of its frame. The frame's slot is freed before its last event is
+sent, so that an application can start the next frame from its handler.
+Messages can now carry a file descriptor, with SCM_RIGHTS.
+
+The frame formats ir, rgbi and grayi, which sane.h keeps out of its
+enumeration, are reported by name and the draft now lists them.
+
+Writing to a pipe whose reader has gone raises SIGPIPE, and ignoring it
+for the process was not enough: the test backend sets it back to the
+default, which killed the helper. The frame's thread blocks it while it
+writes and takes a pending one off before it unblocks.
+
+Tested with SANE's test backend, on the helper alone over a socketpair
+and through the portal on a private bus (20 checks): a whole frame with
+its events and byte count, frame numbers, Busy during a frame, Cancel
+and an early close of the pipe ending the frame, another application
+refused, the helper killed in the middle of a frame (the pipe ends and
+the application gets Session.Closed), the scanner opened again, and the
+application leaving in the middle of a frame. Not tested: the call
+timeout, a helper that stops answering without dying, two simultaneous
+opens, a scanner with more than one frame per scan, and the 8200i.
+---
+ data/org.freedesktop.portal.Scanner.xml |   9 +-
+ desktop-portal/scanner-helper.c         | 425 +++++++++++++++++++++++-
+ desktop-portal/scanner-protocol.h       | 112 ++++++-
+ desktop-portal/scanner.c                | 253 +++++++++++++-
+ 4 files changed, 761 insertions(+), 38 deletions(-)
+
+diff --git a/data/org.freedesktop.portal.Scanner.xml b/data/org.freedesktop.portal.Scanner.xml
+index 6cb7c51..13262f7 100644
+--- a/data/org.freedesktop.portal.Scanner.xml
++++ b/data/org.freedesktop.portal.Scanner.xml
+@@ -219,7 +219,8 @@
+         @descriptors: Option descriptors, in backend order
+ 
+         Returns the scanner's options, modelled on SANE option descriptors.
+-        Call again when SetOptions() reports ``reload-options``.
++        Call again when SetOptions() reports ``reload-options``. Fails with
++        ``org.freedesktop.portal.Error.Busy`` while a frame is in progress.
+ 
+         The order is the backend's and is kept until ``reload-options``.
+         SANE's option 0, the number of options, is not listed, so an
+@@ -284,7 +285,8 @@
+         currently no option supported.
+         @values: Current values by option name
+ 
+-        Returns the current value of every readable, active option.
++        Returns the current value of every readable, active option. Fails with
++        ``org.freedesktop.portal.Error.Busy`` while a frame is in progress.
+     -->
+     <method name="GetOptionValues">
+       <arg type="o" name="session_handle" direction="in"/>
+@@ -407,7 +409,8 @@
+         a frame it has cancelled.
+ 
+         ``started``: the scanner is ready and data will flow. Details:
+-        ``format`` (``s``: ``gray``, ``rgb``, ``red``, ``green``, ``blue``),
++        ``format`` (``s``: ``gray``, ``rgb``, ``red``, ``green``, ``blue``, and for
++        scanners with an infrared channel ``ir``, ``rgbi``, ``grayi``),
+         ``depth`` (``u``), ``pixels_per_line`` (``u``), ``bytes_per_line``
+         (``u``), ``lines`` (``i``, -1 when unknown, as for hand scanners)
+         and ``last_frame`` (``b``).
+diff --git a/desktop-portal/scanner-helper.c b/desktop-portal/scanner-helper.c
+index 7d248c6..6416598 100644
+--- a/desktop-portal/scanner-helper.c
++++ b/desktop-portal/scanner-helper.c
+@@ -16,8 +16,12 @@
+  *     the scanner could be opened.
+  */
+ 
++#include <fcntl.h>
++#include <pthread.h>
++#include <signal.h>
+ #include <stdio.h>
+ #include <string.h>
++#include <time.h>
+ #include <unistd.h>
+ 
+ #include <glib.h>
+@@ -150,16 +154,25 @@ run_list (void)
+   return 0;
+ }
+ 
++/* Replies are written by the thread that serves requests and events by the one that scans, and a
++ * message must not be interleaved with another */
++static GMutex write_lock;
++
+ static gboolean
+ send_reply (guint32   serial,
+             gboolean  ok,
+             GVariant *result)
+ {
+   g_autoptr(GError) error = NULL;
++  gboolean written;
++
++  g_mutex_lock (&write_lock);
++  written = scanner_protocol_write (SCANNER_HELPER_FD,
++                                    g_variant_new ("(ubv)", serial, ok, result),
++                                    &error);
++  g_mutex_unlock (&write_lock);
+ 
+-  if (!scanner_protocol_write (SCANNER_HELPER_FD,
+-                               g_variant_new ("(ubv)", serial, ok, result),
+-                               &error))
++  if (!written)
+     {
+       g_printerr ("scanner-helper: %s\n", error->message);
+       return FALSE;
+@@ -583,14 +596,356 @@ handle_set_options (SANE_Handle   handle,
+   return g_variant_new ("(@a{sv}@as)", g_variant_builder_end (&applied), g_variant_builder_end (&flags));
+ }
+ 
++/* ---- Frames ----
++ *
++ * A frame is scanned by a thread of its own, so that the helper can go on reading requests (a
++ * Cancel, above all) while the scanner works. Only one thread talks to libsane at a time: the
++ * requests that need it are refused as busy while a frame is in progress. */
++
++typedef struct
++{
++  SANE_Handle handle;
++  gint busy;        /* a frame is in progress; atomic */
++  gint cancel;      /* the frame in progress is to stop; atomic */
++  guint32 frames;   /* number of the last frame started */
++  /* The last frame finished and was not the last of its scan, so the next one continues the scan:
++   * SANE wants sane_start again with no sane_cancel in between, since a real driver starts the
++   * scan over after a cancel. Only used while no frame is in progress, and by the frame's thread. */
++  gboolean mid_scan;
++  GThread *thread;
++} Session;
++
++typedef struct
++{
++  Session *session;
++  int out_fd;
++  guint32 frame;
++} FrameJob;
++
++/* sane.h keeps these out of its enumeration, "to be exposed in a later version of SANE", though
++ * backends for scanners with an infrared channel return them */
++#define FRAME_IR 0x0F
++#define FRAME_RGBI 0x10
++#define FRAME_GRAYI 0x11
++
++static const char *
++frame_format_name (SANE_Frame format)
++{
++  switch (format)
++    {
++    case SANE_FRAME_GRAY: return "gray";
++    case SANE_FRAME_RGB: return "rgb";
++    case SANE_FRAME_RED: return "red";
++    case SANE_FRAME_GREEN: return "green";
++    case SANE_FRAME_BLUE: return "blue";
++    default: break;
++    }
++
++  switch ((int) format)
++    {
++    case FRAME_IR: return "ir";
++    case FRAME_RGBI: return "rgbi";
++    case FRAME_GRAYI: return "grayi";
++    default: break;
++    }
++
++  return NULL;
++}
++
++static GVariant *
++frame_parameters_to_variant (const SANE_Parameters *params,
++                             const char            *format)
++{
++  GVariantBuilder builder;
++
++  g_variant_builder_init (&builder, G_VARIANT_TYPE_VARDICT);
++  g_variant_builder_add (&builder, "{sv}", "format", g_variant_new_string (format));
++  g_variant_builder_add (&builder, "{sv}", "depth", g_variant_new_uint32 (params->depth));
++  g_variant_builder_add (&builder, "{sv}", "pixels_per_line", g_variant_new_uint32 (params->pixels_per_line));
++  g_variant_builder_add (&builder, "{sv}", "bytes_per_line", g_variant_new_uint32 (params->bytes_per_line));
++  g_variant_builder_add (&builder, "{sv}", "lines", g_variant_new_int32 (params->lines));
++  g_variant_builder_add (&builder, "{sv}", "last_frame", g_variant_new_boolean (params->last_frame));
++
++  return g_variant_builder_end (&builder);
++}
++
++static const char *
++status_error_name (SANE_Status status)
++{
++  if (status == SANE_STATUS_ACCESS_DENIED)
++    return "org.freedesktop.portal.Error.NotAllowed";
++  if (status == SANE_STATUS_INVAL)
++    return "org.freedesktop.portal.Error.InvalidArgument";
++
++  return "org.freedesktop.portal.Error.Failed";
++}
++
++static void
++send_event (guint32      frame,
++            const char  *state,
++            GVariant    *details)
++{
++  GVariantBuilder builder;
++  GVariantIter iter;
++  GVariant *value;
++  const char *key;
++
++  /* Every event carries the number of its frame, so that a client can tell it from one left over
++   * from a frame it cancelled */
++  g_variant_builder_init (&builder, G_VARIANT_TYPE_VARDICT);
++  g_variant_builder_add (&builder, "{sv}", "frame", g_variant_new_uint32 (frame));
++  if (details != NULL)
++    {
++      g_variant_iter_init (&iter, details);
++      while (g_variant_iter_next (&iter, "{&sv}", &key, &value))
++        {
++          g_variant_builder_add (&builder, "{sv}", key, value);
++          g_variant_unref (value);
++        }
++    }
++
++  send_reply (0, TRUE, g_variant_new ("(s@a{sv})", state, g_variant_builder_end (&builder)));
++
++  if (details != NULL)
++    g_variant_unref (g_variant_ref_sink (details));
++}
++
++/* Ends a frame. The pipe is closed first so that the application sees the end of the data, and the
++ * frame slot is freed before the event, so that the application can start the next frame from its
++ * handler for it. */
++static void
++finish_frame (FrameJob   *job,
++              const char *state,
++              GVariant   *details,
++              gboolean    more_frames)
++{
++  Session *session = job->session;
++
++  close (job->out_fd);
++  job->out_fd = -1;
++  session->mid_scan = more_frames;
++  g_atomic_int_set (&session->busy, 0);
++
++  send_event (job->frame, state, details);
++}
++
++static GVariant *
++error_details (SANE_Status  status,
++               const char  *message)
++{
++  GVariantBuilder builder;
++
++  g_variant_builder_init (&builder, G_VARIANT_TYPE_VARDICT);
++  g_variant_builder_add (&builder, "{sv}", "code", g_variant_new_string (status_error_name (status)));
++  g_variant_builder_add (&builder, "{sv}", "message", g_variant_new_string (message));
++
++  return g_variant_builder_end (&builder);
++}
++
++/* Writes it all to the pipe. Returns FALSE if the application closed its end or the frame was
++ * cancelled while the pipe was full. The pipe is not blocking, so that an application that is not
++ * reading cannot hold the thread past a Cancel.
++ *
++ * Writing to a pipe that has no reader raises SIGPIPE. Ignoring it for the process is not enough:
++ * backends change its disposition (the test backend sets it back to the default), so it is blocked
++ * for this thread while it writes, and a signal that came is taken off before it is unblocked. */
++static gboolean
++write_all_cancellable (Session       *session,
++                       int            fd,
++                       const guchar  *data,
++                       gsize          size)
++{
++  sigset_t pipe_set, old_set;
++  gboolean ok = TRUE;
++
++  sigemptyset (&pipe_set);
++  sigaddset (&pipe_set, SIGPIPE);
++  pthread_sigmask (SIG_BLOCK, &pipe_set, &old_set);
++
++  while (size > 0)
++    {
++      struct pollfd pfd = { .fd = fd, .events = POLLOUT };
++      ssize_t n = write (fd, data, size);
++
++      if (n > 0)
++        {
++          data += n;
++          size -= n;
++          continue;
++        }
++
++      if (n < 0 && errno == EINTR)
++        continue;
++
++      if (n < 0 && errno != EAGAIN)
++        {
++          if (errno == EPIPE)
++            {
++              struct timespec none = { 0, 0 };
++
++              while (sigtimedwait (&pipe_set, NULL, &none) < 0 && errno == EINTR)
++                ;
++            }
++          ok = FALSE;
++          break;
++        }
++
++      if (g_atomic_int_get (&session->cancel))
++        {
++          ok = FALSE;
++          break;
++        }
++
++      poll (&pfd, 1, 100);
++    }
++
++  pthread_sigmask (SIG_SETMASK, &old_set, NULL);
++
++  return ok;
++}
++
++static gpointer
++frame_thread (gpointer data)
++{
++  FrameJob *job = data;
++  Session *session = job->session;
++  SANE_Handle handle = session->handle;
++  SANE_Parameters params;
++  SANE_Status status;
++  const char *format;
++  g_autofree guchar *buffer = g_malloc (64 * 1024);
++  int flags;
++
++  /* A new scan: clear anything left over */
++  if (!session->mid_scan)
++    sane_cancel (handle);
++
++  status = sane_start (handle);
++  if (status != SANE_STATUS_GOOD)
++    {
++      if (status == SANE_STATUS_NO_DOCS)
++        finish_frame (job, "no-documents", NULL, FALSE);
++      else if (status == SANE_STATUS_CANCELLED)
++        finish_frame (job, "cancelled", NULL, FALSE);
++      else
++        finish_frame (job, "error", error_details (status, sane_strstatus (status)), FALSE);
++      goto out;
++    }
++
++  status = sane_get_parameters (handle, &params);
++  format = status == SANE_STATUS_GOOD ? frame_format_name (params.format) : NULL;
++  if (status != SANE_STATUS_GOOD || format == NULL)
++    {
++      sane_cancel (handle);
++      finish_frame (job, "error",
++                    error_details (status, status != SANE_STATUS_GOOD ? sane_strstatus (status)
++                                                                      : "The scanner's frame format is not supported"),
++                    FALSE);
++      goto out;
++    }
++
++  send_event (job->frame, "started", frame_parameters_to_variant (&params, format));
++
++  flags = fcntl (job->out_fd, F_GETFL);
++  if (flags >= 0)
++    fcntl (job->out_fd, F_SETFL, flags | O_NONBLOCK);
++
++  for (;;)
++    {
++      SANE_Int length = 0;
++
++      if (g_atomic_int_get (&session->cancel))
++        {
++          sane_cancel (handle);
++          finish_frame (job, "cancelled", NULL, FALSE);
++          break;
++        }
++
++      status = sane_read (handle, buffer, 64 * 1024, &length);
++
++      if ((status == SANE_STATUS_GOOD || status == SANE_STATUS_EOF) && length > 0 &&
++          !write_all_cancellable (session, job->out_fd, buffer, length))
++        {
++          sane_cancel (handle);
++          finish_frame (job, "cancelled", NULL, FALSE);
++          break;
++        }
++
++      if (status == SANE_STATUS_EOF)
++        {
++          if (params.last_frame)
++            sane_cancel (handle);
++          finish_frame (job, "finished", NULL, !params.last_frame);
++          break;
++        }
++
++      if (status == SANE_STATUS_CANCELLED)
++        {
++          finish_frame (job, "cancelled", NULL, FALSE);
++          break;
++        }
++
++      if (status != SANE_STATUS_GOOD)
++        {
++          sane_cancel (handle);
++          finish_frame (job, "error", error_details (status, sane_strstatus (status)), FALSE);
++          break;
++        }
++    }
++
++out:
++  g_free (job);
++  return NULL;
++}
++
++/* Starts a frame that writes to out_fd, which is taken over. Returns FALSE if one is in progress. */
++static gboolean
++start_frame (Session *session,
++             guint32  serial,
++             int      out_fd)
++{
++  FrameJob *job;
++
++  if (!g_atomic_int_compare_and_exchange (&session->busy, 0, 1))
++    return FALSE;
++
++  /* The one before has finished, so this does not wait */
++  if (session->thread != NULL)
++    g_thread_join (g_steal_pointer (&session->thread));
++
++  g_atomic_int_set (&session->cancel, 0);
++  job = g_new0 (FrameJob, 1);
++  job->session = session;
++  job->out_fd = out_fd;
++  job->frame = ++session->frames;
++
++  /* Reply before the thread can send an event, so that the application sees the reply first */
++  send_reply (serial, TRUE, g_variant_new_string (""));
++  session->thread = g_thread_new ("scanner-frame", frame_thread, job);
++
++  return TRUE;
++}
++
++static void
++stop_frame (Session *session)
++{
++  g_atomic_int_set (&session->cancel, 1);
++  if (session->thread != NULL)
++    g_thread_join (g_steal_pointer (&session->thread));
++}
++
+ static int
+ run_session (const char *name)
+ {
++  Session session = { 0 };
+   SANE_Handle handle = NULL;
+   SANE_Status status;
+   gboolean running = TRUE;
+   int exit_code = 0;
+ 
++  /* An application that closes its end of the pipe is an error from write(), not a signal */
++  signal (SIGPIPE, SIG_IGN);
++
+   status = sane_init (NULL, NULL);
+   if (status != SANE_STATUS_GOOD)
+     {
+@@ -607,6 +962,8 @@ run_session (const char *name)
+       return 1;
+     }
+ 
++  session.handle = handle;
++
+   if (!send_reply (0, TRUE, g_variant_new_string ("")))
+     running = FALSE;
+ 
+@@ -617,8 +974,11 @@ run_session (const char *name)
+       g_autoptr(GVariant) args = NULL;
+       const char *method;
+       guint32 serial;
++      int pass_fd = -1;
++      gboolean busy;
+ 
+-      request = scanner_protocol_read (SCANNER_HELPER_FD, G_VARIANT_TYPE ("(usv)"), -1, &error);
++      request = scanner_protocol_read_with_fd (SCANNER_HELPER_FD, G_VARIANT_TYPE ("(usv)"), -1,
++                                               &pass_fd, &error);
+       if (request == NULL)
+         {
+           /* The portal closing the socket is how a session ends, so that is not an error */
+@@ -631,12 +991,49 @@ run_session (const char *name)
+         }
+ 
+       g_variant_get (request, "(u&sv)", &serial, &method, &args);
++      busy = g_atomic_int_get (&session.busy) != 0;
+ 
+       if (strcmp (method, "close") == 0)
+         {
+           send_reply (serial, TRUE, g_variant_new_string (""));
+           running = FALSE;
+         }
++      else if (strcmp (method, "cancel") == 0)
++        {
++          if (busy)
++            {
++              /* The frame's thread ends with a cancelled event */
++              g_atomic_int_set (&session.cancel, 1);
++            }
++          else
++            {
++              /* Between the frames of a scan this gives the scan up */
++              sane_cancel (handle);
++              session.mid_scan = FALSE;
++            }
++          send_reply (serial, TRUE, g_variant_new_string (""));
++        }
++      else if (strcmp (method, "start_frame") == 0)
++        {
++          if (pass_fd < 0)
++            {
++              send_failure (serial, "failed", "No pipe for the frame");
++            }
++          else if (start_frame (&session, serial, pass_fd))
++            {
++              /* The frame's thread has the descriptor now */
++              pass_fd = -1;
++            }
++          else
++            {
++              send_failure (serial, "busy", "A frame is in progress");
++            }
++        }
++      else if (busy)
++        {
++          /* The scanner is used by the frame's thread, and libsane is not called from two threads */
++          send_failure (serial, "busy", "A frame is in progress");
++        }
+       else if (strcmp (method, "get_options") == 0)
+         {
+           send_reply (serial, TRUE, handle_get_options (handle));
+@@ -645,6 +1042,19 @@ run_session (const char *name)
+         {
+           send_reply (serial, TRUE, handle_get_values (handle));
+         }
++      else if (strcmp (method, "get_frame_parameters") == 0)
++        {
++          SANE_Parameters params;
++          SANE_Status params_status = sane_get_parameters (handle, &params);
++          const char *format = params_status == SANE_STATUS_GOOD ? frame_format_name (params.format) : NULL;
++
++          if (format != NULL)
++            send_reply (serial, TRUE, frame_parameters_to_variant (&params, format));
++          else
++            send_failure (serial, "failed",
++                          params_status != SANE_STATUS_GOOD ? sane_strstatus (params_status)
++                                                            : "The scanner's frame format is not supported");
++        }
+       else if (strcmp (method, "set_options") == 0)
+         {
+           const char *kind = "invalid";
+@@ -665,8 +1075,15 @@ run_session (const char *name)
+         {
+           send_failure (serial, "failed", "Unknown method");
+         }
++
++      /* A descriptor that nothing took over */
++      if (pass_fd >= 0)
++        close (pass_fd);
+     }
+ 
++  /* The frame's thread is the only one that may be using the scanner */
++  stop_frame (&session);
++
+   sane_cancel (handle);
+   sane_close (handle);
+   sane_exit ();
+diff --git a/desktop-portal/scanner-protocol.h b/desktop-portal/scanner-protocol.h
+index cb76736..42687f5 100644
+--- a/desktop-portal/scanner-protocol.h
++++ b/desktop-portal/scanner-protocol.h
+@@ -6,9 +6,14 @@
+  * file descriptor 3. A message is a GVariant, sent as its size in bytes (a 32-bit integer in
+  * host byte order, both sides being on one machine) and then its serialized form.
+  *
+- * Requests, from the portal:  (usv)  serial, method, arguments
++ * Requests, from the portal:  (usv)  serial, method, arguments. The serial is 1 or more. A request
++ *                              can carry one file descriptor, passed with the message
++ *                              (SCM_RIGHTS): the write end of the pipe for a frame
+  * Replies, from the helper:   (ubv)  serial, success, result; on failure the result is (ss), a kind,
+- *                              "busy" or "failed", and a message
++ *                              "invalid", "busy" or "failed", and a message
++ * Events, from the helper:    (ubv)  with serial 0 once the session is open, success true and the
++ *                              result (sa{sv}), the state and details of a FrameEvent. They arrive
++ *                              at any time, between replies.
+  *
+  * The helper exits when the socket closes, after cancelling and closing the scanner.
+  */
+@@ -19,6 +24,7 @@
+ #include <poll.h>
+ #include <string.h>
+ #include <sys/socket.h>
++#include <sys/uio.h>
+ #include <unistd.h>
+ 
+ #include <gio/gio.h>
+@@ -33,6 +39,7 @@ scanner_protocol_read_exact (int       fd,
+                              guchar   *buffer,
+                              gsize     size,
+                              int       timeout_ms,
++                             int      *received_fd,
+                              GError  **error)
+ {
+   gsize done = 0;
+@@ -56,7 +63,35 @@ scanner_protocol_read_exact (int       fd,
+           return FALSE;
+         }
+ 
+-      n = read (fd, buffer + done, size - done);
++      {
++        struct iovec iov = { .iov_base = buffer + done, .iov_len = size - done };
++        union
++        {
++          struct cmsghdr align;
++          char buf[CMSG_SPACE (sizeof (int))];
++        } control;
++        struct msghdr msg = { .msg_iov = &iov, .msg_iovlen = 1,
++                              .msg_control = control.buf, .msg_controllen = sizeof control.buf };
++        struct cmsghdr *cmsg;
++
++        n = recvmsg (fd, &msg, MSG_CMSG_CLOEXEC);
++
++        for (cmsg = n >= 0 ? CMSG_FIRSTHDR (&msg) : NULL; cmsg != NULL; cmsg = CMSG_NXTHDR (&msg, cmsg))
++          {
++            if (cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SCM_RIGHTS &&
++                cmsg->cmsg_len == CMSG_LEN (sizeof (int)))
++              {
++                int passed;
++
++                memcpy (&passed, CMSG_DATA (cmsg), sizeof passed);
++                /* Only one is kept, and only if the caller wants one */
++                if (received_fd != NULL && *received_fd < 0)
++                  *received_fd = passed;
++                else
++                  close (passed);
++              }
++          }
++      }
+       if (n < 0 && errno == EINTR)
+         continue;
+       if (n < 0)
+@@ -76,19 +111,24 @@ scanner_protocol_read_exact (int       fd,
+ }
+ 
+ /* Reads one message and returns it, checked to be of the given type and in normal form, or NULL
+- * with an error set. */
++ * with an error set. If received_fd is not NULL, a descriptor that came with the message is
++ * stored there (it is set to -1 first), and the caller owns it. */
+ static inline GVariant *
+-scanner_protocol_read (int                  fd,
+-                       const GVariantType  *type,
+-                       int                  timeout_ms,
+-                       GError             **error)
++scanner_protocol_read_with_fd (int                  fd,
++                               const GVariantType  *type,
++                               int                  timeout_ms,
++                               int                 *received_fd,
++                               GError             **error)
+ {
+   guint32 size;
+   g_autofree guchar *data = NULL;
+   g_autoptr(GBytes) bytes = NULL;
+   g_autoptr(GVariant) message = NULL;
+ 
+-  if (!scanner_protocol_read_exact (fd, (guchar *) &size, sizeof size, timeout_ms, error))
++  if (received_fd != NULL)
++    *received_fd = -1;
++
++  if (!scanner_protocol_read_exact (fd, (guchar *) &size, sizeof size, timeout_ms, received_fd, error))
+     return NULL;
+ 
+   if (size == 0 || size > SCANNER_PROTOCOL_MAX_MESSAGE)
+@@ -98,7 +138,7 @@ scanner_protocol_read (int                  fd,
+     }
+ 
+   data = g_malloc (size);
+-  if (!scanner_protocol_read_exact (fd, data, size, timeout_ms, error))
++  if (!scanner_protocol_read_exact (fd, data, size, timeout_ms, received_fd, error))
+     return NULL;
+ 
+   bytes = g_bytes_new_take (g_steal_pointer (&data), size);
+@@ -112,10 +152,22 @@ scanner_protocol_read (int                  fd,
+   return g_steal_pointer (&message);
+ }
+ 
++static inline GVariant *
++scanner_protocol_read (int                  fd,
++                       const GVariantType  *type,
++                       int                  timeout_ms,
++                       GError             **error)
++{
++  return scanner_protocol_read_with_fd (fd, type, timeout_ms, NULL, error);
++}
++
++/* Writes one message, with a descriptor if pass_fd is not negative. The caller keeps its own copy
++ * of the descriptor. */
+ static inline gboolean
+-scanner_protocol_write (int        fd,
+-                        GVariant  *message,
+-                        GError   **error)
++scanner_protocol_write_with_fd (int        fd,
++                                GVariant  *message,
++                                int        pass_fd,
++                                GError   **error)
+ {
+   g_autoptr(GVariant) normal = g_variant_get_normal_form (message);
+   guint32 size = g_variant_get_size (normal);
+@@ -130,7 +182,31 @@ scanner_protocol_write (int        fd,
+     {
+       /* send(), not write(), so that a helper that has gone away is an error, not a SIGPIPE that
+        * would take the portal with it */
+-      ssize_t n = send (fd, buffer + done, sizeof size + size - done, MSG_NOSIGNAL);
++      struct iovec iov = { .iov_base = buffer + done, .iov_len = sizeof size + size - done };
++      union
++      {
++        struct cmsghdr align;
++        char buf[CMSG_SPACE (sizeof (int))];
++      } control;
++      struct msghdr msg = { .msg_iov = &iov, .msg_iovlen = 1 };
++      ssize_t n;
++
++      /* The descriptor goes with the first byte */
++      if (done == 0 && pass_fd >= 0)
++        {
++          struct cmsghdr *cmsg;
++
++          memset (&control, 0, sizeof control);
++          msg.msg_control = control.buf;
++          msg.msg_controllen = sizeof control.buf;
++          cmsg = CMSG_FIRSTHDR (&msg);
++          cmsg->cmsg_level = SOL_SOCKET;
++          cmsg->cmsg_type = SCM_RIGHTS;
++          cmsg->cmsg_len = CMSG_LEN (sizeof (int));
++          memcpy (CMSG_DATA (cmsg), &pass_fd, sizeof pass_fd);
++        }
++
++      n = sendmsg (fd, &msg, MSG_NOSIGNAL);
+ 
+       if (n < 0 && errno == EINTR)
+         continue;
+@@ -144,3 +220,11 @@ scanner_protocol_write (int        fd,
+ 
+   return TRUE;
+ }
++
++static inline gboolean
++scanner_protocol_write (int        fd,
++                        GVariant  *message,
++                        GError   **error)
++{
++  return scanner_protocol_write_with_fd (fd, message, -1, error);
++}
+diff --git a/desktop-portal/scanner.c b/desktop-portal/scanner.c
+index 5b30264..5de31a7 100644
+--- a/desktop-portal/scanner.c
++++ b/desktop-portal/scanner.c
+@@ -7,6 +7,7 @@
+ #include "scanner.h"
+ 
+ #include <string.h>
++#include <fcntl.h>
+ #include <sys/socket.h>
+ #include <sys/types.h>
+ #include <unistd.h>
+@@ -60,9 +61,16 @@ struct _XdpScannerSession
+   int fd;
+   gboolean stopping;
+ 
+-  /* One request to the helper at a time, since a reply is matched to its request by order */
++  /* One request to the helper at a time. The reply is read by the session's reader thread, which
++   * hands it to the caller waiting for it, so that it can also deliver the events that arrive
++   * when no call is waiting. */
+   GMutex call_lock;
+   guint32 serial;
++  GMutex reply_lock;
++  GCond reply_cond;
++  GVariant *reply;      /* the reply to the request with serial reply_for, once it is in */
++  guint32 reply_for;
++  gboolean reader_done;
+ };
+ 
+ #define XDP_TYPE_SCANNER_SESSION (xdp_scanner_session_get_type ())
+@@ -573,6 +581,7 @@ handle_select_scanners (XdpDbusScanner         *object,
+ /* ---- Sessions: an open scanner ---- */
+ 
+ #define HELPER_OPEN_TIMEOUT_MS 60000
++#define HELPER_CALL_TIMEOUT_MS 60000
+ #define HELPER_EXIT_GRACE_SECONDS 5
+ 
+ static gboolean
+@@ -660,6 +669,9 @@ xdp_scanner_session_finalize (GObject *object)
+   if (self->fd >= 0)
+     close (self->fd);
+   g_mutex_clear (&self->call_lock);
++  g_mutex_clear (&self->reply_lock);
++  g_cond_clear (&self->reply_cond);
++  g_clear_pointer (&self->reply, g_variant_unref);
+ 
+   G_OBJECT_CLASS (xdp_scanner_session_parent_class)->finalize (object);
+ }
+@@ -680,6 +692,8 @@ xdp_scanner_session_init (XdpScannerSession *self)
+ {
+   self->fd = -1;
+   g_mutex_init (&self->call_lock);
++  g_mutex_init (&self->reply_lock);
++  g_cond_init (&self->reply_cond);
+ }
+ 
+ static XdpScannerSession *
+@@ -710,6 +724,89 @@ xdp_scanner_session_new (XdpScanner       *scanner,
+   return scanner_session;
+ }
+ 
++/* Sends a FrameEvent to the application that owns the session */
++static void
++scanner_session_emit_frame_event (XdpScannerSession *self,
++                                  const char        *state,
++                                  GVariant          *details)
++{
++  XdpSession *session = XDP_SESSION (self);
++  g_autoptr(GError) error = NULL;
++  gboolean stopping;
++
++  g_mutex_lock (&self->scanner->mutex);
++  stopping = self->stopping;
++  g_mutex_unlock (&self->scanner->mutex);
++
++  /* The application closed the session, or left, and is not waiting for events */
++  if (stopping)
++    return;
++
++  if (!g_dbus_connection_emit_signal (session->connection, session->sender, DESKTOP_DBUS_PATH,
++                                      "org.freedesktop.portal.Scanner", "FrameEvent",
++                                      g_variant_new ("(os@a{sv})", session->id, state, details),
++                                      &error))
++    g_warning ("[scanner] Failed to emit FrameEvent: %s", error->message);
++}
++
++/* Reads everything the helper sends: replies go to the call that is waiting for them, and events
++ * (which have serial 0) become FrameEvent signals. Ends when the socket does, which is when the
++ * session is closed or the helper has gone. */
++static gpointer
++scanner_session_reader (gpointer data)
++{
++  g_autoptr(XdpScannerSession) self = data;
++
++  for (;;)
++    {
++      g_autoptr(GVariant) message = NULL;
++      g_autoptr(GError) error = NULL;
++      g_autoptr(GVariant) result = NULL;
++      gboolean ok = FALSE;
++      guint32 serial;
++
++      message = scanner_protocol_read (self->fd, G_VARIANT_TYPE ("(ubv)"), -1, &error);
++      if (message == NULL)
++        {
++          if (!g_error_matches (error, G_IO_ERROR, G_IO_ERROR_CLOSED))
++            g_warning ("[scanner] Reading from the scanner helper: %s", error->message);
++          break;
++        }
++
++      g_variant_get (message, "(ub@v)", &serial, &ok, &result);
++
++      if (serial == 0)
++        {
++          g_autoptr(GVariant) event = g_variant_get_variant (result);
++
++          if (ok && g_variant_is_of_type (event, G_VARIANT_TYPE ("(sa{sv})")))
++            {
++              g_autoptr(GVariant) details = NULL;
++              const char *state;
++
++              g_variant_get (event, "(&s@a{sv})", &state, &details);
++              scanner_session_emit_frame_event (self, state, details);
++            }
++          continue;
++        }
++
++      g_mutex_lock (&self->reply_lock);
++      if (serial == self->reply_for && self->reply == NULL)
++        {
++          self->reply = g_variant_ref (message);
++          g_cond_broadcast (&self->reply_cond);
++        }
++      g_mutex_unlock (&self->reply_lock);
++    }
++
++  g_mutex_lock (&self->reply_lock);
++  self->reader_done = TRUE;
++  g_cond_broadcast (&self->reply_cond);
++  g_mutex_unlock (&self->reply_lock);
++
++  return NULL;
++}
++
+ /* The helper went away. If the session did not ask for that, tell the application. */
+ static void
+ helper_exited_cb (GObject      *source_object,
+@@ -803,6 +900,7 @@ scanner_session_open (XdpScannerSession  *self,
+   g_mutex_unlock (&self->scanner->mutex);
+ 
+   g_subprocess_wait_async (helper, NULL, helper_exited_cb, g_object_ref (self));
++  g_thread_unref (g_thread_new ("scanner-reader", scanner_session_reader, g_object_ref (self)));
+ 
+   return TRUE;
+ }
+@@ -927,26 +1025,30 @@ handle_open_scanner (XdpDbusScanner         *object,
+ 
+ /* ---- Calls to the helper ---- */
+ 
+-#define HELPER_CALL_TIMEOUT_MS 60000
+-
+-/* Sends one request to the helper and returns its result, or NULL with the error the application
+- * should get: a kind of "invalid" is its own mistake, "busy" and anything else are not. */
++/* Sends one request to the helper, with a descriptor if pass_fd is not negative, and returns its
++ * result, or NULL with the error the application should get: a kind of "invalid" is its own
++ * mistake, "busy" means a frame is in progress, and anything else is a failure. args is consumed;
++ * the caller keeps pass_fd. */
+ static GVariant *
+-scanner_session_call (XdpScannerSession  *self,
+-                      const char         *method,
+-                      GVariant           *args,
+-                      GError            **error)
++scanner_session_call_with_fd (XdpScannerSession  *self,
++                              const char         *method,
++                              GVariant           *args,
++                              int                 pass_fd,
++                              GError            **error)
+ {
+   g_autoptr(GVariant) request = NULL;
+   g_autoptr(GVariant) reply = NULL;
+   g_autoptr(GVariant) result = NULL;
+   g_autoptr(GMutexLocker) call_locker = g_mutex_locker_new (&self->call_lock);
+   g_autoptr(GError) local_error = NULL;
++  gint64 deadline;
+   gboolean ok = FALSE;
+   guint32 serial;
+   guint32 reply_serial;
+   int fd;
+ 
++  g_variant_ref_sink (args);
++
+   g_mutex_lock (&self->scanner->mutex);
+   fd = self->stopping ? -1 : self->fd;
+   serial = ++self->serial;
+@@ -954,30 +1056,46 @@ scanner_session_call (XdpScannerSession  *self,
+ 
+   if (fd < 0)
+     {
+-      g_variant_unref (g_variant_ref_sink (args));
++      g_variant_unref (args);
+       g_set_error (error, XDG_DESKTOP_PORTAL_ERROR, XDG_DESKTOP_PORTAL_ERROR_FAILED,
+                    "The session is closed");
+       return NULL;
+     }
+ 
++  g_mutex_lock (&self->reply_lock);
++  self->reply_for = serial;
++  g_clear_pointer (&self->reply, g_variant_unref);
++  g_mutex_unlock (&self->reply_lock);
++
+   request = g_variant_ref_sink (g_variant_new ("(usv)", serial, method, args));
+-  if (!scanner_protocol_write (fd, request, &local_error) ||
+-      (reply = scanner_protocol_read (fd, G_VARIANT_TYPE ("(ubv)"), HELPER_CALL_TIMEOUT_MS,
+-                                      &local_error)) == NULL)
++  g_variant_unref (args);
++  if (!scanner_protocol_write_with_fd (fd, request, pass_fd, &local_error))
+     {
+       g_set_error (error, XDG_DESKTOP_PORTAL_ERROR, XDG_DESKTOP_PORTAL_ERROR_FAILED,
+-                   "The scanner helper did not answer: %s", local_error->message);
++                   "The scanner helper did not take the request: %s", local_error->message);
+       return NULL;
+     }
+ 
+-  g_variant_get (reply, "(ub@v)", &reply_serial, &ok, &result);
+-  if (reply_serial != serial)
++  deadline = g_get_monotonic_time () + HELPER_CALL_TIMEOUT_MS * G_TIME_SPAN_MILLISECOND;
++  g_mutex_lock (&self->reply_lock);
++  while (self->reply == NULL && !self->reader_done)
++    {
++      if (!g_cond_wait_until (&self->reply_cond, &self->reply_lock, deadline))
++        break;
++    }
++  reply = self->reply != NULL ? g_steal_pointer (&self->reply) : NULL;
++  self->reply_for = 0;
++  g_mutex_unlock (&self->reply_lock);
++
++  if (reply == NULL)
+     {
+       g_set_error (error, XDG_DESKTOP_PORTAL_ERROR, XDG_DESKTOP_PORTAL_ERROR_FAILED,
+-                   "The scanner helper answered out of order");
++                   "The scanner helper did not answer");
+       return NULL;
+     }
+ 
++  g_variant_get (reply, "(ub@v)", &reply_serial, &ok, &result);
++
+   if (!ok)
+     {
+       g_autoptr(GVariant) inner = g_variant_get_variant (result);
+@@ -1001,6 +1119,15 @@ scanner_session_call (XdpScannerSession  *self,
+   return g_variant_get_variant (result);
+ }
+ 
++static GVariant *
++scanner_session_call (XdpScannerSession  *self,
++                      const char         *method,
++                      GVariant           *args,
++                      GError            **error)
++{
++  return scanner_session_call_with_fd (self, method, args, -1, error);
++}
++
+ /* The session the application named, which has to be its own and an open scanner. Replies to the
+  * invocation with the error itself if not. */
+ static XdpScannerSession *
+@@ -1093,6 +1220,95 @@ handle_set_options (XdpDbusScanner         *object,
+   return G_DBUS_METHOD_INVOCATION_HANDLED;
+ }
+ 
++static gboolean
++handle_get_frame_parameters (XdpDbusScanner         *object,
++                             GDBusMethodInvocation  *invocation,
++                             const char             *arg_session_handle,
++                             GVariant               *arg_options)
++{
++  g_autoptr(XdpScannerSession) session = scanner_session_from_invocation (invocation, arg_session_handle);
++  g_autoptr(GVariant) result = NULL;
++  g_autoptr(GError) error = NULL;
++
++  if (session == NULL)
++    return G_DBUS_METHOD_INVOCATION_HANDLED;
++
++  result = scanner_session_call (session, "get_frame_parameters", g_variant_new_string (""), &error);
++  if (result == NULL)
++    g_dbus_method_invocation_return_gerror (invocation, error);
++  else
++    xdp_dbus_scanner_complete_get_frame_parameters (object, invocation, result);
++
++  return G_DBUS_METHOD_INVOCATION_HANDLED;
++}
++
++static gboolean
++handle_start_frame (XdpDbusScanner         *object,
++                    GDBusMethodInvocation  *invocation,
++                    GUnixFDList            *in_fd_list,
++                    const char             *arg_session_handle,
++                    GVariant               *arg_options)
++{
++  g_autoptr(XdpScannerSession) session = scanner_session_from_invocation (invocation, arg_session_handle);
++  g_autoptr(GVariant) result = NULL;
++  g_autoptr(GError) error = NULL;
++  g_autoptr(GUnixFDList) out_fd_list = NULL;
++  int pipe_fds[2];
++  int read_end;
++
++  if (session == NULL)
++    return G_DBUS_METHOD_INVOCATION_HANDLED;
++
++  if (pipe2 (pipe_fds, O_CLOEXEC) < 0)
++    {
++      g_dbus_method_invocation_return_error (invocation, XDG_DESKTOP_PORTAL_ERROR,
++                                             XDG_DESKTOP_PORTAL_ERROR_FAILED,
++                                             "Failed to create a pipe: %s", g_strerror (errno));
++      return G_DBUS_METHOD_INVOCATION_HANDLED;
++    }
++
++  /* The helper writes the frame to the pipe, so the pixels do not pass through the portal. Our own
++   * copy of the write end is closed at once: the application sees the end of the data when the
++   * helper closes its copy. */
++  result = scanner_session_call_with_fd (session, "start_frame", g_variant_new_string (""),
++                                         pipe_fds[1], &error);
++  close (pipe_fds[1]);
++
++  if (result == NULL)
++    {
++      close (pipe_fds[0]);
++      g_dbus_method_invocation_return_gerror (invocation, error);
++      return G_DBUS_METHOD_INVOCATION_HANDLED;
++    }
++
++  read_end = pipe_fds[0];
++  out_fd_list = g_unix_fd_list_new_from_array (&read_end, 1);
++  xdp_dbus_scanner_complete_start_frame (object, invocation, out_fd_list, g_variant_new_handle (0));
++
++  return G_DBUS_METHOD_INVOCATION_HANDLED;
++}
++
++static gboolean
++handle_cancel (XdpDbusScanner         *object,
++               GDBusMethodInvocation  *invocation,
++               const char             *arg_session_handle)
++{
++  g_autoptr(XdpScannerSession) session = scanner_session_from_invocation (invocation, arg_session_handle);
++  g_autoptr(GVariant) result = NULL;
++  g_autoptr(GError) error = NULL;
++
++  if (session == NULL)
++    return G_DBUS_METHOD_INVOCATION_HANDLED;
++
++  result = scanner_session_call (session, "cancel", g_variant_new_string (""), &error);
++  if (result == NULL)
++    g_dbus_method_invocation_return_gerror (invocation, error);
++  else
++    xdp_dbus_scanner_complete_cancel (object, invocation);
++
++  return G_DBUS_METHOD_INVOCATION_HANDLED;
++}
++
+ static void
+ xdp_scanner_iface_init (XdpDbusScannerIface *iface)
+ {
+@@ -1102,6 +1318,9 @@ xdp_scanner_iface_init (XdpDbusScannerIface *iface)
+   iface->handle_get_options = handle_get_options;
+   iface->handle_get_option_values = handle_get_option_values;
+   iface->handle_set_options = handle_set_options;
++  iface->handle_get_frame_parameters = handle_get_frame_parameters;
++  iface->handle_start_frame = handle_start_frame;
++  iface->handle_cancel = handle_cancel;
+ }
+ 
+ static void

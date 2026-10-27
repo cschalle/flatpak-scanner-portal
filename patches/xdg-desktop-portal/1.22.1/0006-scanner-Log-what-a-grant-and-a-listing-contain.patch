@@ -1,0 +1,38 @@
+From b48c284234333c1d1d2feca42ebe79bfce8922fa Mon Sep 17 00:00:00 2001
+From: "Christian F.K. Schaller" <christian.schaller@gmail.com>
+Date: Mon, 26 Oct 2026 11:42:33 -0400
+Subject: [PATCH] scanner: Log what a grant and a listing contain
+
+This commit adds two debug messages: how many scanners a selection
+granted to an application, and, for each ListScanners, how many grants
+the application has and how many scanners the host has. Finding out why
+Simple Scan showed no scanner after the user had chosen one took
+reading the code, because nothing said whether the portal had granted
+and listed it. With these the log answers that at once: here the portal
+had, and the application filtered the scanners out itself.
+---
+ src/scanner.c | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/src/scanner.c b/src/scanner.c
+index 8c26446..f579062 100644
+--- a/src/scanner.c
++++ b/src/scanner.c
+@@ -343,6 +343,8 @@ handle_list_scanners (XdpDbusScanner         *object,
+ 
+   g_mutex_lock (&self->mutex);
+   grants = scanner_grants_from_app_info (app_info);
++  g_debug ("[scanner] ListScanners for '%s': %u grant(s), %u scanner(s) on the host",
++           xdp_app_info_get_id (app_info), g_hash_table_size (grants), devices->len);
+   for (guint i = 0; i < devices->len; i++)
+     {
+       ScannerDevice *device = g_ptr_array_index (devices, i);
+@@ -434,6 +436,8 @@ select_scanners_cb (GObject      *source_object,
+       g_variant_builder_add_value (&chosen_builder, candidate);
+       n_chosen++;
+     }
++  g_debug ("[scanner] Granted %u scanner(s) to '%s' (%u in all)", n_chosen,
++           xdp_app_info_get_id (request->app_info), g_hash_table_size (grants));
+   g_mutex_unlock (&self->mutex);
+ 
+   if (n_chosen == 0)

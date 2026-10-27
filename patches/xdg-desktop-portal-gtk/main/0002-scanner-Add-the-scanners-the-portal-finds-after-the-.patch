@@ -1,0 +1,485 @@
+From 2113667afa5d0851519878be0c49ca9538eed4f9 Mon Sep 17 00:00:00 2001
+From: "Christian F.K. Schaller" <christian.schaller@gmail.com>
+Date: Mon, 26 Oct 2026 18:17:13 -0400
+Subject: [PATCH] scanner: Add the scanners the portal finds after the dialog
+ is shown
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+This commit makes the dialog take scanners after it is on screen, for
+the portal that shows the dialog before its search is over. The new
+UpdateScanners call adds rows for the scanners it carries, none twice,
+and says whether the search goes on. SelectScanners sets `searching`
+in its options when it does.
+
+While the search goes on and there is no row yet, the dialog shows
+"Searching for Scanners…" with a spinner, and not "No Scanners
+Found", which it shows once the search is over and found nothing.
+Once there are rows, a spinner with "Searching for scanners…" sits
+below them until the search ends. The first scanner that can be used
+is chosen when it appears, if none was, and later ones do not take the
+choice from the user.
+
+The backend keeps its open dialogs by the handle of the request, and
+drops a dialog when it is closed or answered, so an UpdateScanners
+call that comes after that does nothing and still gets its reply.
+
+The copy of the interface description is the one of the portal.
+
+Tested on main: it builds without errors. On a private bus with a
+headless mutter and the frontend built from main, the dialog opened
+with the search going on, took two scanners and the end of the search
+two seconds later, and closed on Request.Close. The look of the rows
+and of the spinner is not checked by a test.
+---
+ data/org.freedesktop.impl.portal.Scanner.xml |  27 ++++-
+ src/scanner.c                                |  34 ++++++
+ src/scannerdialog.c                          | 117 ++++++++++++++-----
+ src/scannerdialog.h                          |  10 ++
+ src/scannerdialog.ui                         |  71 +++++++++++
+ 5 files changed, 226 insertions(+), 33 deletions(-)
+
+diff --git a/data/org.freedesktop.impl.portal.Scanner.xml b/data/org.freedesktop.impl.portal.Scanner.xml
+index 4ce64c9..a8cd75d 100644
+--- a/data/org.freedesktop.impl.portal.Scanner.xml
++++ b/data/org.freedesktop.impl.portal.Scanner.xml
+@@ -32,7 +32,14 @@
+ 
+         * ``scanners`` (``as``)
+ 
+-          The ids chosen from @scanners. The frontend stores the grant.
++          The ids chosen from @scanners. The frontend keeps the grant in memory.
++
++        The frontend does not wait for every driver before it calls this. Finding the
++        scanners can take seconds, mostly for the ones on the network, while a scanner on USB
++        is found at once. If the frontend is still looking, @options has ``searching`` (``b``)
++        set to true, @scanners is what was found so far, possibly nothing, and the rest comes
++        with :ref:`org.freedesktop.impl.portal.Scanner.UpdateScanners`. The dialog should show
++        what it has, and that it is still looking.
+     -->
+     <method name="SelectScanners">
+       <arg type="o" name="handle" direction="in"/>
+@@ -46,6 +53,24 @@
+       <annotation name="org.qtproject.QtDBus.QtTypeName.Out1" value="QVariantMap"/>
+       <arg type="a{sv}" name="results" direction="out"/>
+     </method>
++    <!--
++        UpdateScanners:
++        @handle: Object path of the Request of the SelectScanners call
++        @scanners: Array of scanner id and information vardict for the scanners found since
++        the last call, in the format of the @scanners of SelectScanners
++        @searching: Whether the frontend is still looking for scanners
++
++        Adds scanners to a dialog that SelectScanners showed with ``searching`` set, as
++        the frontend finds them. The last call has @searching false, possibly with no scanners.
++        Calls for a @handle that is not showing a dialog are ignored. Scanners from earlier
++        calls are not repeated.
++    -->
++    <method name="UpdateScanners">
++      <arg type="o" name="handle" direction="in"/>
++      <annotation name="org.qtproject.QtDBus.QtTypeName.In1" value="QList&lt;QPair&lt;QString,QVariantMap&gt;&gt;"/>
++      <arg type="a(sa{sv})" name="scanners" direction="in"/>
++      <arg type="b" name="searching" direction="in"/>
++    </method>
+     <property name="version" type="u" access="read"/>
+   </interface>
+ </node>
+diff --git a/src/scanner.c b/src/scanner.c
+index 1d96b40..3073083 100644
+--- a/src/scanner.c
++++ b/src/scanner.c
+@@ -33,7 +33,11 @@
+ #include "utils.h"
+ #include "externalwindow.h"
+ 
++/* The dialogs that are showing, by the handle of their request, for UpdateScanners */
++static GHashTable *dialogs;
++
+ typedef struct {
++  char *handle;
+   XdpImplScanner *impl;
+   GDBusMethodInvocation *invocation;
+   Request *request;
+@@ -49,10 +53,14 @@ scanner_dialog_handle_free (gpointer data)
+ {
+   ScannerDialogHandle *handle = data;
+ 
++  if (dialogs != NULL)
++    g_hash_table_remove (dialogs, handle->handle);
++
+   g_clear_object (&handle->external_parent);
+   g_object_unref (handle->request);
+   g_object_unref (handle->dialog);
+ 
++  g_free (handle->handle);
+   g_free (handle);
+ }
+ 
+@@ -174,6 +182,7 @@ handle_select_scanners (XdpImplScanner        *object,
+   gtk_window_set_transient_for (GTK_WINDOW (dialog), GTK_WINDOW (fake_parent));
+ 
+   handle = g_new0 (ScannerDialogHandle, 1);
++  handle->handle = g_strdup (arg_handle);
+   handle->impl = object;
+   handle->invocation = invocation;
+   handle->request = g_object_ref (request);
+@@ -192,11 +201,34 @@ handle_select_scanners (XdpImplScanner        *object,
+ 
+   gtk_widget_show (dialog);
+ 
++  g_hash_table_replace (dialogs, g_strdup (arg_handle), handle);
++
+   request_export (request, g_dbus_method_invocation_get_connection (invocation));
+ 
+   return TRUE;
+ }
+ 
++static gboolean
++handle_update_scanners (XdpImplScanner        *object,
++                        GDBusMethodInvocation *invocation,
++                        const char            *arg_handle,
++                        GVariant              *arg_scanners,
++                        gboolean               arg_searching)
++{
++  ScannerDialogHandle *handle = g_hash_table_lookup (dialogs, arg_handle);
++
++  /* The dialog may be gone already: the user chose, or the application closed the request */
++  if (handle != NULL)
++    {
++      scanner_dialog_add_scanners (SCANNER_DIALOG (handle->dialog), arg_scanners);
++      scanner_dialog_set_searching (SCANNER_DIALOG (handle->dialog), arg_searching);
++    }
++
++  xdp_impl_scanner_complete_update_scanners (object, invocation);
++
++  return TRUE;
++}
++
+ gboolean
+ scanner_init (GDBusConnection  *bus,
+               GError          **error)
+@@ -205,7 +237,9 @@ scanner_init (GDBusConnection  *bus,
+ 
+   helper = G_DBUS_INTERFACE_SKELETON (xdp_impl_scanner_skeleton_new ());
+ 
++  dialogs = g_hash_table_new_full (g_str_hash, g_str_equal, g_free, NULL);
+   g_signal_connect (helper, "handle-select-scanners", G_CALLBACK (handle_select_scanners), NULL);
++  g_signal_connect (helper, "handle-update-scanners", G_CALLBACK (handle_update_scanners), NULL);
+ 
+   xdp_impl_scanner_set_version (XDP_IMPL_SCANNER (helper), 1);
+ 
+diff --git a/src/scannerdialog.c b/src/scannerdialog.c
+index 640e2e9..3adef19 100644
+--- a/src/scannerdialog.c
++++ b/src/scannerdialog.c
+@@ -38,10 +38,16 @@ struct _ScannerDialog {
+   GtkWidget *heading;
+   GtkWidget *subheading;
+   GtkWidget *stack;
++  GtkWidget *searching_box;
+ 
+   /* The check button of every row that can be chosen, in list order */
+   GPtrArray *choices;
++  /* The first of them, which the others join as a group unless several can be chosen */
++  GtkRadioButton *first_choice;
++  /* The ids of the scanners that have a row, so that none gets two */
++  GHashTable *known;
+   gboolean multiple;
++  gboolean searching;
+ };
+ 
+ struct _ScannerDialogClass {
+@@ -151,6 +157,7 @@ scanner_dialog_finalize (GObject *object)
+   ScannerDialog *dialog = SCANNER_DIALOG (object);
+ 
+   g_clear_pointer (&dialog->choices, g_ptr_array_unref);
++  g_clear_pointer (&dialog->known, g_hash_table_unref);
+ 
+   G_OBJECT_CLASS (scanner_dialog_parent_class)->finalize (object);
+ }
+@@ -180,6 +187,7 @@ scanner_dialog_class_init (ScannerDialogClass *class)
+   gtk_widget_class_bind_template_child (widget_class, ScannerDialog, heading);
+   gtk_widget_class_bind_template_child (widget_class, ScannerDialog, subheading);
+   gtk_widget_class_bind_template_child (widget_class, ScannerDialog, stack);
++  gtk_widget_class_bind_template_child (widget_class, ScannerDialog, searching_box);
+   gtk_widget_class_bind_template_callback (widget_class, button_clicked);
+   gtk_widget_class_bind_template_callback (widget_class, row_activated);
+ }
+@@ -188,6 +196,7 @@ static void
+ scanner_dialog_init (ScannerDialog *dialog)
+ {
+   dialog->choices = g_ptr_array_new ();
++  dialog->known = g_hash_table_new_full (g_str_hash, g_str_equal, g_free, NULL);
+ 
+   gtk_widget_init_template (GTK_WIDGET (dialog));
+ }
+@@ -253,10 +262,9 @@ describe_scanner (const char  *kind,
+ }
+ 
+ static void
+-add_scanner_row (ScannerDialog  *dialog,
+-                 const char     *id,
+-                 GVariant       *info,
+-                 GtkRadioButton **first)
++add_scanner_row (ScannerDialog *dialog,
++                 const char    *id,
++                 GVariant      *info)
+ {
+   g_autoptr(GVariantDict) dict = g_variant_dict_new (info);
+   g_autofree const char **capabilities = NULL;
+@@ -324,7 +332,7 @@ add_scanner_row (ScannerDialog  *dialog,
+   if (dialog->multiple)
+     choice = gtk_check_button_new ();
+   else
+-    choice = gtk_radio_button_new_from_widget (*first);
++    choice = gtk_radio_button_new_from_widget (dialog->first_choice);
+   gtk_widget_set_valign (choice, GTK_ALIGN_CENTER);
+   gtk_box_pack_end (GTK_BOX (box), choice, FALSE, FALSE, 0);
+ 
+@@ -349,8 +357,8 @@ add_scanner_row (ScannerDialog  *dialog,
+     }
+   else
+     {
+-      if (!dialog->multiple && !*first)
+-        *first = GTK_RADIO_BUTTON (choice);
++      if (!dialog->multiple && !dialog->first_choice)
++        dialog->first_choice = GTK_RADIO_BUTTON (choice);
+ 
+       g_signal_connect (choice, "toggled", G_CALLBACK (choice_toggled), dialog);
+       g_ptr_array_add (dialog->choices, choice);
+@@ -360,6 +368,73 @@ add_scanner_row (ScannerDialog  *dialog,
+   gtk_list_box_insert (GTK_LIST_BOX (dialog->scanner_list), row, -1);
+ }
+ 
++/* Shows what the stack should: the rows if there are any, else that the search is on, else that
++ * there is nothing */
++static void
++update_stack (ScannerDialog *dialog)
++{
++  const char *page = "scanners";
++
++  if (dialog->choices->len == 0 && g_hash_table_size (dialog->known) == 0)
++    page = dialog->searching ? "searching" : "empty-state";
++
++  gtk_stack_set_visible_child_name (GTK_STACK (dialog->stack), page);
++  gtk_widget_set_visible (dialog->searching_box,
++                          dialog->searching && g_hash_table_size (dialog->known) > 0);
++}
++
++guint
++scanner_dialog_add_scanners (ScannerDialog *dialog,
++                             GVariant      *scanners)
++{
++  GVariantIter iter;
++  GVariant *info;
++  const char *id;
++  guint added = 0;
++  gboolean was_empty;
++
++  g_return_val_if_fail (dialog != NULL, 0);
++
++  was_empty = dialog->choices->len == 0;
++
++  g_variant_iter_init (&iter, scanners);
++  while (g_variant_iter_next (&iter, "(&s@a{sv})", &id, &info))
++    {
++      if (!g_hash_table_contains (dialog->known, id))
++        {
++          g_hash_table_add (dialog->known, g_strdup (id));
++          add_scanner_row (dialog, id, info);
++          added++;
++        }
++      g_variant_unref (info);
++    }
++
++  /* The first scanner that can be used is chosen already, so that one click is enough in the
++   * common case of one scanner. Later ones do not take the choice from the user. */
++  if (was_empty && dialog->choices->len > 0)
++    {
++      GtkWidget *preselected = g_ptr_array_index (dialog->choices, 0);
++
++      gtk_toggle_button_set_active (GTK_TOGGLE_BUTTON (preselected), TRUE);
++      gtk_window_set_focus (GTK_WINDOW (dialog), preselected);
++    }
++
++  update_accept_button (dialog);
++  update_stack (dialog);
++
++  return added;
++}
++
++void
++scanner_dialog_set_searching (ScannerDialog *dialog,
++                              gboolean       searching)
++{
++  g_return_if_fail (dialog != NULL);
++
++  dialog->searching = searching;
++  update_stack (dialog);
++}
++
+ ScannerDialog *
+ scanner_dialog_new (const char *app_id,
+                     GVariant   *scanners,
+@@ -368,14 +443,10 @@ scanner_dialog_new (const char *app_id,
+   g_autoptr(GVariantDict) opts = g_variant_dict_new (options);
+   g_autofree char *app_name = NULL;
+   g_autofree char *heading = NULL;
+-  GtkRadioButton *first = NULL;
+   guint n_rows = 0;
+   const char *accept_label = NULL;
+   const char *title = NULL;
+   gboolean modal = TRUE;
+-  GVariantIter iter;
+-  GVariant *info;
+-  const char *id;
+   ScannerDialog *dialog;
+ 
+   dialog = g_object_new (SCANNER_TYPE_DIALOG, NULL);
+@@ -384,6 +455,7 @@ scanner_dialog_new (const char *app_id,
+   g_variant_dict_lookup (opts, "modal", "b", &modal);
+   g_variant_dict_lookup (opts, "accept_label", "&s", &accept_label);
+   g_variant_dict_lookup (opts, "title", "&s", &title);
++  g_variant_dict_lookup (opts, "searching", "b", &dialog->searching);
+ 
+   gtk_window_set_modal (GTK_WINDOW (dialog), modal);
+   gtk_window_set_title (GTK_WINDOW (dialog), dialog->multiple ? _("Select Scanners") : _("Select Scanner"));
+@@ -414,27 +486,8 @@ scanner_dialog_new (const char *app_id,
+       gtk_widget_show (dialog->subheading);
+     }
+ 
+-  g_variant_iter_init (&iter, scanners);
+-  while (g_variant_iter_next (&iter, "(&s@a{sv})", &id, &info))
+-    {
+-      add_scanner_row (dialog, id, info, &first);
+-      n_rows++;
+-      g_variant_unref (info);
+-    }
+-
+-  /* The first scanner that can be used is chosen already, so that one click is enough in the
+-   * common case of one scanner. */
+-  if (dialog->choices->len > 0)
+-    {
+-      GtkWidget *preselected = g_ptr_array_index (dialog->choices, 0);
+-
+-      gtk_toggle_button_set_active (GTK_TOGGLE_BUTTON (preselected), TRUE);
+-      gtk_window_set_focus (GTK_WINDOW (dialog), preselected);
+-    }
+-  else
+-    gtk_stack_set_visible_child_name (GTK_STACK (dialog->stack), "empty-state");
+-
+-  update_accept_button (dialog);
++  n_rows = scanner_dialog_add_scanners (dialog, scanners);
++  scanner_dialog_set_searching (dialog, dialog->searching);
+ 
+   /* Size the window to the list: room for the heading and the header bar, a row each, and no
+    * more than about what fits on a small screen. */
+diff --git a/src/scannerdialog.h b/src/scannerdialog.h
+index 086c8d8..ad4f0f4 100644
+--- a/src/scannerdialog.h
++++ b/src/scannerdialog.h
+@@ -33,5 +33,15 @@ ScannerDialog *scanner_dialog_new (const char *app_id,
+                                    GVariant   *scanners,
+                                    GVariant   *options);
+ 
++/* Adds the scanners that have no row yet, a(sa{sv}) as in the portal's calls, and returns how
++ * many rows that made. The first scanner that can be chosen is chosen, if none was. */
++guint scanner_dialog_add_scanners (ScannerDialog *dialog,
++                                   GVariant      *scanners);
++
++/* Whether more scanners may still come, which the dialog says and which keeps it from telling
++ * the user that there are none */
++void scanner_dialog_set_searching (ScannerDialog *dialog,
++                                   gboolean       searching);
++
+ /* The ids of the scanners the user chose, NULL-terminated; free with g_strfreev () */
+ char **scanner_dialog_get_selected (ScannerDialog *dialog);
+diff --git a/src/scannerdialog.ui b/src/scannerdialog.ui
+index 47cca80..cc26f66 100644
+--- a/src/scannerdialog.ui
++++ b/src/scannerdialog.ui
+@@ -83,12 +83,83 @@
+                 </child>
+               </object>
+             </child>
++            <!-- Shown under the scanners while more may still turn up -->
++            <child>
++              <object class="GtkBox" id="searching_box">
++                <property name="visible">0</property>
++                <property name="no-show-all">1</property>
++                <property name="halign">center</property>
++                <property name="spacing">12</property>
++                <property name="margin-top">6</property>
++                <child>
++                  <object class="GtkSpinner">
++                    <property name="visible">1</property>
++                    <property name="active">1</property>
++                  </object>
++                </child>
++                <child>
++                  <object class="GtkLabel">
++                    <property name="visible">1</property>
++                    <property name="label" translatable="yes">Searching for scanners…</property>
++                    <style>
++                      <class name="dim-label"/>
++                    </style>
++                  </object>
++                </child>
++              </object>
++              <packing>
++                <property name="expand">0</property>
++              </packing>
++            </child>
+           </object>
+           <packing>
+             <property name="name">scanners</property>
+           </packing>
+         </child>
+ 
++        <!-- Nothing found yet, and the search is not over -->
++        <child>
++          <object class="GtkBox">
++            <property name="visible">1</property>
++            <property name="orientation">vertical</property>
++            <property name="valign">center</property>
++            <property name="spacing">6</property>
++            <property name="margin">18</property>
++            <child>
++              <object class="GtkSpinner">
++                <property name="visible">1</property>
++                <property name="active">1</property>
++                <property name="width-request">32</property>
++                <property name="height-request">32</property>
++                <property name="halign">center</property>
++              </object>
++            </child>
++            <child>
++              <object class="GtkLabel">
++                <property name="visible">1</property>
++                <property name="label" translatable="yes">Searching for Scanners…</property>
++                <style>
++                  <class name="title-2"/>
++                </style>
++              </object>
++            </child>
++            <child>
++              <object class="GtkLabel">
++                <property name="visible">1</property>
++                <property name="label" translatable="yes">Scanners on USB come first, those on the network can take a few seconds</property>
++                <property name="wrap">1</property>
++                <property name="justify">center</property>
++                <style>
++                  <class name="dim-label"/>
++                </style>
++              </object>
++            </child>
++          </object>
++          <packing>
++            <property name="name">searching</property>
++          </packing>
++        </child>
++
+         <!-- Empty state -->
+         <child>
+           <object class="GtkBox">

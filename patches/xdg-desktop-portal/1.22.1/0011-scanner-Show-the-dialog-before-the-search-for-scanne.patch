@@ -1,0 +1,1023 @@
+From b2e0e5edf9b3bf540e89428b297df8d10a907410 Mon Sep 17 00:00:00 2001
+From: "Christian F.K. Schaller" <christian.schaller@gmail.com>
+Date: Mon, 26 Oct 2026 18:15:39 -0400
+Subject: [PATCH] scanner: Show the dialog before the search for scanners is
+ over
+
+This commit makes SelectScanners show the dialog after at most 300
+milliseconds with the scanners found by then, and send the others as
+they are found. The dialog used to wait until libsane had asked every
+driver, one after the other. That took about 6 seconds with network
+scanners on the desktop this was tried on, nearly all of it spent
+waiting for the network, while a scanner on USB is found in
+milliseconds.
+
+The helper now runs once per driver, as many as 12 at a time, each
+with a configuration directory that loads that driver alone, with the
+driver's own files linked in. The drivers are the ones dll.conf and
+dll.d name in the directories SANE_CONFIG_DIR gives, or in
+/etc/sane.d. The search takes as long as the slowest driver, and the
+ids of the scanners do not change. Without a dll.conf the helper runs
+once, as before.
+
+The search runs in a thread. SelectScanners waits for it for 300
+milliseconds, then calls the backend as before, with `searching` set in
+the options if the search goes on. What is found later goes to the
+backend in the new UpdateScanners call, which ends with one that says
+the search is over. Only scanners that were offered to the dialog can
+be granted, and those found late are offered when they are found. A
+search that ends fills the list that ListScanners and OpenScanner use.
+
+The backend interface gets UpdateScanners and the `searching` option;
+the documentation says what a dialog is to do with them. The index of
+the documentation now lists the pages of the scanner portal, which it
+did not, and which the build warned about.
+
+Measured with the system's SANE configuration, listing through the
+frontend took 1.7 seconds, down from about 6, with the same three
+scanners and ids. With a listing that is made to take 2 seconds,
+SelectScanners returned in 0.30.
+
+Tested on 1.22.1: the scenario checks pass 46 of 46, among them three
+for a search that takes longer than the dialog waits. The GNOME and the
+GTK backends took the scanners found late and the end of the search on
+a private bus.
+---
+ data/org.freedesktop.impl.portal.Scanner.xml |  25 +
+ doc/api-reference.rst                        |   1 +
+ doc/impl-dbus-interfaces.rst                 |   1 +
+ src/scanner.c                                | 775 +++++++++++++++++--
+ 4 files changed, 735 insertions(+), 67 deletions(-)
+
+diff --git a/data/org.freedesktop.impl.portal.Scanner.xml b/data/org.freedesktop.impl.portal.Scanner.xml
+index 4c408ea..a8cd75d 100644
+--- a/data/org.freedesktop.impl.portal.Scanner.xml
++++ b/data/org.freedesktop.impl.portal.Scanner.xml
+@@ -33,6 +33,13 @@
+         * ``scanners`` (``as``)
+ 
+           The ids chosen from @scanners. The frontend keeps the grant in memory.
++
++        The frontend does not wait for every driver before it calls this. Finding the
++        scanners can take seconds, mostly for the ones on the network, while a scanner on USB
++        is found at once. If the frontend is still looking, @options has ``searching`` (``b``)
++        set to true, @scanners is what was found so far, possibly nothing, and the rest comes
++        with :ref:`org.freedesktop.impl.portal.Scanner.UpdateScanners`. The dialog should show
++        what it has, and that it is still looking.
+     -->
+     <method name="SelectScanners">
+       <arg type="o" name="handle" direction="in"/>
+@@ -46,6 +53,24 @@
+       <annotation name="org.qtproject.QtDBus.QtTypeName.Out1" value="QVariantMap"/>
+       <arg type="a{sv}" name="results" direction="out"/>
+     </method>
++    <!--
++        UpdateScanners:
++        @handle: Object path of the Request of the SelectScanners call
++        @scanners: Array of scanner id and information vardict for the scanners found since
++        the last call, in the format of the @scanners of SelectScanners
++        @searching: Whether the frontend is still looking for scanners
++
++        Adds scanners to a dialog that SelectScanners showed with ``searching`` set, as
++        the frontend finds them. The last call has @searching false, possibly with no scanners.
++        Calls for a @handle that is not showing a dialog are ignored. Scanners from earlier
++        calls are not repeated.
++    -->
++    <method name="UpdateScanners">
++      <arg type="o" name="handle" direction="in"/>
++      <annotation name="org.qtproject.QtDBus.QtTypeName.In1" value="QList&lt;QPair&lt;QString,QVariantMap&gt;&gt;"/>
++      <arg type="a(sa{sv})" name="scanners" direction="in"/>
++      <arg type="b" name="searching" direction="in"/>
++    </method>
+     <property name="version" type="u" access="read"/>
+   </interface>
+ </node>
+diff --git a/doc/api-reference.rst b/doc/api-reference.rst
+index fc64301..35ec7ed 100644
+--- a/doc/api-reference.rst
++++ b/doc/api-reference.rst
+@@ -59,6 +59,7 @@ All apps have access to the portals below:
+    doc-org.freedesktop.portal.Realtime.rst
+    doc-org.freedesktop.portal.RemoteDesktop.rst
+    doc-org.freedesktop.portal.Request.rst
++   doc-org.freedesktop.portal.Scanner.rst
+    doc-org.freedesktop.portal.ScreenCast.rst
+    doc-org.freedesktop.portal.Screenshot.rst
+    doc-org.freedesktop.portal.Secret.rst
+diff --git a/doc/impl-dbus-interfaces.rst b/doc/impl-dbus-interfaces.rst
+index 937d2d1..8dfff2e 100644
+--- a/doc/impl-dbus-interfaces.rst
++++ b/doc/impl-dbus-interfaces.rst
+@@ -25,6 +25,7 @@ accessible to sandboxed applications.
+    doc-org.freedesktop.impl.portal.Print.rst
+    doc-org.freedesktop.impl.portal.RemoteDesktop.rst
+    doc-org.freedesktop.impl.portal.Request.rst
++   doc-org.freedesktop.impl.portal.Scanner.rst
+    doc-org.freedesktop.impl.portal.ScreenCast.rst
+    doc-org.freedesktop.impl.portal.Screenshot.rst
+    doc-org.freedesktop.impl.portal.Secret.rst
+diff --git a/src/scanner.c b/src/scanner.c
+index 841f7e6..94e4f74 100644
+--- a/src/scanner.c
++++ b/src/scanner.c
+@@ -6,12 +6,14 @@
+ 
+ #include "scanner.h"
+ 
++#include <errno.h>
+ #include <string.h>
+ #include <fcntl.h>
+ #include <sys/socket.h>
+ #include <sys/types.h>
+ #include <unistd.h>
+ 
++#include <glib/gstdio.h>
+ #include <gio/gio.h>
+ #include <gio/gunixfdlist.h>
+ 
+@@ -186,80 +188,475 @@ scanner_device_new (const char *id,
+ 
+ #define HELPER_TIMEOUT_SECONDS 30
+ 
+-static gboolean
+-helper_timed_out (gpointer data)
+-{
+-  g_cancellable_cancel (G_CANCELLABLE (data));
++/* How many backends are asked at once. Each is a process of its own, and most answer at once. */
++#define DISCOVER_PARALLEL 12
+ 
+-  return G_SOURCE_REMOVE;
+-}
++#define SANE_DEFAULT_CONFIG_DIR "/etc/sane.d"
+ 
+-/* Runs the helper to ask libsane for the scanners. Probing can take seconds, and some backends
+- * reset the scanner they find, so callers should not do this more than they have to. */
++/* What the helper printed for `list`, as a list of ScannerDevice, or NULL if it is not a list */
+ static GPtrArray *
+-scanner_enumerate_with_helper (void)
++scanner_parse_helper_list (GBytes *stdout_bytes)
+ {
+   g_autoptr(GPtrArray) devices = g_ptr_array_new_with_free_func ((GDestroyNotify) scanner_device_free);
+-  g_autoptr(GSubprocess) subprocess = NULL;
+-  g_autoptr(GCancellable) cancellable = g_cancellable_new ();
+-  g_autoptr(GBytes) stdout_bytes = NULL;
+-  g_autoptr(GBytes) stderr_bytes = NULL;
+   g_autoptr(GVariant) list = NULL;
+-  g_autoptr(GError) error = NULL;
+-  const char *helper = g_getenv ("XDP_SCANNER_HELPER");
+   GVariantIter iter;
+   const char *id;
+   const char *sane_name;
+   GVariant *info;
+-  guint timeout_id;
+ 
+-  if (helper == NULL)
+-    helper = LIBEXECDIR "/xdg-desktop-portal-scanner-helper";
++  /* The helper is part of the portal, but what it read from drivers is not trusted to be well
++   * formed, so check the type and the encoding before using it */
++  list = g_variant_ref_sink (g_variant_new_from_bytes (G_VARIANT_TYPE ("a(ssa{sv})"), stdout_bytes, FALSE));
++  if (!g_variant_is_normal_form (list))
++    {
++      g_warning ("[scanner] The scanner helper returned a malformed list");
++      return NULL;
++    }
+ 
+-  subprocess = g_subprocess_new (G_SUBPROCESS_FLAGS_STDOUT_PIPE | G_SUBPROCESS_FLAGS_STDERR_PIPE,
+-                                 &error, helper, "list", NULL);
+-  if (subprocess == NULL)
++  g_variant_iter_init (&iter, list);
++  while (g_variant_iter_next (&iter, "(&s&s@a{sv})", &id, &sane_name, &info))
+     {
+-      g_warning ("[scanner] Failed to run %s: %s", helper, error->message);
+-      return g_steal_pointer (&devices);
++      g_ptr_array_add (devices, scanner_device_new_from_helper (id, sane_name, info));
++      g_variant_unref (info);
+     }
+ 
+-  timeout_id = g_timeout_add_seconds (HELPER_TIMEOUT_SECONDS, helper_timed_out, cancellable);
++  return g_steal_pointer (&devices);
++}
+ 
+-  if (!g_subprocess_communicate (subprocess, NULL, cancellable, &stdout_bytes, &stderr_bytes, &error))
++/* The directories libsane reads its configuration from */
++static GPtrArray *
++scanner_config_dirs (void)
++{
++  GPtrArray *dirs = g_ptr_array_new_with_free_func (g_free);
++  const char *env = g_getenv ("SANE_CONFIG_DIR");
++
++  if (env != NULL && *env != '\0')
++    {
++      g_auto(GStrv) parts = g_strsplit (env, ":", -1);
++
++      /* An empty entry stands for the default directory, as in libsane */
++      for (size_t i = 0; parts[i] != NULL; i++)
++        g_ptr_array_add (dirs, g_strdup (*parts[i] != '\0' ? parts[i] : SANE_DEFAULT_CONFIG_DIR));
++    }
++  else
+     {
+-      g_warning ("[scanner] The scanner helper did not finish: %s", error->message);
+-      g_subprocess_force_exit (subprocess);
++      g_ptr_array_add (dirs, g_strdup (SANE_DEFAULT_CONFIG_DIR));
+     }
+-  g_source_remove (timeout_id);
+ 
+-  if (stdout_bytes == NULL || !g_subprocess_get_if_exited (subprocess) ||
+-      g_subprocess_get_exit_status (subprocess) != 0)
++  return dirs;
++}
++
++static void
++scanner_add_backends_from_file (GPtrArray  *names,
++                                const char *path)
++{
++  g_autofree char *contents = NULL;
++  g_auto(GStrv) lines = NULL;
++
++  if (!g_file_get_contents (path, &contents, NULL, NULL))
++    return;
++
++  lines = g_strsplit (contents, "\n", -1);
++  for (size_t i = 0; lines[i] != NULL; i++)
+     {
+-      if (stderr_bytes != NULL && g_bytes_get_size (stderr_bytes) > 0)
+-        g_warning ("[scanner] The scanner helper failed: %.*s",
+-                   (int) g_bytes_get_size (stderr_bytes),
+-                   (const char *) g_bytes_get_data (stderr_bytes, NULL));
+-      return g_steal_pointer (&devices);
++      char *hash = strchr (lines[i], '#');
++
++      if (hash != NULL)
++        *hash = '\0';
++      g_strstrip (lines[i]);
++
++      if (*lines[i] != '\0' && strpbrk (lines[i], " \t/") == NULL && !g_ptr_array_find_with_equal_func (names, lines[i], g_str_equal, NULL))
++        g_ptr_array_add (names, g_strdup (lines[i]));
+     }
++}
+ 
+-  /* The helper is part of the portal, but what it read from drivers is not trusted to be well
+-   * formed, so check the type and the encoding before using it */
+-  list = g_variant_ref_sink (g_variant_new_from_bytes (G_VARIANT_TYPE ("a(ssa{sv})"), stdout_bytes, FALSE));
+-  if (!g_variant_is_normal_form (list))
++/* The backends libsane would load: dll.conf of the first directory that has one, and the files in
++ * the dll.d directories. NULL if none can be found. */
++static GPtrArray *
++scanner_backend_names (GPtrArray *dirs)
++{
++  GPtrArray *names = g_ptr_array_new_with_free_func (g_free);
++  gboolean have_dll_conf = FALSE;
++
++  for (guint i = 0; i < dirs->len; i++)
+     {
+-      g_warning ("[scanner] The scanner helper returned a malformed list");
+-      return g_steal_pointer (&devices);
++      const char *dir = g_ptr_array_index (dirs, i);
++      g_autofree char *dll_conf = g_build_filename (dir, "dll.conf", NULL);
++      g_autofree char *dll_d = g_build_filename (dir, "dll.d", NULL);
++      g_autoptr(GDir) d = NULL;
++      g_autoptr(GPtrArray) files = g_ptr_array_new_with_free_func (g_free);
++      const char *entry;
++
++      if (!have_dll_conf && g_file_test (dll_conf, G_FILE_TEST_IS_REGULAR))
++        {
++          scanner_add_backends_from_file (names, dll_conf);
++          have_dll_conf = TRUE;
++        }
++
++      d = g_dir_open (dll_d, 0, NULL);
++      while (d != NULL && (entry = g_dir_read_name (d)) != NULL)
++        g_ptr_array_add (files, g_build_filename (dll_d, entry, NULL));
++      g_ptr_array_sort_values (files, (GCompareFunc) g_strcmp0);
++      for (guint k = 0; k < files->len; k++)
++        scanner_add_backends_from_file (names, g_ptr_array_index (files, k));
+     }
+ 
+-  g_variant_iter_init (&iter, list);
+-  while (g_variant_iter_next (&iter, "(&s&s@a{sv})", &id, &sane_name, &info))
++  if (names->len == 0)
++    g_clear_pointer (&names, g_ptr_array_unref);
++
++  return names;
++}
++
++static void
++scanner_remove_tree (const char *path)
++{
++  g_autoptr(GDir) dir = g_dir_open (path, 0, NULL);
++  const char *entry;
++
++  while (dir != NULL && (entry = g_dir_read_name (dir)) != NULL)
+     {
+-      g_ptr_array_add (devices, scanner_device_new_from_helper (id, sane_name, info));
+-      g_variant_unref (info);
++      g_autofree char *child = g_build_filename (path, entry, NULL);
++
++      if (g_file_test (child, G_FILE_TEST_IS_DIR) && !g_file_test (child, G_FILE_TEST_IS_SYMLINK))
++        scanner_remove_tree (child);
++      else
++        g_unlink (child);
+     }
+ 
+-  return g_steal_pointer (&devices);
++  g_rmdir (path);
++}
++
++/* A configuration directory under root that loads one backend, with the backend's own files of
++ * the real one. libsane lists the backends one after another, so asking each alone, at the same
++ * time, takes as long as the slowest instead of the sum. */
++static char *
++scanner_backend_config (const char *root,
++                        const char *backend,
++                        GPtrArray  *dirs)
++{
++  g_autofree char *config = g_build_filename (root, backend, NULL);
++  g_autofree char *dll_conf = g_build_filename (config, "dll.conf", NULL);
++  g_autofree char *line = g_strdup_printf ("%s\n", backend);
++  g_autofree char *prefix = g_strdup_printf ("%s.", backend);
++
++  if (g_mkdir (config, 0700) != 0 || !g_file_set_contents (dll_conf, line, -1, NULL))
++    return NULL;
++
++  for (guint i = 0; i < dirs->len; i++)
++    {
++      const char *dir = g_ptr_array_index (dirs, i);
++      g_autoptr(GDir) d = g_dir_open (dir, 0, NULL);
++      const char *entry;
++
++      while (d != NULL && (entry = g_dir_read_name (d)) != NULL)
++        {
++          g_autofree char *source = NULL;
++          g_autofree char *link = NULL;
++
++          if (!g_str_has_prefix (entry, prefix))
++            continue;
++
++          source = g_build_filename (dir, entry, NULL);
++          link = g_build_filename (config, entry, NULL);
++          if (symlink (source, link) != 0 && errno != EEXIST)
++            g_warning ("[scanner] Could not link %s: %s", source, g_strerror (errno));
++        }
++    }
++
++  return g_steal_pointer (&config);
++}
++
++/* Called with the scanners one backend found, as soon as it has answered, and takes the list.
++ * total is how many backends are asked and index tells which this is, for callers that want a
++ * stable order. */
++typedef void (*ScannerDiscoverBatch) (GPtrArray *devices,
++                                      guint      index,
++                                      guint      total,
++                                      gpointer   user_data);
++
++typedef struct _Discovery Discovery;
++
++typedef struct
++{
++  Discovery *discovery;
++  guint index;
++  GSubprocess *subprocess;
++  GCancellable *cancellable;
++  GSource *timeout;
++} DiscoveryJob;
++
++struct _Discovery
++{
++  GMainLoop *loop;
++  const char *helper;
++  GPtrArray *backends;      /* names, or NULL for one run of the helper with the whole config */
++  GPtrArray *dirs;
++  char *root;               /* the directory holding the per-backend configurations */
++  guint total;
++  guint next;
++  guint pending;
++  gboolean complete;        /* every backend answered */
++  gboolean failed;
++  GPtrArray *jobs;          /* DiscoveryJob, those running */
++  ScannerDiscoverBatch batch;
++  gpointer user_data;
++};
++
++static void discovery_start_more (Discovery *d);
++
++static void
++discovery_job_free (DiscoveryJob *job)
++{
++  if (job->timeout != NULL)
++    {
++      g_source_destroy (job->timeout);
++      g_source_unref (job->timeout);
++    }
++  g_clear_object (&job->subprocess);
++  g_clear_object (&job->cancellable);
++  g_free (job);
++}
++
++static gboolean
++discovery_job_timed_out (gpointer data)
++{
++  DiscoveryJob *job = data;
++
++  g_warning ("[scanner] A scanner listing took longer than %d seconds, giving up on it", HELPER_TIMEOUT_SECONDS);
++  g_cancellable_cancel (job->cancellable);
++  g_subprocess_force_exit (job->subprocess);
++
++  return G_SOURCE_REMOVE;
++}
++
++static void
++discovery_job_done (GObject      *source_object,
++                    GAsyncResult *result,
++                    gpointer      user_data)
++{
++  DiscoveryJob *job = user_data;
++  Discovery *d = job->discovery;
++  g_autoptr(GBytes) stdout_bytes = NULL;
++  g_autoptr(GError) error = NULL;
++  g_autoptr(GPtrArray) devices = NULL;
++
++  if (g_subprocess_communicate_finish (G_SUBPROCESS (source_object), result, &stdout_bytes, NULL, &error) &&
++      stdout_bytes != NULL &&
++      g_subprocess_get_if_exited (job->subprocess) &&
++      g_subprocess_get_exit_status (job->subprocess) == 0)
++    {
++      devices = scanner_parse_helper_list (stdout_bytes);
++    }
++  else if (!g_cancellable_is_cancelled (job->cancellable))
++    {
++      g_debug ("[scanner] A scanner listing failed");
++    }
++
++  if (devices == NULL)
++    d->failed = TRUE;
++  else if (d->batch != NULL)
++    d->batch (g_steal_pointer (&devices), job->index, d->total, d->user_data);
++
++  g_ptr_array_remove (d->jobs, job);
++  discovery_job_free (job);
++  d->pending--;
++
++  discovery_start_more (d);
++  if (d->pending == 0 && d->next >= d->total)
++    {
++      d->complete = !d->failed;
++      g_main_loop_quit (d->loop);
++    }
++}
++
++static void
++discovery_start_job (Discovery *d,
++                     guint      index)
++{
++  g_autoptr(GSubprocessLauncher) launcher = g_subprocess_launcher_new (G_SUBPROCESS_FLAGS_STDOUT_PIPE | G_SUBPROCESS_FLAGS_STDERR_SILENCE);
++  g_autoptr(GError) error = NULL;
++  DiscoveryJob *job;
++
++  job = g_new0 (DiscoveryJob, 1);
++  job->discovery = d;
++  job->index = index;
++
++  if (d->backends != NULL)
++    {
++      g_autofree char *config = scanner_backend_config (d->root, g_ptr_array_index (d->backends, index), d->dirs);
++
++      if (config != NULL)
++        g_subprocess_launcher_setenv (launcher, "SANE_CONFIG_DIR", config, TRUE);
++    }
++
++  job->subprocess = g_subprocess_launcher_spawn (launcher, &error, d->helper, "list", NULL);
++  if (job->subprocess == NULL)
++    {
++      g_warning ("[scanner] Failed to run %s: %s", d->helper, error->message);
++      d->failed = TRUE;
++      g_free (job);
++      return;
++    }
++
++  job->cancellable = g_cancellable_new ();
++  job->timeout = g_timeout_source_new_seconds (HELPER_TIMEOUT_SECONDS);
++  g_source_set_callback (job->timeout, discovery_job_timed_out, job, NULL);
++  g_source_attach (job->timeout, g_main_context_get_thread_default ());
++
++  g_ptr_array_add (d->jobs, job);
++  d->pending++;
++  g_subprocess_communicate_async (job->subprocess, NULL, job->cancellable, discovery_job_done, job);
++}
++
++static void
++discovery_start_more (Discovery *d)
++{
++  while (d->pending < DISCOVER_PARALLEL && d->next < d->total)
++    discovery_start_job (d, d->next++);
++}
++
++static gboolean
++discovery_cancelled (GObject  *cancellable,
++                     gpointer  user_data)
++{
++  Discovery *d = user_data;
++
++  for (guint i = 0; i < d->jobs->len; i++)
++    {
++      DiscoveryJob *job = g_ptr_array_index (d->jobs, i);
++
++      g_cancellable_cancel (job->cancellable);
++      g_subprocess_force_exit (job->subprocess);
++    }
++  d->next = d->total;
++  d->failed = TRUE;
++
++  return G_SOURCE_REMOVE;
++}
++
++/* Asks libsane for the scanners with a helper per backend, running side by side, and calls batch
++ * for each as it answers. Returns TRUE if every one answered; FALSE if it was cancelled or one
++ * failed. Blocks until then. Probing can take seconds, and some backends reset the scanner they
++ * find, so callers should not do this more than they have to. */
++static gboolean
++scanner_discover (ScannerDiscoverBatch  batch,
++                  gpointer              user_data,
++                  GCancellable         *cancellable)
++{
++  g_autoptr(GMainContext) context = g_main_context_new ();
++  g_autoptr(GSource) cancel_source = NULL;
++  Discovery d = { 0, };
++  gboolean complete;
++
++  d.helper = g_getenv ("XDP_SCANNER_HELPER");
++  if (d.helper == NULL)
++    d.helper = LIBEXECDIR "/xdg-desktop-portal-scanner-helper";
++
++  d.dirs = scanner_config_dirs ();
++  d.backends = scanner_backend_names (d.dirs);
++  d.total = d.backends != NULL ? d.backends->len : 1;
++  d.jobs = g_ptr_array_new ();
++  d.batch = batch;
++  d.user_data = user_data;
++
++  if (d.backends != NULL)
++    {
++      d.root = g_dir_make_tmp ("xdp-scanner-XXXXXX", NULL);
++      if (d.root == NULL)
++        g_clear_pointer (&d.backends, g_ptr_array_unref);   /* ask for everything in one go instead */
++      d.total = d.backends != NULL ? d.backends->len : 1;
++    }
++
++  g_main_context_push_thread_default (context);
++  d.loop = g_main_loop_new (context, FALSE);
++
++  if (cancellable != NULL)
++    {
++      cancel_source = g_cancellable_source_new (cancellable);
++      g_source_set_callback (cancel_source, G_SOURCE_FUNC (discovery_cancelled), &d, NULL);
++      g_source_attach (cancel_source, context);
++    }
++
++  discovery_start_more (&d);
++  if (d.pending == 0)
++    d.failed = TRUE;
++  else
++    g_main_loop_run (d.loop);
++
++  complete = d.complete;
++
++  if (cancel_source != NULL)
++    g_source_destroy (cancel_source);
++  g_main_context_pop_thread_default (context);
++  g_main_loop_unref (d.loop);
++  if (d.root != NULL)
++    scanner_remove_tree (d.root);
++  g_free (d.root);
++  g_clear_pointer (&d.backends, g_ptr_array_unref);
++  g_clear_pointer (&d.dirs, g_ptr_array_unref);
++  g_clear_pointer (&d.jobs, g_ptr_array_unref);
++
++  return complete;
++}
++
++typedef struct
++{
++  GPtrArray *slots;   /* per backend index: a GPtrArray of ScannerDevice, or NULL */
++} Collected;
++
++static void
++collect_batch (GPtrArray *devices,
++               guint      index,
++               guint      total,
++               gpointer   user_data)
++{
++  Collected *collected = user_data;
++
++  if (collected->slots == NULL)
++    {
++      collected->slots = g_ptr_array_new_full (total, (GDestroyNotify) g_ptr_array_unref);
++      g_ptr_array_set_size (collected->slots, total);
++    }
++
++  g_ptr_array_index (collected->slots, index) = devices;
++}
++
++/* Everything the backends found, in the order of the backends */
++static GPtrArray *
++scanner_flatten (Collected *collected)
++{
++  GPtrArray *all = g_ptr_array_new_with_free_func ((GDestroyNotify) scanner_device_free);
++
++  for (guint i = 0; collected->slots != NULL && i < collected->slots->len; i++)
++    {
++      GPtrArray *devices = g_ptr_array_index (collected->slots, i);
++      gsize n = 0;
++      gpointer *items;
++
++      if (devices == NULL)
++        continue;
++
++      items = g_ptr_array_steal (devices, &n);
++      for (gsize k = 0; k < n; k++)
++        g_ptr_array_add (all, items[k]);
++      g_free (items);
++    }
++
++  return all;
++}
++
++/* Runs the helpers and waits for all of them */
++static GPtrArray *
++scanner_enumerate_with_helper (void)
++{
++  Collected collected = { NULL, };
++  GPtrArray *all;
++
++  scanner_discover (collect_batch, &collected, NULL);
++  all = scanner_flatten (&collected);
++  g_clear_pointer (&collected.slots, g_ptr_array_unref);
++
++  return all;
+ }
+ 
+ /* Two made-up scanners, for trying the dialog without hardware or drivers */
+@@ -399,13 +796,18 @@ typedef struct
+   XdpScanner *scanner;
+   gboolean multiple;
+   GHashTable *candidates; /* id → GVariant (s, a{sv}) */
++  GStrv required;         /* the capabilities asked for */
++  GCancellable *cancellable; /* ends the search for scanners, which may outlive the call */
++  gboolean finished;      /* the backend has answered, nothing more is offered */
+ } SelectData;
+ 
+ static void
+ select_data_free (SelectData *data)
+ {
+   g_clear_object (&data->scanner);
++  g_clear_object (&data->cancellable);
+   g_clear_pointer (&data->candidates, g_hash_table_unref);
++  g_strfreev (data->required);
+   g_free (data);
+ }
+ 
+@@ -431,6 +833,10 @@ select_scanners_cb (GObject      *source_object,
+   data = g_object_get_data (G_OBJECT (request), "scanner-select");
+   self = data->scanner;
+ 
++  /* Whatever is still being looked for is of no use now */
++  data->finished = TRUE;
++  g_cancellable_cancel (data->cancellable);
++
+   g_variant_builder_init (&results_builder, G_VARIANT_TYPE_VARDICT);
+   g_variant_builder_init (&chosen_builder, G_VARIANT_TYPE ("a(sa{sv})"));
+ 
+@@ -494,6 +900,223 @@ out:
+     }
+ }
+ 
++/* How long SelectScanners waits for the drivers before it shows the dialog with what it has. The
++ * ones for scanners on USB answer in a few milliseconds; the dialog should not wait for the ones
++ * that search the network. */
++#define SELECT_GRACE_MS 300
++
++/* The search for scanners that SelectScanners starts. The thread that runs it hands the scanners
++ * to the call until the call has taken what there was after SELECT_GRACE_MS, and to the dialog as
++ * they come after that. */
++typedef struct
++{
++  GMutex mutex;
++  GCond cond;
++  XdpRequest *request;    /* a reference; the request data has the candidates and the flag */
++  XdpScanner *scanner;
++  GCancellable *cancellable;
++  GPtrArray *slots;       /* per backend: the ScannerDevice it found, NULL until it answers */
++  GPtrArray *before;      /* what came before the hand-over, in the order of the drivers */
++  gboolean handed_over;
++  gboolean done;
++} SelectSearch;
++
++static void
++select_search_free (SelectSearch *search)
++{
++  g_clear_object (&search->request);
++  g_clear_object (&search->scanner);
++  g_clear_object (&search->cancellable);
++  g_clear_pointer (&search->slots, g_ptr_array_unref);
++  g_clear_pointer (&search->before, g_ptr_array_unref);
++  g_mutex_clear (&search->mutex);
++  g_cond_clear (&search->cond);
++  g_free (search);
++}
++
++static SelectSearch *
++select_search_new (XdpRequest *request,
++                   XdpScanner *scanner,
++                   GCancellable *cancellable)
++{
++  SelectSearch *search = g_new0 (SelectSearch, 1);
++
++  g_mutex_init (&search->mutex);
++  g_cond_init (&search->cond);
++  search->request = g_object_ref (request);
++  search->scanner = g_object_ref (scanner);
++  search->cancellable = g_object_ref (cancellable);
++  search->before = g_ptr_array_new ();   /* the devices belong to slots */
++
++  return search;
++}
++
++/* Adds the scanners that have what the application asked for to the candidates, and to builder
++ * if it is not NULL. The request must be locked. */
++static void
++select_offer (SelectData      *data,
++              GPtrArray       *devices,
++              GVariantBuilder *builder)
++{
++  for (guint i = 0; i < devices->len; i++)
++    {
++      ScannerDevice *device = g_ptr_array_index (devices, i);
++      GVariant *entry;
++
++      if (!scanner_device_has_capabilities (device, (const char * const *) data->required))
++        continue;
++
++      entry = g_variant_ref_sink (scanner_device_to_variant (device));
++      if (builder != NULL)
++        g_variant_builder_add_value (builder, entry);
++      g_hash_table_insert (data->candidates, g_strdup (device->id), entry);
++    }
++}
++
++static void
++select_update_done (GObject      *source_object,
++                    GAsyncResult *result,
++                    gpointer      user_data)
++{
++  g_autoptr(GError) error = NULL;
++
++  if (!xdp_dbus_impl_scanner_call_update_scanners_finish (XDP_DBUS_IMPL_SCANNER (source_object),
++                                                          result, &error))
++    g_debug ("[scanner] The backend did not take the scanners it was sent: %s", error->message);
++}
++
++/* Sends the dialog the scanners that were found after it was shown */
++static void
++select_send_update (SelectSearch *search,
++                    GPtrArray    *devices,
++                    gboolean      searching)
++{
++  XdpRequest *request = search->request;
++  SelectData *data;
++  GVariantBuilder builder;
++
++  REQUEST_AUTOLOCK (request);
++
++  data = g_object_get_data (G_OBJECT (request), "scanner-select");
++  if (data == NULL || data->finished)
++    return;
++
++  g_variant_builder_init (&builder, G_VARIANT_TYPE ("a(sa{sv})"));
++  if (devices != NULL)
++    select_offer (data, devices, &builder);
++
++  g_debug ("[scanner] Sending %u more scanner(s) to the dialog, still searching: %s",
++           devices != NULL ? devices->len : 0, searching ? "yes" : "no");
++  xdp_dbus_impl_scanner_call_update_scanners (search->scanner->impl, request->id,
++                                              g_variant_builder_end (&builder), searching,
++                                              NULL, select_update_done, NULL);
++}
++
++static void
++select_search_batch (GPtrArray *devices,
++                     guint      index,
++                     guint      total,
++                     gpointer   user_data)
++{
++  SelectSearch *search = user_data;
++  gboolean forward;
++  gboolean searching;
++
++  g_mutex_lock (&search->mutex);
++
++  if (search->slots == NULL)
++    {
++      search->slots = g_ptr_array_new_full (total, (GDestroyNotify) g_ptr_array_unref);
++      g_ptr_array_set_size (search->slots, total);
++    }
++  g_ptr_array_index (search->slots, index) = g_ptr_array_ref (devices);
++
++  forward = search->handed_over;
++  if (!forward)
++    {
++      /* The call still builds its list, from the order of the drivers */
++      for (guint k = 0; k < devices->len; k++)
++        g_ptr_array_add (search->before, g_ptr_array_index (devices, k));
++      g_cond_broadcast (&search->cond);
++    }
++
++  searching = FALSE;
++  for (guint i = 0; i < search->slots->len; i++)
++    searching |= g_ptr_array_index (search->slots, i) == NULL;
++  g_mutex_unlock (&search->mutex);
++
++  if (forward)
++    select_send_update (search, devices, searching);
++
++  g_ptr_array_unref (devices);
++}
++
++static gpointer
++select_search_thread (gpointer user_data)
++{
++  SelectSearch *search = user_data;
++  XdpScanner *self = search->scanner;
++  Collected collected;
++  GPtrArray *all;
++  gboolean complete;
++
++  complete = scanner_discover (select_search_batch, search, search->cancellable);
++
++  /* The call reads what it was given before the search is over, so wait for it to be done with
++   * that before the devices go anywhere else */
++  g_mutex_lock (&search->mutex);
++  search->done = TRUE;
++  g_cond_broadcast (&search->cond);
++  while (!search->handed_over)
++    g_cond_wait (&search->cond, &search->mutex);
++  g_mutex_unlock (&search->mutex);
++
++  /* What was found is the list of scanners now, to the calls that ask for one in the next
++   * seconds, unless the search was cut short and may have missed some */
++  collected.slots = search->slots;
++  all = scanner_flatten (&collected);
++  if (complete)
++    {
++      g_mutex_lock (&self->mutex);
++      g_clear_pointer (&self->cached_devices, g_ptr_array_unref);
++      self->cached_devices = g_steal_pointer (&all);
++      self->cached_at = g_get_monotonic_time ();
++      g_mutex_unlock (&self->mutex);
++    }
++  g_clear_pointer (&all, g_ptr_array_unref);
++
++  select_send_update (search, NULL, FALSE);
++
++  select_search_free (search);
++
++  return NULL;
++}
++
++/* What the search has found by now, once it is found it all or SELECT_GRACE_MS have passed, as the
++ * scanners the dialog gets and whether it is still looking. From here on the search sends
++ * the rest to the dialog. The request must be locked. */
++static GVariant *
++select_search_take (SelectSearch *search,
++                    SelectData   *data,
++                    gboolean     *searching)
++{
++  GVariantBuilder builder;
++  gint64 until = g_get_monotonic_time () + SELECT_GRACE_MS * 1000;
++
++  g_mutex_lock (&search->mutex);
++  while (!search->done && g_cond_wait_until (&search->cond, &search->mutex, until))
++    ;
++
++  g_variant_builder_init (&builder, G_VARIANT_TYPE ("a(sa{sv})"));
++  select_offer (data, search->before, &builder);
++  *searching = !search->done;
++  search->handed_over = TRUE;
++  g_cond_broadcast (&search->cond);
++  g_mutex_unlock (&search->mutex);
++
++  return g_variant_ref_sink (g_variant_builder_end (&builder));
++}
++
+ static gboolean
+ validate_required_capabilities (const char  *key,
+                                 GVariant    *value,
+@@ -513,16 +1136,17 @@ handle_select_scanners (XdpDbusScanner         *object,
+ {
+   XdpScanner *self = XDP_SCANNER (object);
+   g_autoptr(XdpDbusImplRequest) impl_request = NULL;
+-  g_autoptr(GPtrArray) devices = NULL;
++  g_autoptr(GVariant) filtered_options = NULL;
+   g_autoptr(GVariant) impl_options = NULL;
+   g_autoptr(GError) error = NULL;
+   g_autofree const char **required = NULL;
+   GVariantBuilder options_builder;
+-  GVariantBuilder offered_builder;
++  SelectSearch *search;
+   SelectData *data;
+   XdpRequest *request;
+   GVariant *offered;
+   gboolean multiple = FALSE;
++  gboolean searching = FALSE;
+ 
+   static const XdpOptionKey scanner_select_options[] = {
+     { "modal", G_VARIANT_TYPE_BOOLEAN, NULL },
+@@ -547,35 +1171,54 @@ handle_select_scanners (XdpDbusScanner         *object,
+       g_dbus_method_invocation_return_gerror (invocation, error);
+       return G_DBUS_METHOD_INVOCATION_HANDLED;
+     }
+-  impl_options = g_variant_ref_sink (g_variant_builder_end (&options_builder));
++  filtered_options = g_variant_ref_sink (g_variant_builder_end (&options_builder));
+ 
+-  g_variant_lookup (impl_options, "multiple", "b", &multiple);
+-  g_variant_lookup (impl_options, "required_capabilities", "^a&s", &required);
++  g_variant_lookup (filtered_options, "multiple", "b", &multiple);
++  g_variant_lookup (filtered_options, "required_capabilities", "^a&s", &required);
+ 
+   /* The scanners the dialog may offer: all that exist and have what the application asked for.
+    * The application never sees this list, only what the user picks from it. */
+-  devices = scanner_enumerate (self, 0);
+-
+   data = g_new0 (SelectData, 1);
+   data->scanner = g_object_ref (self);
+   data->multiple = multiple;
++  data->required = g_strdupv ((char **) required);
++  data->cancellable = g_cancellable_new ();
+   data->candidates = g_hash_table_new_full (g_str_hash, g_str_equal,
+                                             g_free, (GDestroyNotify) g_variant_unref);
+ 
+-  g_variant_builder_init (&offered_builder, G_VARIANT_TYPE ("a(sa{sv})"));
+-  for (guint i = 0; i < devices->len; i++)
++  /* The request owns the data from here on, whatever happens next */
++  g_object_set_data_full (G_OBJECT (request), "scanner-select", data,
++                          (GDestroyNotify) select_data_free);
++
++  if (g_strcmp0 (g_getenv ("XDG_DESKTOP_PORTAL_SCANNER_FAKE"), "1") == 0)
+     {
+-      ScannerDevice *device = g_ptr_array_index (devices, i);
+-      GVariant *entry;
++      g_autoptr(GPtrArray) devices = scanner_enumerate_fake ();
++      GVariantBuilder offered_builder;
+ 
+-      if (!scanner_device_has_capabilities (device, (const char * const *) required))
+-        continue;
++      g_variant_builder_init (&offered_builder, G_VARIANT_TYPE ("a(sa{sv})"));
++      select_offer (data, devices, &offered_builder);
++      offered = g_variant_ref_sink (g_variant_builder_end (&offered_builder));
++    }
++  else
++    {
++      /* The drivers are asked side by side in a thread. The dialog gets what they have found
++       * after a moment, and the rest as it comes. */
++      search = select_search_new (request, self, data->cancellable);
++      g_thread_unref (g_thread_new ("scanner-search", select_search_thread, search));
++      offered = select_search_take (search, data, &searching);
++    }
+ 
+-      entry = g_variant_ref_sink (scanner_device_to_variant (device));
+-      g_hash_table_insert (data->candidates, g_strdup (device->id), entry);
+-      g_variant_builder_add_value (&offered_builder, entry);
++  if (searching)
++    {
++      g_autoptr(GVariantDict) dict = g_variant_dict_new (filtered_options);
++
++      g_variant_dict_insert (dict, "searching", "b", TRUE);
++      impl_options = g_variant_ref_sink (g_variant_dict_end (dict));
++    }
++  else
++    {
++      impl_options = g_variant_ref (filtered_options);
+     }
+-  offered = g_variant_ref_sink (g_variant_builder_end (&offered_builder));
+ 
+   impl_request = xdp_dbus_impl_request_proxy_new_sync (
+     g_dbus_proxy_get_connection (G_DBUS_PROXY (self->impl)),
+@@ -587,7 +1230,8 @@ handle_select_scanners (XdpDbusScanner         *object,
+   if (!impl_request)
+     {
+       g_dbus_method_invocation_return_gerror (invocation, error);
+-      select_data_free (data);
++      data->finished = TRUE;
++      g_cancellable_cancel (data->cancellable);
+       g_variant_unref (offered);
+       return G_DBUS_METHOD_INVOCATION_HANDLED;
+     }
+@@ -595,9 +1239,6 @@ handle_select_scanners (XdpDbusScanner         *object,
+   xdp_request_set_impl_request (request, impl_request);
+   xdp_request_export (request, g_dbus_method_invocation_get_connection (invocation));
+ 
+-  g_object_set_data_full (G_OBJECT (request), "scanner-select", data,
+-                          (GDestroyNotify) select_data_free);
+-
+   xdp_dbus_impl_scanner_call_select_scanners (self->impl,
+                                               request->id,
+                                               arg_parent_window,

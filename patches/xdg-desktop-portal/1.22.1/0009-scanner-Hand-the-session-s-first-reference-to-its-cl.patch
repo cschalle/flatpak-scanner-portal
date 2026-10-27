@@ -1,0 +1,37 @@
+From 26d67c082a041d1b6b3c5d0c75b809ce6783af0b Mon Sep 17 00:00:00 2001
+From: "Christian F.K. Schaller" <christian.schaller@gmail.com>
+Date: Mon, 26 Oct 2026 15:10:08 -0400
+Subject: [PATCH] scanner: Hand the session's first reference to its close
+
+This commit stops OpenScanner from dropping the reference it created
+the session with. xdp_session_close () ends by dropping one reference
+more than export and register took, which is that one, as the other
+portals that make sessions rely on. Dropping it at the end of the call
+as well left the helper's exit callback as the only other holder, so
+closing the session freed it under the callback, which then locked the
+scanner's mutex through a freed session and crashed the portal.
+
+Found while building the frontend on xdg-desktop-portal 1.22.1, where
+it crashed in the scenario that closes a session by leaving the bus.
+The frontend on main did not crash in the same run.
+
+Tested: the scenario checks pass 40 of 40 on main and on 1.22.1.
+---
+ src/scanner.c | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/src/scanner.c b/src/scanner.c
+index f579062..4fb4dd8 100644
+--- a/src/scanner.c
++++ b/src/scanner.c
+@@ -1027,6 +1027,10 @@ handle_open_scanner (XdpDbusScanner         *object,
+ 
+   xdp_dbus_scanner_complete_open_scanner (object, invocation, XDP_SESSION (session)->id);
+ 
++  /* xdp_session_close () drops one more reference than export and register took, the one this
++   * call was created with, so it is not released here. */
++  g_steal_pointer (&session);
++
+   return G_DBUS_METHOD_INVOCATION_HANDLED;
+ }
+ 

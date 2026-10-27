@@ -1,0 +1,1122 @@
+From 121120d3e64e8a68255c475baa170f03673adff0 Mon Sep 17 00:00:00 2001
+From: "Christian F.K. Schaller" <christian.schaller@gmail.com>
+Date: Mon, 26 Oct 2026 10:47:49 -0400
+Subject: [PATCH] scanner: Add the frontend for the scanner portal,
+ SelectScanners and ListScanners
+
+This commit adds org.freedesktop.portal.Scanner with the two methods
+that decide which scanners an application may use, and the backend
+interface org.freedesktop.impl.portal.Scanner that draws the dialog.
+
+SelectScanners asks the backend to show a dialog listing the scanners
+the host has that match required_capabilities, and records the user's
+choice as a grant for that application. ListScanners returns the
+granted scanners that exist at that moment. An application never sees a
+scanner it was not granted, and the frontend only grants ids it offered
+to the dialog, and at most one unless multiple was asked for, so a
+backend can draw the dialog but cannot widen what an application uses.
+
+Grants are kept in memory on the application's XdpAppInfo, so they end
+when the application leaves the bus. Nothing is stored in the
+permission store; see the open questions in the proposal.
+
+The scanners come from a stand-in until the helper that asks libsane
+exists: with XDG_DESKTOP_PORTAL_SCANNER_FAKE=1 the portal offers two
+made-up scanners, and without it there are none. The other methods of
+the interface are declared and not yet implemented.
+
+Tested on a private bus with this frontend and the xdg-desktop-portal-
+gnome scanner dialog, driven by a small client: select, cancel with
+Escape, multiple, required_capabilities, and a second connection that
+sees no grants. Not tested: an application leaving the bus, a backend
+that answers with ids it was not offered, and the permission checks of
+a sandboxed caller.
+---
+ data/meson.build                             |   2 +
+ data/org.freedesktop.impl.portal.Scanner.xml |  51 ++
+ data/org.freedesktop.portal.Scanner.xml      | 422 ++++++++++++++++
+ src/meson.build                              |   1 +
+ src/scanner.c                                | 502 +++++++++++++++++++
+ src/scanner.h                                |   9 +
+ src/xdp-context.c                            |   2 +
+ src/xdp-types.h                              |   3 +
+ 8 files changed, 992 insertions(+)
+ create mode 100644 data/org.freedesktop.impl.portal.Scanner.xml
+ create mode 100644 data/org.freedesktop.portal.Scanner.xml
+ create mode 100644 src/scanner.c
+ create mode 100644 src/scanner.h
+
+diff --git a/data/meson.build b/data/meson.build
+index 9f2eaf1..bf3e2ff 100644
+--- a/data/meson.build
++++ b/data/meson.build
+@@ -29,6 +29,7 @@ portal_sources = files(
+   'org.freedesktop.portal.Realtime.xml',
+   'org.freedesktop.portal.RemoteDesktop.xml',
+   'org.freedesktop.portal.Request.xml',
++  'org.freedesktop.portal.Scanner.xml',
+   'org.freedesktop.portal.ScreenCast.xml',
+   'org.freedesktop.portal.Screenshot.xml',
+   'org.freedesktop.portal.Secret.xml',
+@@ -61,6 +62,7 @@ portal_impl_sources = files(
+   'org.freedesktop.impl.portal.Print.xml',
+   'org.freedesktop.impl.portal.RemoteDesktop.xml',
+   'org.freedesktop.impl.portal.Request.xml',
++  'org.freedesktop.impl.portal.Scanner.xml',
+   'org.freedesktop.impl.portal.ScreenCast.xml',
+   'org.freedesktop.impl.portal.Screenshot.xml',
+   'org.freedesktop.impl.portal.Secret.xml',
+diff --git a/data/org.freedesktop.impl.portal.Scanner.xml b/data/org.freedesktop.impl.portal.Scanner.xml
+new file mode 100644
+index 0000000..4c408ea
+--- /dev/null
++++ b/data/org.freedesktop.impl.portal.Scanner.xml
+@@ -0,0 +1,51 @@
++<?xml version="1.0"?>
++<!--
++ DRAFT. Prototype for upstream xdg-desktop-portal. Not yet reviewed.
++ SPDX-License-Identifier: LGPL-2.1-or-later
++-->
++<node name="/" xmlns:doc="http://www.freedesktop.org/dbus/1.0/doc.dtd">
++  <!--
++      org.freedesktop.impl.portal.Scanner:
++      @short_description: Scanner portal backend interface
++
++      The backend only provides UI, like org.freedesktop.impl.portal.Usb.
++      Talking to scanners is done by the frontend through a host helper
++      (see PROPOSAL.md), not by the backend.
++
++      This documentation describes version 1 of this interface.
++  -->
++  <interface name="org.freedesktop.impl.portal.Scanner">
++
++    <!--
++        SelectScanners:
++        @handle: Object path for the :ref:`org.freedesktop.impl.portal.Request` object representing this call
++        @parent_window: Identifier for the application window
++        @app_id: App id of the application
++        @scanners: Array of scanner id and information vardict for every
++        scanner the frontend found that matches the request, with the same
++        keys as org.freedesktop.portal.Scanner.ListScanners
++        @options: Vardict with the options of the frontend call
++        @response: Numeric Request response
++        @results: Vardict with the results of the call
++
++        Shows the selection dialog. Results:
++
++        * ``scanners`` (``as``)
++
++          The ids chosen from @scanners. The frontend keeps the grant in memory.
++    -->
++    <method name="SelectScanners">
++      <arg type="o" name="handle" direction="in"/>
++      <arg type="s" name="parent_window" direction="in"/>
++      <arg type="s" name="app_id" direction="in"/>
++      <annotation name="org.qtproject.QtDBus.QtTypeName.In3" value="QList&lt;QPair&lt;QString,QVariantMap&gt;&gt;"/>
++      <arg type="a(sa{sv})" name="scanners" direction="in"/>
++      <annotation name="org.qtproject.QtDBus.QtTypeName.In4" value="QVariantMap"/>
++      <arg type="a{sv}" name="options" direction="in"/>
++      <arg type="u" name="response" direction="out"/>
++      <annotation name="org.qtproject.QtDBus.QtTypeName.Out1" value="QVariantMap"/>
++      <arg type="a{sv}" name="results" direction="out"/>
++    </method>
++    <property name="version" type="u" access="read"/>
++  </interface>
++</node>
+diff --git a/data/org.freedesktop.portal.Scanner.xml b/data/org.freedesktop.portal.Scanner.xml
+new file mode 100644
+index 0000000..f06bd36
+--- /dev/null
++++ b/data/org.freedesktop.portal.Scanner.xml
+@@ -0,0 +1,422 @@
++<?xml version="1.0"?>
++<!--
++ DRAFT. Prototype for upstream xdg-desktop-portal. Not yet reviewed.
++ SPDX-License-Identifier: LGPL-2.1-or-later
++-->
++<node name="/" xmlns:doc="http://www.freedesktop.org/dbus/1.0/doc.dtd">
++  <!--
++      org.freedesktop.portal.Scanner:
++      @short_description: Portal for scanner access
++
++      This interface lets sandboxed applications ask the user for access to
++      scanners and scan with them, without access to /dev, the network, or
++      the host's SANE configuration.
++
++      Scanners are driven by the host (libsane and its backends run outside
++      the sandbox). The application sees an abstract model that follows SANE:
++      a list of typed options, and image data delivered one frame at a time.
++
++      Typical use: SelectScanners() once, OpenScanner(), GetOptions(),
++      SetOptions(), then StartFrame() until last_frame is true.
++
++      An application finds out whether the portal can be used by checking
++      that the ``version`` property of this interface exists on
++      org.freedesktop.portal.Desktop, and otherwise falls back to libsane.
++
++      This documentation describes version 1 of this interface.
++    -->
++  <interface name="org.freedesktop.portal.Scanner">
++
++    <!--
++        SelectScanners:
++        @parent_window: Identifier for the application window, see :doc:`window-identifiers`
++        @options: Vardict with optional further information
++        @handle: Object path for the :ref:`org.freedesktop.portal.Request` object representing this call
++
++        Presents a dialog listing the scanners the host knows about and lets
++        the user choose which ones the application may use. The choice lasts
++        until the application leaves the bus; nothing is stored, so the
++        application must ask again the next time it starts.
++
++        Call it in response to the user asking to choose a scanner, or when
++        ListScanners() returns nothing, which is the case after every start. The dialog waits
++        for the user, so applications that have a worker thread should not
++        block it on the response, and should close the request with
++        org.freedesktop.portal.Request.Close() if they stop waiting.
++
++        Supported keys in the @options vardict:
++
++        * ``handle_token`` (``s``)
++
++          A string that will be used as the last element of the @handle. Must be a valid
++          object path element. See :ref:`org.freedesktop.portal.Request`.
++
++        * ``modal`` (``b``)
++
++          Whether to make the dialog modal. Defaults to yes.
++
++        * ``multiple`` (``b``)
++
++          Whether more than one scanner may be selected. Defaults to no.
++
++        * ``accept_label`` (``s``)
++
++          Label for the accept button. Mnemonic underlines are allowed.
++
++        * ``title`` (``s``)
++
++          Short text saying what the application wants the scanner for, such as
++          "Import photos". The dialog shows it as secondary text under the
++          application's own name, which the portal supplies and the application
++          cannot change, and may shorten it.
++
++        * ``required_capabilities`` (``as``)
++
++          Only offer scanners that have all of these capabilities. Known
++          values: ``film`` (transparency unit), ``adf``, ``infrared``,
++          ``flatbed``, ``color``. Unknown values are ignored.
++
++        The following results get returned via the :ref:`org.freedesktop.portal.Request::Response` signal:
++
++        * ``scanners`` (``a(sa{sv})``)
++
++          The selected scanners as an array of scanner id and a vardict with
++          the keys described in ListScanners().
++    -->
++    <method name="SelectScanners">
++      <arg type="s" name="parent_window" direction="in"/>
++      <annotation name="org.qtproject.QtDBus.QtTypeName.In1" value="QVariantMap"/>
++      <arg type="a{sv}" name="options" direction="in"/>
++      <arg type="o" name="handle" direction="out"/>
++    </method>
++
++    <!--
++        ListScanners:
++        @options: Vardict with optional further information. There is
++        currently no option supported.
++        @scanners: Array of scanner id and information vardict
++
++        Lists the scanners this application has been granted access to and
++        that are currently available. The scanner id is opaque and stable
++        across sessions for the same physical scanner where the backend
++        allows it. Applications must not construct ids.
++
++        Keys in the information vardict:
++
++        * ``name`` (``s``)
++
++          User-visible name.
++
++        * ``vendor`` (``s``), ``model`` (``s``)
++
++          As reported by the backend.
++
++        * ``backend`` (``s``)
++
++          The SANE backend that drives the scanner, such as ``plustek8200i``.
++          Applications match device quirks on it: the scanner id is opaque and
++          cannot be used for that.
++
++        * ``kind`` (``s``)
++
++          One of ``usb``, ``network``, ``other``.
++
++        * ``type`` (``s``)
++
++          The backend's own device type, as SANE reports it, such as
++          ``flatbed scanner``, ``film scanner``, ``video camera`` or
++          ``virtual device``. It is untranslated and free text: use it to
++          hide devices that are not scanners or to rank them, like
++          ``capabilities`` as a hint, and never to identify a model.
++
++        * ``capabilities`` (``as``)
++
++          Same vocabulary as ``required_capabilities`` in SelectScanners().
++          Capabilities are hints; GetOptions() is authoritative.
++
++        * ``available`` (``b``)
++
++          Whether the scanner can be opened right now.
++    -->
++    <method name="ListScanners">
++      <annotation name="org.qtproject.QtDBus.QtTypeName.In0" value="QVariantMap"/>
++      <arg type="a{sv}" name="options" direction="in"/>
++      <annotation name="org.qtproject.QtDBus.QtTypeName.Out0" value="QList&lt;QPair&lt;QString,QVariantMap&gt;&gt;"/>
++      <arg type="a(sa{sv})" name="scanners" direction="out"/>
++    </method>
++
++    <!--
++        CreateSession:
++        @options: Vardict with optional further information
++        @session_handle: Object path for the session.
++
++        Creates a monitoring session, needed only to receive ScannerEvents.
++
++        Supported keys in the @options vardict:
++
++        * ``session_handle_token`` (``s``)
++
++          Last element of the session handle. See :ref:`org.freedesktop.portal.Session`.
++    -->
++    <method name="CreateSession">
++      <annotation name="org.qtproject.QtDBus.QtTypeName.In0" value="QVariantMap"/>
++      <arg type="a{sv}" name="options" direction="in"/>
++      <arg type="o" name="session_handle" direction="out"/>
++    </method>
++
++    <!--
++        ScannerEvents:
++        @session_handle: Object path for the monitoring session
++        @events: A list of events which occurred.
++
++        Emitted when granted scanners appear, change or disappear. Each
++        element is an action (``add``, ``change`` or ``remove``), a scanner
++        id, and an information vardict as in ListScanners(). Only emitted for
++        scanners the application has been granted.
++    -->
++    <signal name="ScannerEvents">
++      <arg type="o" name="session_handle" direction="out"/>
++      <annotation name="org.qtproject.QtDBus.QtTypeName.Out1" value="QList&lt;std::tuple&lt;QString,QString,QVariantMap&gt;&gt;"/>
++      <arg type="a(ssa{sv})" name="events" direction="out"/>
++    </signal>
++
++    <!--
++        OpenScanner:
++        @scanner_id: A scanner id granted to the application
++        @options: Vardict with optional further information. There is
++        currently no option supported.
++        @session_handle: Object path for the :ref:`org.freedesktop.portal.Session` of the open scanner
++
++        Opens a granted scanner and takes the host's exclusive lock on it.
++        Fails with ``org.freedesktop.portal.Error.NotAllowed`` if the id was
++        not granted, ``org.freedesktop.portal.Error.Busy`` if it is
++        busy, and ``org.freedesktop.portal.Error.Failed`` if it is gone. May
++        take several seconds (lamp warm-up, calibration).
++        Closing the session (Session.Close, or the application leaving the
++        bus) cancels any scan and releases the scanner. The portal emits
++        Session.Closed if access is revoked.
++    -->
++    <method name="OpenScanner">
++      <arg type="s" name="scanner_id" direction="in"/>
++      <annotation name="org.qtproject.QtDBus.QtTypeName.In1" value="QVariantMap"/>
++      <arg type="a{sv}" name="options" direction="in"/>
++      <arg type="o" name="session_handle" direction="out"/>
++    </method>
++
++    <!--
++        GetOptions:
++        @session_handle: An open scanner session
++        @options: Vardict with optional further information. There is
++        currently no option supported.
++        @descriptors: Option descriptors, in backend order
++
++        Returns the scanner's options, modelled on SANE option descriptors.
++        Call again when SetOptions() reports ``reload-options``.
++
++        The order is the backend's and is kept until ``reload-options``.
++        SANE's option 0, the number of options, is not listed, so an
++        application that numbers options as SANE does starts at 1. Groups
++        stay in the list, with an empty ``name``, so that the numbering and
++        the grouping of the backend are preserved.
++
++        Each descriptor is a vardict:
++
++        * ``name`` (``s``)
++
++          Machine name, such as ``resolution`` or ``mode``. Empty for groups.
++
++        * ``title`` (``s``), ``description`` (``s``)
++
++          Translated by the backend where possible.
++
++        * ``type`` (``s``)
++
++          One of ``bool``, ``int``, ``fixed``, ``string``, ``button``,
++          ``group``. ``fixed`` values are carried as ``d``.
++
++        * ``unit`` (``s``)
++
++          One of ``none``, ``pixel``, ``bit``, ``mm``, ``dpi``,
++          ``percent``, ``microsecond``.
++
++        * ``size`` (``u``)
++
++          Number of values; above 1 means the value is an array.
++
++        Values are carried as ``b`` for ``bool`` and ``button``, ``i`` for
++        ``int``, ``d`` for ``fixed`` and ``s`` for ``string``. Constraint
++        ranges are ``(ddd)`` for ``int`` as well, in the option's own unit.
++
++        * ``constraint`` (``(sv)``)
++
++          Kind and data: ``none`` with ``b`` false; ``range`` with
++          ``(ddd)`` min, max, step; ``list`` with an array of the value type.
++
++        * ``capabilities`` (``as``)
++
++          Any of ``settable``, ``readable``, ``automatic``, ``inactive``,
++          ``advanced``, ``emulated``, ``hardware``.
++
++        Options that can be used to make the host open files or sockets
++        chosen by the application (file name options, for example) are not
++        listed and cannot be set.
++    -->
++    <method name="GetOptions">
++      <arg type="o" name="session_handle" direction="in"/>
++      <annotation name="org.qtproject.QtDBus.QtTypeName.In1" value="QVariantMap"/>
++      <arg type="a{sv}" name="options" direction="in"/>
++      <annotation name="org.qtproject.QtDBus.QtTypeName.Out0" value="QVariantMapList"/>
++      <arg type="aa{sv}" name="descriptors" direction="out"/>
++    </method>
++
++    <!--
++        GetOptionValues:
++        @session_handle: An open scanner session
++        @options: Vardict with optional further information. There is
++        currently no option supported.
++        @values: Current values by option name
++
++        Returns the current value of every readable, active option.
++    -->
++    <method name="GetOptionValues">
++      <arg type="o" name="session_handle" direction="in"/>
++      <annotation name="org.qtproject.QtDBus.QtTypeName.In1" value="QVariantMap"/>
++      <arg type="a{sv}" name="options" direction="in"/>
++      <annotation name="org.qtproject.QtDBus.QtTypeName.Out0" value="QVariantMap"/>
++      <arg type="a{sv}" name="values" direction="out"/>
++    </method>
++
++    <!--
++        SetOptions:
++        @session_handle: An open scanner session
++        @values: Array of (option name, value) pairs, each value a variant of the option's type, or the vardict ``{'auto': <true>}``
++        @options: Vardict with optional further information. There is
++        currently no option supported.
++        @applied: The value each option ended up with
++        @flags: Zero or more of ``inexact`` (a value was rounded),
++        ``reload-options`` (call GetOptions() again),
++        ``reload-params`` (frame geometry changed)
++
++        Sets options in array order (not a dictionary: order matters to SANE,
++        for example ``mode`` before ``resolution``). Button options take ``true``.
++
++        A value of ``{'auto': <true>}`` (an ``a{sv}``) asks the scanner to pick
++        the option's value itself, as SANE's ``SANE_ACTION_SET_AUTO``. It is
++        only valid for options with the ``automatic`` capability. (D-Bus has
++        no empty structure, so a vardict stands in for a "no value" marker, and
++        leaves room for further per-option modifiers.) An
++        invalid option or value fails the whole call with
++        ``org.freedesktop.portal.Error.InvalidArgument`` and applies
++        nothing after the failing entry. Fails with
++        ``org.freedesktop.portal.Error.Busy`` while a frame is in progress.
++    -->
++    <method name="SetOptions">
++      <arg type="o" name="session_handle" direction="in"/>
++      <annotation name="org.qtproject.QtDBus.QtTypeName.In1" value="QList&lt;QPair&lt;QString,QVariant&gt;&gt;"/>
++      <arg type="a(sv)" name="values" direction="in"/>
++      <annotation name="org.qtproject.QtDBus.QtTypeName.In2" value="QVariantMap"/>
++      <arg type="a{sv}" name="options" direction="in"/>
++      <annotation name="org.qtproject.QtDBus.QtTypeName.Out0" value="QVariantMap"/>
++      <arg type="a{sv}" name="applied" direction="out"/>
++      <arg type="as" name="flags" direction="out"/>
++    </method>
++
++    <!--
++        GetFrameParameters:
++        @session_handle: An open scanner session
++        @options: Vardict with optional further information. There is
++        currently no option supported.
++        @parameters: Frame layout the scanner would produce now
++
++        Returns the layout of the next frame for the current options, as an
++        estimate (SANE allows this before ``sane_start``; applications use it
++        to size buffers and previews). The keys are those of the ``started``
++        FrameEvent. The final values are only known once the frame has
++        started: use those. Fails with ``org.freedesktop.portal.Error.Busy``
++        while a frame is in progress.
++    -->
++    <method name="GetFrameParameters">
++      <arg type="o" name="session_handle" direction="in"/>
++      <annotation name="org.qtproject.QtDBus.QtTypeName.In1" value="QVariantMap"/>
++      <arg type="a{sv}" name="options" direction="in"/>
++      <annotation name="org.qtproject.QtDBus.QtTypeName.Out0" value="QVariantMap"/>
++      <arg type="a{sv}" name="parameters" direction="out"/>
++    </method>
++
++    <!--
++        StartFrame:
++        @session_handle: An open scanner session
++        @options: Vardict with optional further information. There is
++        currently no option supported.
++        @fd: Read end of a pipe carrying the frame's pixel data
++
++        Starts acquiring one frame and returns at once. Subscribe to
++        FrameEvent before calling. The pipe carries raw image data exactly as
++        SANE delivers it (see the ``started`` event for the layout), and is
++        closed by the portal at the end of the frame. End of data on the pipe
++        is not a success signal: wait for the ``finished`` event.
++
++        Call again after ``finished`` while ``last_frame`` was false (for
++        example separate red, green, blue and infrared frames). Fails with
++        ``org.freedesktop.portal.Error.Busy`` if a frame is in progress.
++        Closing the pipe early cancels the frame, as does Cancel().
++
++        Every StartFrame() starts a new frame with the next number, counting
++        from 1 in the session. All FrameEvent signals of the frame carry that
++        number as ``frame``, and the frame ends with exactly one event that is
++        not ``started``.
++    -->
++    <method name="StartFrame">
++      <annotation name="org.gtk.GDBus.C.UnixFD" value="true"/>
++      <arg type="o" name="session_handle" direction="in"/>
++      <annotation name="org.qtproject.QtDBus.QtTypeName.In1" value="QVariantMap"/>
++      <arg type="a{sv}" name="options" direction="in"/>
++      <arg type="h" name="fd" direction="out"/>
++    </method>
++
++    <!--
++        Cancel:
++        @session_handle: An open scanner session
++
++        Cancels the frame in progress, if any. A ``cancelled`` FrameEvent follows,
++        unless the frame ended by itself first, which also ends it with one event.
++    -->
++    <method name="Cancel">
++      <arg type="o" name="session_handle" direction="in"/>
++    </method>
++
++    <!--
++        FrameEvent:
++        @session_handle: The open scanner session
++        @state: One of ``started``, ``finished``, ``cancelled``, ``no-documents``, ``error``
++        @details: Vardict with details of the state
++
++        Reports progress of the frame started by StartFrame().
++
++        Every event has ``frame`` (``u``) in its @details, the number of the
++        frame it belongs to. A client discards events whose number is not
++        higher than that of the last frame it saw end, which are leftovers of
++        a frame it has cancelled.
++
++        ``started``: the scanner is ready and data will flow. Details:
++        ``format`` (``s``: ``gray``, ``rgb``, ``red``, ``green``, ``blue``),
++        ``depth`` (``u``), ``pixels_per_line`` (``u``), ``bytes_per_line``
++        (``u``), ``lines`` (``i``, -1 when unknown, as for hand scanners)
++        and ``last_frame`` (``b``).
++
++        ``finished``: all data was written. ``cancelled``: the frame was
++        cancelled. ``no-documents``: the feeder or film holder is empty or
++        the carriage needs the user (the application may prompt and call
++        StartFrame() again). ``error``: details ``message`` (``s``) and
++        ``code`` (``s``, a D-Bus error name).
++    -->
++    <signal name="FrameEvent">
++      <arg type="o" name="session_handle" direction="out"/>
++      <arg type="s" name="state" direction="out"/>
++      <annotation name="org.qtproject.QtDBus.QtTypeName.Out2" value="QVariantMap"/>
++      <arg type="a{sv}" name="details" direction="out"/>
++    </signal>
++
++    <property name="version" type="u" access="read"/>
++  </interface>
++</node>
+diff --git a/src/meson.build b/src/meson.build
+index 7e06400..b93d0a2 100644
+--- a/src/meson.build
++++ b/src/meson.build
+@@ -143,6 +143,7 @@ endif
+ 
+ if have_gudev
+   xdg_desktop_portal_sources += files(
++    'scanner.c',
+     'usb.c',
+   )
+ endif
+diff --git a/src/scanner.c b/src/scanner.c
+new file mode 100644
+index 0000000..0d63e9f
+--- /dev/null
++++ b/src/scanner.c
+@@ -0,0 +1,502 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later
++ * SPDX-FileCopyrightText: Copyright © the xdg-desktop-portal contributors
++ */
++
++#include "config.h"
++
++#include "scanner.h"
++
++#include <string.h>
++
++#include <gio/gio.h>
++
++#include "xdp-context.h"
++#include "xdp-dbus.h"
++#include "xdp-impl-dbus.h"
++#include "xdp-portal-config.h"
++#include "xdp-request.h"
++#include "xdp-utils.h"
++
++/* Scanners are listed by id, and an application only ever sees the ones the user chose for it.
++ * The choice is kept in memory for as long as the application stays on the bus. */
++
++struct _XdpScanner
++{
++  XdpDbusScannerSkeleton parent_instance;
++
++  XdpContext *context;
++  XdpDbusImplScanner *impl;
++
++  GMutex mutex;
++};
++
++#define XDP_TYPE_SCANNER (xdp_scanner_get_type ())
++G_DECLARE_FINAL_TYPE (XdpScanner, xdp_scanner, XDP, SCANNER, XdpDbusScannerSkeleton);
++
++static void xdp_scanner_iface_init (XdpDbusScannerIface *iface);
++
++G_DEFINE_FINAL_TYPE_WITH_CODE (XdpScanner, xdp_scanner, XDP_DBUS_TYPE_SCANNER_SKELETON,
++                               G_IMPLEMENT_INTERFACE (XDP_DBUS_TYPE_SCANNER, xdp_scanner_iface_init));
++
++#define GRANTS_KEY "-xdp-scanner-grants"
++
++/* The scanners the user has chosen for one application: a set of ids */
++static GHashTable *
++scanner_grants_from_app_info (XdpAppInfo *app_info)
++{
++  GHashTable *grants = g_object_get_data (G_OBJECT (app_info), GRANTS_KEY);
++
++  if (grants == NULL)
++    {
++      grants = g_hash_table_new_full (g_str_hash, g_str_equal, g_free, NULL);
++      g_object_set_data_full (G_OBJECT (app_info), GRANTS_KEY, grants,
++                              (GDestroyNotify) g_hash_table_unref);
++    }
++
++  return grants;
++}
++
++/* ---- The scanners the host has ----
++ *
++ * One entry per scanner: an opaque id and the information vardict that ListScanners returns,
++ * with the keys name, vendor, model, backend, kind, type, capabilities and available.
++ */
++
++typedef struct
++{
++  char *id;
++  GVariant *info; /* a{sv}, floating reference sunk */
++  GStrv capabilities;
++} ScannerDevice;
++
++static void
++scanner_device_free (ScannerDevice *device)
++{
++  g_free (device->id);
++  g_clear_pointer (&device->info, g_variant_unref);
++  g_strfreev (device->capabilities);
++  g_free (device);
++}
++
++G_DEFINE_AUTOPTR_CLEANUP_FUNC (ScannerDevice, scanner_device_free)
++
++static ScannerDevice *
++scanner_device_new (const char *id,
++                    const char *name,
++                    const char *kind,
++                    const char *type,
++                    const char * const *capabilities,
++                    gboolean available)
++{
++  ScannerDevice *device = g_new0 (ScannerDevice, 1);
++  GVariantBuilder builder;
++
++  device->id = g_strdup (id);
++  device->capabilities = g_strdupv ((char **) capabilities);
++
++  g_variant_builder_init (&builder, G_VARIANT_TYPE_VARDICT);
++  g_variant_builder_add (&builder, "{sv}", "name", g_variant_new_string (name));
++  g_variant_builder_add (&builder, "{sv}", "backend", g_variant_new_string ("fake"));
++  g_variant_builder_add (&builder, "{sv}", "kind", g_variant_new_string (kind));
++  g_variant_builder_add (&builder, "{sv}", "type", g_variant_new_string (type));
++  g_variant_builder_add (&builder, "{sv}", "capabilities",
++                         g_variant_new_strv (capabilities, -1));
++  g_variant_builder_add (&builder, "{sv}", "available", g_variant_new_boolean (available));
++  device->info = g_variant_ref_sink (g_variant_builder_end (&builder));
++
++  return device;
++}
++
++/* The scanners that exist right now, as a list of ScannerDevice. This stands in for the helper
++ * that will ask libsane; until then XDG_DESKTOP_PORTAL_SCANNER_FAKE=1 gives two made-up ones. */
++static GPtrArray *
++scanner_enumerate (XdpScanner *self)
++{
++  GPtrArray *devices = g_ptr_array_new_with_free_func ((GDestroyNotify) scanner_device_free);
++
++  if (g_strcmp0 (g_getenv ("XDG_DESKTOP_PORTAL_SCANNER_FAKE"), "1") == 0)
++    {
++      static const char * const film[] = { "film", "infrared", "color", NULL };
++      static const char * const mfp[] = { "flatbed", "adf", "color", NULL };
++
++      g_ptr_array_add (devices,
++                       scanner_device_new ("fake-film", "Fake Film Scanner", "usb",
++                                           "film scanner", film, TRUE));
++      g_ptr_array_add (devices,
++                       scanner_device_new ("fake-mfp", "Fake Office Printer", "network",
++                                           "multi-function peripheral", mfp, TRUE));
++    }
++
++  return devices;
++}
++
++static gboolean
++scanner_device_has_capabilities (ScannerDevice       *device,
++                                 const char * const  *required)
++{
++  for (size_t i = 0; required && required[i]; i++)
++    {
++      if (!g_strv_contains ((const char * const *) device->capabilities, required[i]))
++        return FALSE;
++    }
++
++  return TRUE;
++}
++
++static GVariant *
++scanner_device_to_variant (ScannerDevice *device)
++{
++  return g_variant_new ("(s@a{sv})", device->id, device->info);
++}
++
++/* ---- ListScanners ---- */
++
++static gboolean
++handle_list_scanners (XdpDbusScanner         *object,
++                      GDBusMethodInvocation  *invocation,
++                      GVariant               *arg_options)
++{
++  XdpScanner *self = XDP_SCANNER (object);
++  XdpAppInfo *app_info = xdp_invocation_get_app_info (invocation);
++  g_autoptr(GPtrArray) devices = NULL;
++  g_autoptr(GError) error = NULL;
++  GVariantBuilder options_builder;
++  GVariantBuilder scanners_builder;
++  GHashTable *grants;
++
++  g_debug ("[scanner] Handling ListScanners");
++
++  g_variant_builder_init (&options_builder, G_VARIANT_TYPE_VARDICT);
++  if (!xdp_filter_options (arg_options, &options_builder, NULL, 0, NULL, &error))
++    {
++      g_variant_builder_clear (&options_builder);
++      g_dbus_method_invocation_return_gerror (invocation, error);
++      return G_DBUS_METHOD_INVOCATION_HANDLED;
++    }
++  g_variant_builder_clear (&options_builder);
++
++  devices = scanner_enumerate (self);
++
++  g_variant_builder_init (&scanners_builder, G_VARIANT_TYPE ("a(sa{sv})"));
++
++  g_mutex_lock (&self->mutex);
++  grants = scanner_grants_from_app_info (app_info);
++  for (guint i = 0; i < devices->len; i++)
++    {
++      ScannerDevice *device = g_ptr_array_index (devices, i);
++
++      if (g_hash_table_contains (grants, device->id))
++        g_variant_builder_add_value (&scanners_builder, scanner_device_to_variant (device));
++    }
++  g_mutex_unlock (&self->mutex);
++
++  xdp_dbus_scanner_complete_list_scanners (object, invocation,
++                                           g_variant_builder_end (&scanners_builder));
++
++  return G_DBUS_METHOD_INVOCATION_HANDLED;
++}
++
++/* ---- SelectScanners ---- */
++
++typedef struct
++{
++  XdpScanner *scanner;
++  gboolean multiple;
++  GHashTable *candidates; /* id → GVariant (s, a{sv}) */
++} SelectData;
++
++static void
++select_data_free (SelectData *data)
++{
++  g_clear_object (&data->scanner);
++  g_clear_pointer (&data->candidates, g_hash_table_unref);
++  g_free (data);
++}
++
++static void
++select_scanners_cb (GObject      *source_object,
++                    GAsyncResult *result,
++                    gpointer      user_data)
++{
++  g_autoptr(XdpRequest) request = user_data;
++  g_autoptr(GVariant) results = NULL;
++  g_autoptr(GError) error = NULL;
++  g_autofree const char **ids = NULL;
++  GVariantBuilder results_builder;
++  GVariantBuilder chosen_builder;
++  XdpScanner *self;
++  SelectData *data;
++  GHashTable *grants;
++  guint response = XDG_DESKTOP_PORTAL_RESPONSE_OTHER;
++  guint n_chosen = 0;
++
++  REQUEST_AUTOLOCK (request);
++
++  data = g_object_get_data (G_OBJECT (request), "scanner-select");
++  self = data->scanner;
++
++  g_variant_builder_init (&results_builder, G_VARIANT_TYPE_VARDICT);
++  g_variant_builder_init (&chosen_builder, G_VARIANT_TYPE ("a(sa{sv})"));
++
++  if (!xdp_dbus_impl_scanner_call_select_scanners_finish (self->impl, &response, &results,
++                                                          result, &error))
++    {
++      response = XDG_DESKTOP_PORTAL_RESPONSE_OTHER;
++      g_dbus_error_strip_remote_error (error);
++      g_warning ("[scanner] The backend failed to select scanners: %s", error->message);
++      goto out;
++    }
++
++  if (response != XDG_DESKTOP_PORTAL_RESPONSE_SUCCESS)
++    goto out;
++
++  if (!g_variant_lookup (results, "scanners", "^a&s", &ids))
++    {
++      response = XDG_DESKTOP_PORTAL_RESPONSE_OTHER;
++      goto out;
++    }
++
++  g_mutex_lock (&self->mutex);
++  grants = scanner_grants_from_app_info (request->app_info);
++
++  /* Only scanners the application was offered can be granted, and one if it asked for one. The
++   * backend is trusted to draw the dialog, not to widen what the application may use. */
++  for (size_t i = 0; ids[i] != NULL; i++)
++    {
++      GVariant *candidate = g_hash_table_lookup (data->candidates, ids[i]);
++
++      if (candidate == NULL || (!data->multiple && n_chosen == 1))
++        continue;
++
++      g_hash_table_add (grants, g_strdup (ids[i]));
++      g_variant_builder_add_value (&chosen_builder, candidate);
++      n_chosen++;
++    }
++  g_mutex_unlock (&self->mutex);
++
++  if (n_chosen == 0)
++    response = XDG_DESKTOP_PORTAL_RESPONSE_OTHER;
++
++out:
++  if (response == XDG_DESKTOP_PORTAL_RESPONSE_SUCCESS)
++    g_variant_builder_add (&results_builder, "{sv}", "scanners",
++                           g_variant_builder_end (&chosen_builder));
++  else
++    g_variant_builder_clear (&chosen_builder);
++
++  if (request->exported)
++    {
++      xdp_dbus_request_emit_response (XDP_DBUS_REQUEST (request), response,
++                                      g_variant_builder_end (&results_builder));
++      xdp_request_unexport (request);
++    }
++  else
++    {
++      g_variant_builder_clear (&results_builder);
++    }
++}
++
++static gboolean
++validate_required_capabilities (const char  *key,
++                                GVariant    *value,
++                                GVariant    *options,
++                                gpointer     user_data,
++                                GError     **error)
++{
++  /* Unknown capabilities are ignored, as the documentation says, so any list is valid */
++  return TRUE;
++}
++
++static gboolean
++handle_select_scanners (XdpDbusScanner         *object,
++                        GDBusMethodInvocation  *invocation,
++                        const char             *arg_parent_window,
++                        GVariant               *arg_options)
++{
++  XdpScanner *self = XDP_SCANNER (object);
++  g_autoptr(XdpDbusImplRequest) impl_request = NULL;
++  g_autoptr(GPtrArray) devices = NULL;
++  g_autoptr(GVariant) impl_options = NULL;
++  g_autoptr(GError) error = NULL;
++  g_autofree const char **required = NULL;
++  GVariantBuilder options_builder;
++  GVariantBuilder offered_builder;
++  SelectData *data;
++  XdpRequest *request;
++  GVariant *offered;
++  gboolean multiple = FALSE;
++
++  static const XdpOptionKey scanner_select_options[] = {
++    { "modal", G_VARIANT_TYPE_BOOLEAN, NULL },
++    { "multiple", G_VARIANT_TYPE_BOOLEAN, NULL },
++    { "accept_label", G_VARIANT_TYPE_STRING, NULL },
++    { "title", G_VARIANT_TYPE_STRING, NULL },
++    { "required_capabilities", G_VARIANT_TYPE_STRING_ARRAY, validate_required_capabilities },
++  };
++
++  request = xdp_request_from_invocation (invocation);
++
++  g_debug ("[scanner] Handling SelectScanners");
++
++  REQUEST_AUTOLOCK (request);
++
++  g_variant_builder_init (&options_builder, G_VARIANT_TYPE_VARDICT);
++  if (!xdp_filter_options (arg_options, &options_builder,
++                           scanner_select_options, G_N_ELEMENTS (scanner_select_options),
++                           NULL, &error))
++    {
++      g_variant_builder_clear (&options_builder);
++      g_dbus_method_invocation_return_gerror (invocation, error);
++      return G_DBUS_METHOD_INVOCATION_HANDLED;
++    }
++  impl_options = g_variant_ref_sink (g_variant_builder_end (&options_builder));
++
++  g_variant_lookup (impl_options, "multiple", "b", &multiple);
++  g_variant_lookup (impl_options, "required_capabilities", "^a&s", &required);
++
++  /* The scanners the dialog may offer: all that exist and have what the application asked for.
++   * The application never sees this list, only what the user picks from it. */
++  devices = scanner_enumerate (self);
++
++  data = g_new0 (SelectData, 1);
++  data->scanner = g_object_ref (self);
++  data->multiple = multiple;
++  data->candidates = g_hash_table_new_full (g_str_hash, g_str_equal,
++                                            g_free, (GDestroyNotify) g_variant_unref);
++
++  g_variant_builder_init (&offered_builder, G_VARIANT_TYPE ("a(sa{sv})"));
++  for (guint i = 0; i < devices->len; i++)
++    {
++      ScannerDevice *device = g_ptr_array_index (devices, i);
++      GVariant *entry;
++
++      if (!scanner_device_has_capabilities (device, (const char * const *) required))
++        continue;
++
++      entry = g_variant_ref_sink (scanner_device_to_variant (device));
++      g_hash_table_insert (data->candidates, g_strdup (device->id), entry);
++      g_variant_builder_add_value (&offered_builder, entry);
++    }
++  offered = g_variant_ref_sink (g_variant_builder_end (&offered_builder));
++
++  impl_request = xdp_dbus_impl_request_proxy_new_sync (
++    g_dbus_proxy_get_connection (G_DBUS_PROXY (self->impl)),
++    G_DBUS_PROXY_FLAGS_NONE,
++    g_dbus_proxy_get_name (G_DBUS_PROXY (self->impl)),
++    request->id,
++    NULL,
++    &error);
++  if (!impl_request)
++    {
++      g_dbus_method_invocation_return_gerror (invocation, error);
++      select_data_free (data);
++      g_variant_unref (offered);
++      return G_DBUS_METHOD_INVOCATION_HANDLED;
++    }
++
++  xdp_request_set_impl_request (request, impl_request);
++  xdp_request_export (request, g_dbus_method_invocation_get_connection (invocation));
++
++  g_object_set_data_full (G_OBJECT (request), "scanner-select", data,
++                          (GDestroyNotify) select_data_free);
++
++  xdp_dbus_impl_scanner_call_select_scanners (self->impl,
++                                              request->id,
++                                              arg_parent_window,
++                                              xdp_app_info_get_id (request->app_info),
++                                              offered,
++                                              impl_options,
++                                              NULL,
++                                              select_scanners_cb,
++                                              g_object_ref (request));
++  g_variant_unref (offered);
++
++  xdp_dbus_scanner_complete_select_scanners (object, invocation, request->id);
++
++  return G_DBUS_METHOD_INVOCATION_HANDLED;
++}
++
++static void
++xdp_scanner_iface_init (XdpDbusScannerIface *iface)
++{
++  iface->handle_list_scanners = handle_list_scanners;
++  iface->handle_select_scanners = handle_select_scanners;
++}
++
++static void
++xdp_scanner_dispose (GObject *object)
++{
++  XdpScanner *self = XDP_SCANNER (object);
++
++  g_clear_object (&self->impl);
++  g_mutex_clear (&self->mutex);
++
++  G_OBJECT_CLASS (xdp_scanner_parent_class)->dispose (object);
++}
++
++static void
++xdp_scanner_class_init (XdpScannerClass *klass)
++{
++  GObjectClass *object_class = G_OBJECT_CLASS (klass);
++
++  object_class->dispose = xdp_scanner_dispose;
++}
++
++static void
++xdp_scanner_init (XdpScanner *self)
++{
++  g_mutex_init (&self->mutex);
++}
++
++static XdpScanner *
++scanner_new (XdpContext           *context,
++             XdpDbusImplScanner   *impl)
++{
++  XdpScanner *scanner;
++
++  g_debug ("[scanner] Initializing scanner portal");
++
++  scanner = g_object_new (xdp_scanner_get_type (), NULL);
++  scanner->context = context;
++  scanner->impl = g_object_ref (impl);
++
++  /* The dialog waits for the user, however long they take */
++  g_dbus_proxy_set_default_timeout (G_DBUS_PROXY (scanner->impl), G_MAXINT);
++
++  xdp_dbus_scanner_set_version (XDP_DBUS_SCANNER (scanner), 1);
++
++  return scanner;
++}
++
++void
++init_scanner (XdpContext *context)
++{
++  g_autoptr(XdpScanner) scanner = NULL;
++  GDBusConnection *connection = xdp_context_get_connection (context);
++  XdpPortalConfig *config = xdp_context_get_config (context);
++  XdpImplConfig *impl_config;
++  g_autoptr(XdpDbusImplScanner) impl = NULL;
++  g_autoptr(GError) error = NULL;
++
++  impl_config = xdp_portal_config_find (config, SCANNER_DBUS_IMPL_IFACE);
++  if (impl_config == NULL)
++    return;
++
++  impl = xdp_dbus_impl_scanner_proxy_new_sync (connection,
++                                               G_DBUS_PROXY_FLAGS_NONE,
++                                               impl_config->dbus_name,
++                                               DESKTOP_DBUS_PATH,
++                                               NULL,
++                                               &error);
++  if (impl == NULL)
++    {
++      g_warning ("Failed to create scanner proxy: %s", error->message);
++      return;
++    }
++
++  scanner = scanner_new (context, impl);
++
++  xdp_context_take_and_export_portal (context,
++                                      G_DBUS_INTERFACE_SKELETON (g_steal_pointer (&scanner)),
++                                      XDP_CONTEXT_EXPORT_FLAGS_NONE);
++}
+diff --git a/src/scanner.h b/src/scanner.h
+new file mode 100644
+index 0000000..485a13e
+--- /dev/null
++++ b/src/scanner.h
+@@ -0,0 +1,9 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later
++ * SPDX-FileCopyrightText: Copyright © the xdg-desktop-portal contributors
++ */
++
++#pragma once
++
++#include "xdp-types.h"
++
++void init_scanner (XdpContext *context);
+diff --git a/src/xdp-context.c b/src/xdp-context.c
+index 1a5d59b..852d5a6 100644
+--- a/src/xdp-context.c
++++ b/src/xdp-context.c
+@@ -48,6 +48,7 @@
+ #include "secret.h"
+ #include "settings.h"
+ #include "trash.h"
++#include "scanner.h"
+ #include "usb.h"
+ #include "wallpaper.h"
+ #include "xdp-app-info-registry.h"
+@@ -414,6 +415,7 @@ xdp_context_register (XdpContext       *context,
+ #if HAVE_GUDEV
+   init_usb (context);
+ #endif
++  init_scanner (context);
+   init_registry (context);
+ 
+   return TRUE;
+diff --git a/src/xdp-types.h b/src/xdp-types.h
+index c9dee7c..727aa72 100644
+--- a/src/xdp-types.h
++++ b/src/xdp-types.h
+@@ -132,6 +132,9 @@ typedef struct _XdpDbusImplAccess XdpDbusImplAccess;
+ #define SECRET_DBUS_IFACE DESKTOP_DBUS_IFACE ".Secret"
+ #define SECRET_DBUS_IMPL_IFACE DESKTOP_DBUS_IMPL_IFACE ".Secret"
+ 
++#define SCANNER_DBUS_IFACE DESKTOP_DBUS_IFACE ".Scanner"
++#define SCANNER_DBUS_IMPL_IFACE DESKTOP_DBUS_IMPL_IFACE ".Scanner"
++
+ #define SETTINGS_DBUS_IFACE DESKTOP_DBUS_IFACE ".Settings"
+ #define SETTINGS_DBUS_IMPL_IFACE DESKTOP_DBUS_IMPL_IFACE ".Settings"
+ 
