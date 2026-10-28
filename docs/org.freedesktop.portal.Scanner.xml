@@ -77,15 +77,16 @@
         * ``required_capabilities`` (``as``)
 
           Only offer scanners that have all of these capabilities. Known
-          values: ``film`` (transparency unit), ``adf``, ``infrared``,
-          ``flatbed``, ``color``. Unknown values are ignored.
+          values: ``film`` (transparency unit), ``feeder`` (automatic
+          document feeder), ``infrared``, ``flatbed``, ``color``. Unknown
+          values are ignored.
 
         * ``any_capabilities`` (``as``)
 
           Only offer scanners that have at least one of these capabilities,
           with the same values. It is applied together with
           ``required_capabilities``. An application for documents asks for
-          ``['flatbed', 'adf']``, one for film for ``film`` in
+          ``['flatbed', 'feeder']``, one for film for ``film`` in
           ``required_capabilities``, and neither is offered the other's
           scanners. A flatbed with a transparency unit has both, and is
           offered to both.
@@ -111,15 +112,12 @@
         @scanners: Array of scanner id and information vardict
 
         Lists the scanners this application has been granted access to and
-        that are currently available. The scanner id is opaque and stable
-        across sessions for the same physical scanner where the backend
-        allows it. Applications must not construct ids.
+        that are currently available. The scanner id is opaque: do not construct
+        ids, or keep them for the next run.
 
         A physical scanner is listed once, however many drivers find it, as
-        a network printer is by both an eSCL and a vendor driver. The portal
-        opens it with the driver that ranks best, and with the next one if
-        that cannot open it, so an application does not see a driver that
-        does not work.
+        a network scanner is by both an eSCL and a vendor driver. The portal
+        chooses a driver based on ranking and functionality.
 
         Keys in the information vardict:
 
@@ -127,15 +125,18 @@
 
           User-visible name.
 
-        * ``vendor`` (``s``), ``model`` (``s``)
+        * ``vendor`` (``s``)
 
-          As reported by the backend.
+          The vendor, as reported by the backend.
+
+        * ``model`` (``s``)
+
+          The model, as reported by the backend.
 
         * ``backend`` (``s``)
 
-          The SANE backend that drives the scanner, such as ``plustek8200i``.
-          Applications match device quirks on it: the scanner id is opaque and
-          cannot be used for that.
+          The SANE backend that drives the scanner, such as
+          ``plustek8200i``, for matching device quirks.
 
         * ``kind`` (``s``)
 
@@ -143,31 +144,21 @@
 
         * ``type`` (``s``)
 
-          What the device is, in the portal's words: ``scanner``, ``film``
-          for a scanner that is only for film, ``camera`` or ``virtual`` for
-          what is not a scanner at all. Use it to hide devices that are not
-          scanners. It is not the driver's own device type, which differs
-          between drivers and can hold an address; ``capabilities`` says
-          what a scanner can do. The portal leaves cameras out of its lists
-          itself, so ``camera`` is for a future driver.
+          Possible values: ``scanner``, ``film`` (a scanner that is only for
+          film) and ``other`` (a device that is not a scanner, such as a
+          camera). New values may be added in the future.
 
         * ``capabilities`` (``as``)
 
-          Same vocabulary as ``required_capabilities`` in SelectScanners().
-          The portal sets them, not the driver: it knows which scanners are
-          for film, by USB id or by product line, and assumes that a scanner
-          it does not know to be for film only is for documents, so it has
-          ``flatbed`` unless its driver says it is a sheet feeder. They are
-          reliable enough to filter on; GetOptions() is still authoritative
-          for what an opened scanner can do.
+          What the scanner can do, with the values of
+          ``required_capabilities`` in SelectScanners(). The portal sets
+          them. GetOptions() is authoritative for an opened scanner.
 
         * ``buttons`` (``as``)
 
-          The buttons of the scanner that the portal can report, with
-          ButtonEvent, by the names the portal gives them: ``scan``,
-          ``copy``, ``email``, ``pdf``, ``file`` or ``extra``. Empty when
-          the scanner has none, or its driver is not one the portal knows
-          the buttons of.
+          The buttons the portal can report with ButtonEvent: any of
+          ``scan``, ``copy``, ``email``, ``pdf``, ``file`` and ``extra``.
+          Empty if there are none.
 
         * ``available`` (``b``)
 
@@ -179,41 +170,6 @@
       <annotation name="org.qtproject.QtDBus.QtTypeName.Out0" value="QList&lt;QPair&lt;QString,QVariantMap&gt;&gt;"/>
       <arg type="a(sa{sv})" name="scanners" direction="out"/>
     </method>
-
-    <!--
-        CreateSession:
-        @options: Vardict with optional further information
-        @session_handle: Object path for the session.
-
-        Creates a monitoring session, needed only to receive ScannerEvents.
-
-        Supported keys in the @options vardict:
-
-        * ``session_handle_token`` (``s``)
-
-          Last element of the session handle. See :ref:`org.freedesktop.portal.Session`.
-    -->
-    <method name="CreateSession">
-      <annotation name="org.qtproject.QtDBus.QtTypeName.In0" value="QVariantMap"/>
-      <arg type="a{sv}" name="options" direction="in"/>
-      <arg type="o" name="session_handle" direction="out"/>
-    </method>
-
-    <!--
-        ScannerEvents:
-        @session_handle: Object path for the monitoring session
-        @events: A list of events which occurred.
-
-        Emitted when granted scanners appear, change or disappear. Each
-        element is an action (``add``, ``change`` or ``remove``), a scanner
-        id, and an information vardict as in ListScanners(). Only emitted for
-        scanners the application has been granted.
-    -->
-    <signal name="ScannerEvents">
-      <arg type="o" name="session_handle" direction="out"/>
-      <annotation name="org.qtproject.QtDBus.QtTypeName.Out1" value="QList&lt;std::tuple&lt;QString,QString,QVariantMap&gt;&gt;"/>
-      <arg type="a(ssa{sv})" name="events" direction="out"/>
-    </signal>
 
     <!--
         OpenScanner:
@@ -231,11 +187,9 @@
           token is already taken.
 
         Opens a granted scanner and takes the host's exclusive lock on it.
-        Opening can take a long time: seconds for a scanner on USB (lamp
-        warm-up, calibration), and on a network scanner through ``airscan``
-        more than D-Bus's default call timeout of 25 seconds. The call is
-        therefore a request: it returns at once, and the outcome comes as a
-        Response. The call itself fails with
+        Opening can take longer than D-Bus's call timeout, so this is a
+        request: it returns at once, and the outcome comes as a Response. The
+        call itself fails with
         ``org.freedesktop.portal.Error.NotAllowed`` if the id was not
         granted. Close the request to give up; no Response follows.
 
@@ -372,9 +326,8 @@
         A value of ``{'auto': <true>}`` (an ``a{sv}``) asks the scanner to pick
         the option's value itself, as SANE's ``SANE_ACTION_SET_AUTO``. It is
         only valid for options with the ``automatic`` capability. (D-Bus has
-        no empty structure, so a vardict stands in for a "no value" marker, and
-        leaves room for further per-option modifiers.) An
-        invalid option or value fails the whole call with
+        no empty structure, so a vardict stands in for a "no value" marker.)
+        An invalid option or value fails the whole call with
         ``org.freedesktop.portal.Error.InvalidArgument`` and applies
         nothing after the failing entry. Fails with
         ``org.freedesktop.portal.Error.Busy`` while a frame is in progress.
@@ -418,12 +371,37 @@
         @options: Vardict with optional further information. There is
         currently no option supported.
         @fd: Read end of a pipe carrying the frame's pixel data
+        @frame: The number of the frame
 
         Starts acquiring one frame and returns at once. Subscribe to
-        FrameEvent before calling. The pipe carries raw image data exactly as
-        SANE delivers it (see the ``started`` event for the layout), and is
-        closed by the portal at the end of the frame. End of data on the pipe
-        is not a success signal: wait for the ``finished`` event.
+        FrameEvent before calling. The pipe is closed by the portal at the
+        end of the frame. End of data on the pipe is not a success signal:
+        wait for the ``finished`` event.
+
+        The pipe carries the frame's pixels as SANE delivers them, described
+        by the ``started`` event (see the SANE standard, "Image Data Format"
+        and ``sane_get_parameters``):
+
+        * Rows run from the top of the image down, ``bytes_per_line`` bytes
+          each, and there are ``lines`` of them. A row can end in padding, so
+          ``bytes_per_line`` can be more than the pixels in it need.
+
+        * ``gray``, ``red``, ``green``, ``blue`` and ``ir`` frames have one
+          sample per pixel. ``rgb`` has three, in the order red, green, blue,
+          and ``rgbi`` four, with infrared last. ``grayi`` has two, gray and
+          infrared.
+
+        * ``depth`` is the bits in a sample: 1, 8 or 16. A depth of 1 packs
+          eight pixels to a byte, the first one in the most significant bit.
+          A 16-bit sample is two bytes in the host's byte order, as SANE
+          delivers it. Samples of one pixel are next to each other in a row.
+
+        * A scan in several passes is several frames, one for each of
+          ``red``, ``green`` and ``blue``, and ``last_frame`` is true on the
+          last of them. The application combines them.
+
+        * When ``lines`` is -1 the height is not known in advance, as for a
+          hand scanner, and the frame is as long as the data on the pipe.
 
         Call again after ``finished`` while ``last_frame`` was false (for
         example separate red, green, blue and infrared frames). Fails with
@@ -431,9 +409,9 @@
         Closing the pipe early cancels the frame, as does Cancel().
 
         Every StartFrame() starts a new frame with the next number, counting
-        from 1 in the session. All FrameEvent signals of the frame carry that
-        number as ``frame``, and the frame ends with exactly one event that is
-        not ``started``.
+        from 1 in the session, and returns the number as @frame. All
+        FrameEvent signals of the frame carry that number as ``frame``, and
+        the frame ends with exactly one event that is not ``started``.
     -->
     <method name="StartFrame">
       <annotation name="org.gtk.GDBus.C.UnixFD" value="true"/>
@@ -441,17 +419,24 @@
       <annotation name="org.qtproject.QtDBus.QtTypeName.In1" value="QVariantMap"/>
       <arg type="a{sv}" name="options" direction="in"/>
       <arg type="h" name="fd" direction="out"/>
+      <arg type="u" name="frame" direction="out"/>
     </method>
 
     <!--
         Cancel:
         @session_handle: An open scanner session
+        @frame: The number of the frame to cancel, as StartFrame() returned it
 
-        Cancels the frame in progress, if any. A ``cancelled`` FrameEvent follows,
-        unless the frame ended by itself first, which also ends it with one event.
+        Cancels the frame with that number. A ``cancelled`` FrameEvent
+        follows, unless the frame ended by itself first, which also ends it
+        with one event. Cancelling a frame that is over does nothing, and in
+        particular does not cancel a frame that was started after it. A
+        number that no StartFrame() returned fails with
+        ``org.freedesktop.portal.Error.InvalidArgument``.
     -->
     <method name="Cancel">
       <arg type="o" name="session_handle" direction="in"/>
+      <arg type="u" name="frame" direction="in"/>
     </method>
 
     <!--

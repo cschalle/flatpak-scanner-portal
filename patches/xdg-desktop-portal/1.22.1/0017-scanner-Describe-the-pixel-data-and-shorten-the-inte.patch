@@ -1,0 +1,103 @@
+From 4c059dd59b41a22b35d15333de490d1b88c5dbf0 Mon Sep 17 00:00:00 2001
+From: "Christian F.K. Schaller" <christian.schaller@gmail.com>
+Date: Wed, 28 Oct 2026 15:16:50 -0400
+Subject: [PATCH] scanner: Describe the pixel data and shorten the interface
+ text
+
+Say what the pipe of StartFrame carries: the order of the rows, padding,
+the samples of each format, depth and byte order, and how a scan in
+several passes comes as frames. The text pointed to the started event
+for the layout and to nothing for the rest.
+
+Say "network scanner" where it said network printer, split the vendor
+and model keys, and drop the account of how the driver is chosen from
+the description of ListScanners(), where the portal chooses a driver
+based on ranking and functionality is all an application needs.
+---
+ data/org.freedesktop.portal.Scanner.xml | 51 ++++++++++++++++++-------
+ 1 file changed, 38 insertions(+), 13 deletions(-)
+
+diff --git a/data/org.freedesktop.portal.Scanner.xml b/data/org.freedesktop.portal.Scanner.xml
+index c6d4a11..21b15f5 100644
+--- a/data/org.freedesktop.portal.Scanner.xml
++++ b/data/org.freedesktop.portal.Scanner.xml
+@@ -116,10 +116,8 @@
+         allows it. Applications must not construct ids.
+ 
+         A physical scanner is listed once, however many drivers find it, as
+-        a network printer is by both an eSCL and a vendor driver. The portal
+-        opens it with the driver that ranks best, and with the next one if
+-        that cannot open it, so an application does not see a driver that
+-        does not work.
++        a network scanner is by both an eSCL and a vendor driver. The portal
++        chooses a driver based on ranking and functionality.
+ 
+         Keys in the information vardict:
+ 
+@@ -127,9 +125,13 @@
+ 
+           User-visible name.
+ 
+-        * ``vendor`` (``s``), ``model`` (``s``)
++        * ``vendor`` (``s``)
+ 
+-          As reported by the backend.
++          The vendor, as reported by the backend.
++
++        * ``model`` (``s``)
++
++          The model, as reported by the backend.
+ 
+         * ``backend`` (``s``)
+ 
+@@ -372,9 +374,8 @@
+         A value of ``{'auto': <true>}`` (an ``a{sv}``) asks the scanner to pick
+         the option's value itself, as SANE's ``SANE_ACTION_SET_AUTO``. It is
+         only valid for options with the ``automatic`` capability. (D-Bus has
+-        no empty structure, so a vardict stands in for a "no value" marker, and
+-        leaves room for further per-option modifiers.) An
+-        invalid option or value fails the whole call with
++        no empty structure, so a vardict stands in for a "no value" marker.)
++        An invalid option or value fails the whole call with
+         ``org.freedesktop.portal.Error.InvalidArgument`` and applies
+         nothing after the failing entry. Fails with
+         ``org.freedesktop.portal.Error.Busy`` while a frame is in progress.
+@@ -420,10 +421,34 @@
+         @fd: Read end of a pipe carrying the frame's pixel data
+ 
+         Starts acquiring one frame and returns at once. Subscribe to
+-        FrameEvent before calling. The pipe carries raw image data exactly as
+-        SANE delivers it (see the ``started`` event for the layout), and is
+-        closed by the portal at the end of the frame. End of data on the pipe
+-        is not a success signal: wait for the ``finished`` event.
++        FrameEvent before calling. The pipe is closed by the portal at the
++        end of the frame. End of data on the pipe is not a success signal:
++        wait for the ``finished`` event.
++
++        The pipe carries the frame's pixels as SANE delivers them, described
++        by the ``started`` event (see the SANE standard, "Image Data Format"
++        and ``sane_get_parameters``):
++
++        * Rows run from the top of the image down, ``bytes_per_line`` bytes
++          each, and there are ``lines`` of them. A row can end in padding, so
++          ``bytes_per_line`` can be more than the pixels in it need.
++
++        * ``gray``, ``red``, ``green``, ``blue`` and ``ir`` frames have one
++          sample per pixel. ``rgb`` has three, in the order red, green, blue,
++          and ``rgbi`` four, with infrared last. ``grayi`` has two, gray and
++          infrared.
++
++        * ``depth`` is the bits in a sample: 1, 8 or 16. A depth of 1 packs
++          eight pixels to a byte, the first one in the most significant bit.
++          A 16-bit sample is two bytes in the host's byte order, as SANE
++          delivers it. Samples of one pixel are next to each other in a row.
++
++        * A scan in several passes is several frames, one for each of
++          ``red``, ``green`` and ``blue``, and ``last_frame`` is true on the
++          last of them. The application combines them.
++
++        * When ``lines`` is -1 the height is not known in advance, as for a
++          hand scanner, and the frame is as long as the data on the pipe.
+ 
+         Call again after ``finished`` while ``last_frame`` was false (for
+         example separate red, green, blue and infrared frames). Fails with

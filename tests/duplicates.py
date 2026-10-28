@@ -20,16 +20,23 @@ def main():
     check("scanner-devices.json names a scanner and gives it capabilities",
           len(film) == 1 and film[0][1]["capabilities"] == ["film", "color"], names)
     others = [s for s in scanners if s not in film]
+    feeder = [s for s in others if s[1]["name"] == "Fake Tie Pair"]
+    others = [s for s in others if s not in feeder]
     check("a scanner it does not name is for documents",
-          len(others) == 3 and all(s[1]["capabilities"] == ["flatbed"] for s in others), others)
+          len(others) == 2 and all(s[1]["capabilities"] == ["flatbed"] for s in others), others)
+    check("a scanner with a document feeder has the capability 'feeder'",
+          len(feeder) == 1 and feeder[0][1]["capabilities"] == ["flatbed", "feeder"], feeder)
+    only_feeders = c.select(multiple=v("b", True), required_capabilities=v("as", ["feeder"]))[1].get("scanners", [])
+    check("an application that needs a feeder is offered only the scanner that has one",
+          [s[1]["name"] for s in only_feeders] == ["Fake Tie Pair"], only_feeders)
     check("the type is the portal's word, not the driver's",
-          film[0][1]["type"] == "film" and all(s[1]["type"] == "scanner" for s in others), [s[1]["type"] for s in scanners])
+          film[0][1]["type"] == "film" and all(s[1]["type"] == "scanner" for s in others + feeder), [s[1]["type"] for s in scanners])
     listed = c.call("ListScanners", ({},), "(a{sv})")[0]
     check("ListScanners lists them the same", len(listed) == 4, listed)
 
     # An entry of the file that has nothing to match on is ignored, not taken for everything
     check("an unusable entry of the file does not apply to every scanner",
-          not any("adf" in s[1]["capabilities"] for s in scanners), scanners)
+          not any("feeder" in s[1]["capabilities"] and s[1]["name"] != "Fake Tie Pair" for s in scanners), scanners)
     copier = [s for s in scanners if "Copier" in s[1]["name"] or "copier" in s[1]["name"]]
     check("the scanner both drivers found is there once", len(copier) == 1, names)
     sess = c.open(copier[0][0], "dup")

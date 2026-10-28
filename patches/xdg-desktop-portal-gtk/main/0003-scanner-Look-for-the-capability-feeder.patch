@@ -1,0 +1,29 @@
+From e314374d8e0078e300c79b8fb335ad4620cce7ac Mon Sep 17 00:00:00 2001
+From: "Christian F.K. Schaller" <christian.schaller@gmail.com>
+Date: Wed, 28 Oct 2026 15:17:58 -0400
+Subject: [PATCH] scanner: Look for the capability 'feeder'
+
+---
+ src/scannerdialog.c | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/src/scannerdialog.c b/src/scannerdialog.c
+index 3adef19..4da9bc5 100644
+--- a/src/scannerdialog.c
++++ b/src/scannerdialog.c
+@@ -236,13 +236,13 @@ describe_scanner (const char  *kind,
+   /* Every kind of glass the scanner has, since a multi-function device has two */
+   if (g_strv_contains (capabilities, "film") ||
+       g_strv_contains (capabilities, "flatbed") ||
+-      g_strv_contains (capabilities, "adf"))
++      g_strv_contains (capabilities, "feeder"))
+     {
+       g_autoptr(GPtrArray) sources = g_ptr_array_new ();
+ 
+       if (g_strv_contains (capabilities, "flatbed"))
+         g_ptr_array_add (sources, (gpointer) _("Flatbed"));
+-      if (g_strv_contains (capabilities, "adf"))
++      if (g_strv_contains (capabilities, "feeder"))
+         g_ptr_array_add (sources, (gpointer) _("Feeder"));
+       if (g_strv_contains (capabilities, "film"))
+         g_ptr_array_add (sources, (gpointer) _("Film"));

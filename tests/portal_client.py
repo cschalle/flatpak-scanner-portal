@@ -133,8 +133,13 @@ class Client:
     def start_frame(self, sess):
         res = self.bus.call_with_unix_fd_list_sync(NAME, PATH, IFACE, "StartFrame", GLib.Variant("(oa{sv})", (sess, {})), None, Gio.DBusCallFlags.NONE, 20000, None, None)
         reply, fdl = res
-        fd = fdl.get(reply.unpack()[0])
+        handle, self.last_frame = reply.unpack()
+        fd = fdl.get(handle)
         return fd
+
+    def cancel(self, sess, frame=None):
+        """Cancel() the frame StartFrame returned last, or the one given."""
+        self.call("Cancel", (sess, self.last_frame if frame is None else frame), "(ou)")
 
     def wait_state(self, sess, states, start=0, timeout=20):
         def find():

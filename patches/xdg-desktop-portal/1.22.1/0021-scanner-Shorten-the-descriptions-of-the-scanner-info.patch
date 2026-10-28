@@ -1,0 +1,84 @@
+From 672970bcf4ba920c70dfe013423b2c14a6b5af09 Mon Sep 17 00:00:00 2001
+From: "Christian F.K. Schaller" <christian.schaller@gmail.com>
+Date: Wed, 28 Oct 2026 15:24:53 -0400
+Subject: [PATCH] scanner: Shorten the descriptions of the scanner information
+ and OpenScanner
+
+Keep to what an application needs to know, and leave the reasons to the
+proposal. The scanner id was said to be stable across sessions, which it
+is not.
+---
+ data/org.freedesktop.portal.Scanner.xml | 36 +++++++++----------------
+ 1 file changed, 13 insertions(+), 23 deletions(-)
+
+diff --git a/data/org.freedesktop.portal.Scanner.xml b/data/org.freedesktop.portal.Scanner.xml
+index 95cb3e5..90544b3 100644
+--- a/data/org.freedesktop.portal.Scanner.xml
++++ b/data/org.freedesktop.portal.Scanner.xml
+@@ -112,9 +112,8 @@
+         @scanners: Array of scanner id and information vardict
+ 
+         Lists the scanners this application has been granted access to and
+-        that are currently available. The scanner id is opaque and stable
+-        across sessions for the same physical scanner where the backend
+-        allows it. Applications must not construct ids.
++        that are currently available. The scanner id is opaque: do not construct
++        ids, or keep them for the next run.
+ 
+         A physical scanner is listed once, however many drivers find it, as
+         a network scanner is by both an eSCL and a vendor driver. The portal
+@@ -136,9 +135,8 @@
+ 
+         * ``backend`` (``s``)
+ 
+-          The SANE backend that drives the scanner, such as ``plustek8200i``.
+-          Applications match device quirks on it: the scanner id is opaque and
+-          cannot be used for that.
++          The SANE backend that drives the scanner, such as
++          ``plustek8200i``, for matching device quirks.
+ 
+         * ``kind`` (``s``)
+ 
+@@ -152,21 +150,15 @@
+ 
+         * ``capabilities`` (``as``)
+ 
+-          Same vocabulary as ``required_capabilities`` in SelectScanners().
+-          The portal sets them, not the driver: it knows which scanners are
+-          for film, by USB id or by product line, and assumes that a scanner
+-          it does not know to be for film only is for documents, so it has
+-          ``flatbed`` unless its driver says it is a sheet feeder. They are
+-          reliable enough to filter on; GetOptions() is still authoritative
+-          for what an opened scanner can do.
++          What the scanner can do, with the values of
++          ``required_capabilities`` in SelectScanners(). The portal sets
++          them. GetOptions() is authoritative for an opened scanner.
+ 
+         * ``buttons`` (``as``)
+ 
+-          The buttons of the scanner that the portal can report, with
+-          ButtonEvent, by the names the portal gives them: ``scan``,
+-          ``copy``, ``email``, ``pdf``, ``file`` or ``extra``. Empty when
+-          the scanner has none, or its driver is not one the portal knows
+-          the buttons of.
++          The buttons the portal can report with ButtonEvent: any of
++          ``scan``, ``copy``, ``email``, ``pdf``, ``file`` and ``extra``.
++          Empty if there are none.
+ 
+         * ``available`` (``b``)
+ 
+@@ -195,11 +187,9 @@
+           token is already taken.
+ 
+         Opens a granted scanner and takes the host's exclusive lock on it.
+-        Opening can take a long time: seconds for a scanner on USB (lamp
+-        warm-up, calibration), and on a network scanner through ``airscan``
+-        more than D-Bus's default call timeout of 25 seconds. The call is
+-        therefore a request: it returns at once, and the outcome comes as a
+-        Response. The call itself fails with
++        Opening can take longer than D-Bus's call timeout, so this is a
++        request: it returns at once, and the outcome comes as a Response. The
++        call itself fails with
+         ``org.freedesktop.portal.Error.NotAllowed`` if the id was not
+         granted. Close the request to give up; no Response follows.
+ 

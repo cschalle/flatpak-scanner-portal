@@ -1,0 +1,154 @@
+From 649c83b39c3156649ece0bc2bc15d7259b3c7998 Mon Sep 17 00:00:00 2001
+From: "Christian F.K. Schaller" <christian.schaller@gmail.com>
+Date: Wed, 28 Oct 2026 15:21:18 -0400
+Subject: [PATCH] scanner: Number the frame StartFrame starts, and Cancel by
+ that number
+
+Cancel() did not say which frame it was for, so a Cancel() that arrived
+late could stop the frame that was started after the one it was meant
+for. StartFrame() now returns the frame's number, which the FrameEvents
+carry already, and Cancel() takes it. Cancelling a frame that is over
+does nothing, and a number that was never returned is an invalid
+argument.
+---
+ data/org.freedesktop.portal.Scanner.xml | 20 ++++++++++++++------
+ src/scanner-helper.c                    | 20 ++++++++++++++++++--
+ src/scanner.c                           | 11 ++++++++---
+ 3 files changed, 40 insertions(+), 11 deletions(-)
+
+diff --git a/data/org.freedesktop.portal.Scanner.xml b/data/org.freedesktop.portal.Scanner.xml
+index b01238b..cacbe41 100644
+--- a/data/org.freedesktop.portal.Scanner.xml
++++ b/data/org.freedesktop.portal.Scanner.xml
+@@ -416,6 +416,7 @@
+         @options: Vardict with optional further information. There is
+         currently no option supported.
+         @fd: Read end of a pipe carrying the frame's pixel data
++        @frame: The number of the frame
+ 
+         Starts acquiring one frame and returns at once. Subscribe to
+         FrameEvent before calling. The pipe is closed by the portal at the
+@@ -453,9 +454,9 @@
+         Closing the pipe early cancels the frame, as does Cancel().
+ 
+         Every StartFrame() starts a new frame with the next number, counting
+-        from 1 in the session. All FrameEvent signals of the frame carry that
+-        number as ``frame``, and the frame ends with exactly one event that is
+-        not ``started``.
++        from 1 in the session, and returns the number as @frame. All
++        FrameEvent signals of the frame carry that number as ``frame``, and
++        the frame ends with exactly one event that is not ``started``.
+     -->
+     <method name="StartFrame">
+       <annotation name="org.gtk.GDBus.C.UnixFD" value="true"/>
+@@ -463,17 +464,24 @@
+       <annotation name="org.qtproject.QtDBus.QtTypeName.In1" value="QVariantMap"/>
+       <arg type="a{sv}" name="options" direction="in"/>
+       <arg type="h" name="fd" direction="out"/>
++      <arg type="u" name="frame" direction="out"/>
+     </method>
+ 
+     <!--
+         Cancel:
+         @session_handle: An open scanner session
+-
+-        Cancels the frame in progress, if any. A ``cancelled`` FrameEvent follows,
+-        unless the frame ended by itself first, which also ends it with one event.
++        @frame: The number of the frame to cancel, as StartFrame() returned it
++
++        Cancels the frame with that number. A ``cancelled`` FrameEvent
++        follows, unless the frame ended by itself first, which also ends it
++        with one event. Cancelling a frame that is over does nothing, and in
++        particular does not cancel a frame that was started after it. A
++        number that no StartFrame() returned fails with
++        ``org.freedesktop.portal.Error.InvalidArgument``.
+     -->
+     <method name="Cancel">
+       <arg type="o" name="session_handle" direction="in"/>
++      <arg type="u" name="frame" direction="in"/>
+     </method>
+ 
+     <!--
+diff --git a/src/scanner-helper.c b/src/scanner-helper.c
+index 20f92d9..2ec7e40 100644
+--- a/src/scanner-helper.c
++++ b/src/scanner-helper.c
+@@ -1038,8 +1038,9 @@ start_frame (Session *session,
+   job->out_fd = out_fd;
+   job->frame = ++session->frames;
+ 
+-  /* Reply before the thread can send an event, so that the application sees the reply first */
+-  send_reply (serial, TRUE, g_variant_new_string (""));
++  /* Reply before the thread can send an event, so that the application sees the reply first. The
++   * reply is the number of the frame. */
++  send_reply (serial, TRUE, g_variant_new_uint32 (job->frame));
+   session->thread = g_thread_new ("scanner-frame", frame_thread, job);
+ 
+   return TRUE;
+@@ -1356,6 +1357,21 @@ run_session (const char *name,
+         }
+       else if (strcmp (method, "cancel") == 0)
+         {
++          guint32 frame = g_variant_is_of_type (args, G_VARIANT_TYPE_UINT32) ? g_variant_get_uint32 (args) : 0;
++
++          /* Only the last frame that was started can be cancelled. An older one is over, and
++           * cancelling it must not stop the one that came after. */
++          if (frame == 0 || frame > session.frames)
++            {
++              send_failure (serial, "invalid", "That frame was not started");
++              continue;
++            }
++          if (frame < session.frames)
++            {
++              send_reply (serial, TRUE, g_variant_new_string (""));
++              continue;
++            }
++
+           if (busy)
+             {
+               /* The frame's thread ends with a cancelled event, before the reply */
+diff --git a/src/scanner.c b/src/scanner.c
+index 55c6503..7f2be95 100644
+--- a/src/scanner.c
++++ b/src/scanner.c
+@@ -2739,6 +2739,7 @@ handle_start_frame (XdpDbusScanner         *object,
+   g_autoptr(GVariant) result = NULL;
+   g_autoptr(GError) error = NULL;
+   g_autoptr(GUnixFDList) out_fd_list = NULL;
++  guint32 frame = 0;
+   int pipe_fds[2];
+   int read_end;
+ 
+@@ -2767,9 +2768,12 @@ handle_start_frame (XdpDbusScanner         *object,
+       return G_DBUS_METHOD_INVOCATION_HANDLED;
+     }
+ 
++  /* The helper numbers the frames of a session, and says which this one is */
++  g_variant_get (result, "u", &frame);
++
+   read_end = pipe_fds[0];
+   out_fd_list = g_unix_fd_list_new_from_array (&read_end, 1);
+-  xdp_dbus_scanner_complete_start_frame (object, invocation, out_fd_list, g_variant_new_handle (0));
++  xdp_dbus_scanner_complete_start_frame (object, invocation, out_fd_list, g_variant_new_handle (0), frame);
+ 
+   return G_DBUS_METHOD_INVOCATION_HANDLED;
+ }
+@@ -2777,7 +2781,8 @@ handle_start_frame (XdpDbusScanner         *object,
+ static gboolean
+ handle_cancel (XdpDbusScanner         *object,
+                GDBusMethodInvocation  *invocation,
+-               const char             *arg_session_handle)
++               const char             *arg_session_handle,
++               guint32                 arg_frame)
+ {
+   g_autoptr(XdpScannerSession) session = scanner_session_from_invocation (invocation, arg_session_handle);
+   g_autoptr(GVariant) result = NULL;
+@@ -2786,7 +2791,7 @@ handle_cancel (XdpDbusScanner         *object,
+   if (session == NULL)
+     return G_DBUS_METHOD_INVOCATION_HANDLED;
+ 
+-  result = scanner_session_call (session, "cancel", g_variant_new_string (""), &error);
++  result = scanner_session_call (session, "cancel", g_variant_new_uint32 (arg_frame), &error);
+   if (result == NULL)
+     g_dbus_method_invocation_return_gerror (invocation, error);
+   else

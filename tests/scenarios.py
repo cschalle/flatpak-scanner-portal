@@ -23,7 +23,7 @@ def main():
     sid = scanners[0][0]
     info = scanners[0][1]
     check("scanner info names the SANE backend", info.get("backend") == "test", info)
-    check("scanner info carries the portal's device type, not SANE's", info.get("type") == "virtual", info)
+    check("scanner info carries the portal's device type, not SANE's", info.get("type") == "other", info)
 
     # ---- scanners found after the dialog is shown. The runner's helper wrapper makes the listing
     # take two seconds while this file exists; the call must still return at once, with the
@@ -45,7 +45,7 @@ def main():
               code == 0 and [s[0] for s in results.get("scanners", [])] == [sid], (code, results))
         late.bus.close_sync(None)
 
-    # ---- an app that needs film is not offered a virtual device, and is granted nothing
+    # ---- an app that needs film is not offered the test device, which is not a scanner, and is granted nothing
     film = Client()
     code, results = film.select(required_capabilities=v("as", ["film"]))
     check("a scanner without the required capability is not offered", code != 0 and not results.get("scanners"), (code, results))
@@ -55,9 +55,9 @@ def main():
     # ---- an app for documents is offered it: a scanner that is not known to be for film only is
     # assumed to be a flatbed, whatever its driver says
     doc = Client()
-    code, results = doc.select(any_capabilities=v("as", ["flatbed", "adf"]))
+    code, results = doc.select(any_capabilities=v("as", ["flatbed", "feeder"]))
     got = results.get("scanners", [])
-    check("a scanner not known to be film is offered to an application that wants flatbed or adf",
+    check("a scanner not known to be film is offered to an application that wants flatbed or feeder",
           code == 0 and [s[0] for s in got] == [sid], (code, results))
     check("... with the flatbed capability", bool(got) and "flatbed" in got[0][1].get("capabilities", []), got)
     check("... and without the portal's own bookkeeping", bool(got) and "physical" not in got[0][1] and "usb_id" not in got[0][1], got)
@@ -78,11 +78,26 @@ def main():
     # ---- exclusive lock
     check("a second open of the same scanner is Busy (lock)", (c.open_error(sid) or "").endswith("Error.Busy"))
 
+    # ---- the shape of the interface, as the service introspects: what v1 has, and what it left out
+    import xml.etree.ElementTree as ET
+    node = ET.fromstring(c.call("Introspect", (), "()", iface="org.freedesktop.DBus.Introspectable")[0])
+    iface = [i for i in node.findall("interface") if i.get("name") == "org.freedesktop.portal.Scanner"][0]
+    def sig(member, direction):
+        m = [x for x in iface if x.get("name") == member][0]
+        return "".join(a.get("type") for a in m.findall("arg") if a.get("direction", "in" if m.tag == "method" else "out") == direction)
+    members = {x.get("name") for x in iface}
+    check("StartFrame returns the pipe and the number of the frame", sig("StartFrame", "out") == "hu", sig("StartFrame", "out"))
+    check("Cancel takes the number of the frame", sig("Cancel", "in") == "ou", sig("Cancel", "in"))
+    check("there is no monitoring session and no ScannerEvents in v1",
+          not members & {"CreateSession", "ScannerEvents"}, sorted(members))
+    check("FrameEvent is a signal of the interface", "FrameEvent" in members, sorted(members))
+
     # ---- a different app cannot use our session
     other = Client()
     foreign = "Error.AccessDenied"
     check("another connection cannot read our session's options", (other.error("GetOptions", (sess, {}), "(oa{sv})") or "").endswith(foreign))
     check("another connection cannot start a frame on our session", (other.error("StartFrame", (sess, {}), "(oa{sv})") or "").endswith(foreign))
+    check("another connection cannot cancel a frame on our session", (other.error("Cancel", (sess, 1), "(ou)") or "").endswith(foreign))
     check("another connection cannot Close our session", (other.error("Close", (), "()", iface="org.freedesktop.portal.Session", path=sess) or "").endswith(foreign))
 
     # ---- options
@@ -127,6 +142,10 @@ def main():
     check("normal frame: started then finished", states[:2] == ["started", "finished"], states)
     d = c.events[n0][2]
     check("started carries layout; data length matches", len(data) == d["bytes_per_line"] * d["lines"], (len(data), d))
+    samples = {"gray": 1, "red": 1, "green": 1, "blue": 1, "ir": 1, "rgb": 3, "rgbi": 4, "grayi": 2}.get(d["format"])
+    check("a row holds the pixels the format and depth say, and may be padded",
+          samples is not None and d["depth"] in (1, 8, 16) and
+          d["bytes_per_line"] * 8 >= d["pixels_per_line"] * samples * d["depth"], d)
     check("GetFrameParameters estimate equals the started values", est == {k: x for k, x in d.items() if k != "frame"}, (est, d))
     mine = [e for e in c.events[n0:] if e[0] == sess]
     serial0 = d.get("frame")
@@ -139,6 +158,8 @@ def main():
     fd1 = c.start_frame(sess)
     c.wait_state(sess, ("started",), n1)
     check("the next frame has a higher number", c.events[n1][2].get("frame", 0) > serial0, (c.events[n1][2], serial0))
+    check("StartFrame returns the number the frame's events carry", c.last_frame == c.events[n1][2].get("frame"), (c.last_frame, c.events[n1][2]))
+    check("... and the frames are numbered one after the other", c.last_frame == serial0 + 1, (c.last_frame, serial0))
     e = c.error("StartFrame", (sess, {}), "(oa{sv})")
     check("StartFrame during a frame is Busy", (e or "").endswith("Error.Busy"), e)
     e = c.error("SetOptions", (sess, [("resolution", v("d", 50.0))], {}), "(oa(sv)a{sv})")
@@ -147,14 +168,25 @@ def main():
     check("GetFrameParameters during a frame is Busy", (e or "").endswith("Error.Busy"), e)
 
     # ---- Cancel()
-    c.call("Cancel", (sess,), "(o)")
+    c.cancel(sess)
     i, ev = c.wait_state(sess, ("cancelled", "finished", "error"), n1)
     check("Cancel() ends the frame with 'cancelled'", ev and ev[1] == "cancelled", ev)
     os.close(fd1)
+    frame1 = c.last_frame
     # lock is free for a new frame
     n2 = len(c.events)
     fd2 = c.start_frame(sess)
     c.wait_state(sess, ("started",), n2)
+    # ---- a Cancel() for the frame that was cancelled must not cancel the one that came after it
+    c.cancel(sess, frame1)
+    time.sleep(0.5)
+    check("Cancel() of a frame that is over does not cancel the next frame",
+          not any(e[0] == sess and e[1] in ("cancelled", "finished", "error") for e in c.events[n2:]), c.events[n2:])
+    e = c.error("Cancel", (sess, c.last_frame + 1), "(ou)")
+    check("Cancel() of a frame that was not started is InvalidArgument", (e or "").endswith("Error.InvalidArgument"), e)
+    e = c.error("Cancel", (sess, 0), "(ou)")
+    check("Cancel() of frame 0 is InvalidArgument", (e or "").endswith("Error.InvalidArgument"), e)
+    check("... and the frame is still running", not any(e[0] == sess and e[1] in ("cancelled", "finished", "error") for e in c.events[n2:]), c.events[n2:])
     # ---- closing the pipe early cancels
     os.close(fd2)
     i, ev = c.wait_state(sess, ("cancelled", "finished", "error"), n2)
@@ -167,7 +199,7 @@ def main():
     c.wait_state(sess, ("started",), n)
     time.sleep(0.5)  # the 64 KB pipe is full by now and nobody reads
     t0 = time.time()
-    c.call("Cancel", (sess,), "(o)")
+    c.cancel(sess)
     i, ev = c.wait_state(sess, ("cancelled", "finished", "error"), n, timeout=8)
     check("Cancel() with a full, unread pipe still ends the frame", ev and ev[1] == "cancelled", ev)
     check("... and promptly", time.time() - t0 < 2, time.time() - t0)

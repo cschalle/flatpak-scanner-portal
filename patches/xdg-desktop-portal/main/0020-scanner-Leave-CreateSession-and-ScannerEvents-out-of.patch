@@ -1,0 +1,62 @@
+From 164a5773ae48365464e61272affe97200fa20fb1 Mon Sep 17 00:00:00 2001
+From: "Christian F.K. Schaller" <christian.schaller@gmail.com>
+Date: Wed, 28 Oct 2026 15:24:30 -0400
+Subject: [PATCH] scanner: Leave CreateSession and ScannerEvents out of the
+ interface
+
+Nothing emitted ScannerEvents, and a scanner can only be granted once it
+is there, so what it reported was at most a granted scanner that came
+back after being away, which an application can ask ListScanners() for
+when it needs to know. Without the event there is no use for the monitoring
+session either. They can come back in a later version, as one event per
+signal.
+---
+ data/org.freedesktop.portal.Scanner.xml | 35 -------------------------
+ 1 file changed, 35 deletions(-)
+
+diff --git a/data/org.freedesktop.portal.Scanner.xml b/data/org.freedesktop.portal.Scanner.xml
+index cacbe41..95cb3e5 100644
+--- a/data/org.freedesktop.portal.Scanner.xml
++++ b/data/org.freedesktop.portal.Scanner.xml
+@@ -179,41 +179,6 @@
+       <arg type="a(sa{sv})" name="scanners" direction="out"/>
+     </method>
+ 
+-    <!--
+-        CreateSession:
+-        @options: Vardict with optional further information
+-        @session_handle: Object path for the session.
+-
+-        Creates a monitoring session, needed only to receive ScannerEvents.
+-
+-        Supported keys in the @options vardict:
+-
+-        * ``session_handle_token`` (``s``)
+-
+-          Last element of the session handle. See :ref:`org.freedesktop.portal.Session`.
+-    -->
+-    <method name="CreateSession">
+-      <annotation name="org.qtproject.QtDBus.QtTypeName.In0" value="QVariantMap"/>
+-      <arg type="a{sv}" name="options" direction="in"/>
+-      <arg type="o" name="session_handle" direction="out"/>
+-    </method>
+-
+-    <!--
+-        ScannerEvents:
+-        @session_handle: Object path for the monitoring session
+-        @events: A list of events which occurred.
+-
+-        Emitted when granted scanners appear, change or disappear. Each
+-        element is an action (``add``, ``change`` or ``remove``), a scanner
+-        id, and an information vardict as in ListScanners(). Only emitted for
+-        scanners the application has been granted.
+-    -->
+-    <signal name="ScannerEvents">
+-      <arg type="o" name="session_handle" direction="out"/>
+-      <annotation name="org.qtproject.QtDBus.QtTypeName.Out1" value="QList&lt;std::tuple&lt;QString,QString,QVariantMap&gt;&gt;"/>
+-      <arg type="a(ssa{sv})" name="events" direction="out"/>
+-    </signal>
+-
+     <!--
+         OpenScanner:
+         @scanner_id: A scanner id granted to the application

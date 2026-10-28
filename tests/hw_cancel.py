@@ -132,7 +132,7 @@ def main():
         print(f"RESULT cancel_ok=0 reason=frame ended after {got} of {total} bytes")
         return 1
     t0 = time.time()
-    c.call("Cancel", (sess,), "(o)")
+    c.cancel(sess)
     i, ev = c.wait_state(sess, ("cancelled", "finished", "error"), n, timeout=30)
     took = time.time() - t0
     os.close(fd)

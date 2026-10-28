@@ -31,7 +31,8 @@ PORTAL
 {
   "version": 1,
   "scanners": [
-    { "capabilities": ["adf"] },
+    { "capabilities": ["feeder"] },
+    { "model_contains": "tie pair", "capabilities": ["flatbed", "feeder"] },
     { "model_contains": "other", "name": "Fake Film Thing", "capabilities": ["film", "color"] },
     { "model_contains": "pinned", "driver": "fakez", "capabilities": ["flatbed"] }
   ],

@@ -176,10 +176,8 @@ Consent and enumeration:
 
 | Member | Purpose |
 |---|---|
-| `SelectScanners(parent_window, options) → Request` | Shows the dialog and records the grant for the application's connection. Called on a user action, or when `ListScanners` comes back empty, which is the case on every start, since grants are not remembered. `options` can ask for `multiple` and filter on `required_capabilities` (all of them) or `any_capabilities` (at least one of them), from `film`, `adf`, `infrared`, `flatbed`, `color`. |
-| `ListScanners(options) → a(sa{sv})` | The granted, currently available scanners. Each is an opaque id plus `name`, `vendor`, `model`, `backend`, `kind`, `type` (`scanner`, `film`, `camera` or `virtual`), `capabilities`, `buttons`, `available`. |
-| `CreateSession(options) → Session` | A monitoring session, needed only for `ScannerEvents`. |
-| `ScannerEvents(session, a(ssa{sv}))` | `add`, `change` or `remove` for granted scanners only. |
+| `SelectScanners(parent_window, options) → Request` | Shows the dialog and records the grant for the application's connection. Called on a user action, or when `ListScanners` comes back empty, which is the case on every start, since grants are not remembered. `options` can ask for `multiple` and filter on `required_capabilities` (all of them) or `any_capabilities` (at least one of them), from `film`, `feeder`, `infrared`, `flatbed`, `color`. |
+| `ListScanners(options) → a(sa{sv})` | The granted, currently available scanners. Each is an opaque id plus `name`, `vendor`, `model`, `backend`, `kind`, `type` (`scanner`, `film` or `other`), `capabilities`, `buttons`, `available`. |
 
 Scanning, on a `Session` from `OpenScanner`:
 
@@ -190,8 +188,8 @@ Scanning, on a `Session` from `OpenScanner`:
 | `GetOptionValues(session, options) → a{sv}` | The current value of every readable, active option. |
 | `SetOptions(session, a(sv), options) → applied, flags` | Sets options **in array order**. Returns what each option ended up with, and flags `inexact`, `reload-options`, `reload-params`. |
 | `GetFrameParameters(session, options) → a{sv}` | The layout the next frame would have, as an estimate, for sizing buffers and previews. |
-| `StartFrame(session, options) → fd` | Starts one frame and returns at once with the read end of a pipe. |
-| `Cancel(session)` | Cancels the frame in progress. |
+| `StartFrame(session, options) → (fd, frame)` | Starts one frame and returns at once with the read end of a pipe and the number of the frame. |
+| `Cancel(session, frame)` | Cancels the frame with that number, which `StartFrame` returned. A frame that is over is not cancelled again, and a number never returned is an error. |
 | `FrameEvent(session, state, details)` | `started`, `finished`, `cancelled`, `no-documents` or `error`. `started` carries `format`, `depth`, `pixels_per_line`, `bytes_per_line`, `lines` and `last_frame`. Every event carries its frame number. |
 | `ButtonEvent(session, scanner_id, button, details)` | A press of a button on the scanner, while no frame is running: `button` is `scan`, `copy`, `email`, `pdf`, `file` or `extra`, and `details` has the backend's option name. Only for a scanner whose info lists `buttons`. See Hardware buttons. |
 
@@ -229,18 +227,18 @@ nothing is written to disk.
 | Decision | Reason |
 |---|---|
 | A SANE-shaped typed option model, not a reduced `resolution`/`mode`/`source` API | Film scanning needs infrared channels, 16-bit depth, multi-pass and backend-specific options; a reduced API loses them and the application has to go around the portal. Well-known option names keep the simple cases simple. |
-| Typed D-Bus values, with constraints and units | The print portal's all-string settings dictionary is the mistake not to repeat: it moves validation into every application. |
+| Typed D-Bus values, with constraints and units; names as strings | The print portal's all-string settings dictionary is the mistake not to repeat: it moves validation into every application. That is about values. The names of a frame's state, a capability, a button or a device type are strings, since they are read by people, are logged as they are, and can be added to without changing a signature. A client that gets one it does not know ignores it. |
 | A pipe fd per frame, not a file or D-Bus bytes | Frames reach hundreds of megabytes. A pipe gives backpressure for free, needs no temporary file and no disk access in the sandbox. One frame per call mirrors `sane_start` and covers RGB plus infrared. |
 | `StartFrame` returns immediately; state arrives in `FrameEvent` | `sane_start` can block for many seconds on warm-up or carriage movement, which no application should hold a D-Bus call open for. End of data on a pipe also cannot distinguish success from failure, so `finished` has to be explicit. |
 | Ordered `a(sv)` for `SetOptions`, not `a{sv}` | D-Bus dictionaries do not preserve order and SANE option setting is order-dependent: `mode` must be set before options that are inactive in the wrong mode, such as `three-pass` in grayscale. A dictionary cannot express that at all. |
-| A frame number on every `FrameEvent` | A client that cancels a frame and immediately starts another must be able to tell the old frame's trailing events from the new frame's. A per-session counter, and the rule that a frame ends with exactly one non-`started` event, let it discard anything not newer than the last frame it saw end. Without it every client reimplements a drain-and-wait by hand. |
+| A frame number on every `FrameEvent`, returned by `StartFrame` and named by `Cancel` | A client that cancels a frame and immediately starts another must be able to tell the old frame's trailing events from the new frame's. A per-session counter, and the rule that a frame ends with exactly one non-`started` event, let it discard anything not newer than the last frame it saw end. Without it every client reimplements a drain-and-wait by hand. `Cancel` names the frame for the same reason: one that arrives late would otherwise stop the frame started after the one it was meant for. Only the last frame started can be cancelled, an older one is over and is left alone, and a number never returned is an invalid argument. |
 | Automatic values as the vardict `{'auto': <true>}` | SANE has `SANE_ACTION_SET_AUTO` and real applications use it, for example to let the scanner pick the source. D-Bus has no empty structure, so a vardict stands in for the "no value" marker, and leaves room for further per-option modifiers. |
 | `backend` in the scanner info | The scanner id is opaque, so applications cannot match device quirks on it — and device quirks are unavoidable in practice. The driver name has to be exposed on purpose. |
-| `type` in the scanner info, alongside `kind`, in the portal's own words | Applications hide devices that are not scanners (webcams through `v4l`, SANE's `test` backend). `kind`, the connection, cannot express that. SANE's own type string can, but it differs between drivers, is free text and can hold an address (`ip=192.0.2.10` for `airscan`), so the portal says `scanner`, `film` (a scanner only for film), `camera` or `virtual`, worked out from the driver's string and the capabilities, and keeps the raw string out. The portal leaves cameras out of its lists itself, so `camera` is for a future driver. Simple Scan and Negative Vibes hide `virtual`. |
+| `type` in the scanner info, alongside `kind`, in the portal's own words | Applications hide devices that are not scanners (webcams through `v4l`, SANE's `test` backend). `kind`, the connection, cannot express that. SANE's own type string can, but it differs between drivers, is free text and can hold an address (`ip=192.0.2.10` for `airscan`), so the portal says `scanner`, `film` (a scanner only for film) or `other` (not a scanner: a camera, SANE's `test` device), worked out from the driver's string and the capabilities, and keeps the raw string out. An application only needs to hide `other`, which Simple Scan and Negative Vibes do, so there is one word for it. New values may be added. |
 | `GetFrameParameters` as an estimate | SANE allows `sane_get_parameters` before `sane_start` and applications use it to size buffers and previews. Without it a client cannot know the frame size until data is already flowing. |
 | `org.freedesktop.DBus.Error.AccessDenied` for a session that is not the caller's, closed or unknown | The other portals that have sessions answer this way, and it does not tell an application whether the session exists for someone else. `NotAllowed` stays for a scanner that was not granted, which is a decision of the user's. |
 | One helper process per open scanner, started by the frontend | libsane keeps global state, some backends leak or install signal handlers, and `sane_exit` plus `sane_init` is the only reliable reset, so a process that ends with the session is the reset. A crash costs one session. A systemd user service that owns libsane would keep that state for as long as it runs; it could come with a provider other than SANE, and nothing here needs one. |
-| `ListScanners` is a snapshot; hotplug is for `ScannerEvents` to report | Polling the drivers is not the way: `sane_get_devices` on a network takes seconds and stalls the other backends. The sources that know are udev for USB and Avahi for network scanners. `ScannerEvents` is declared in the interface and the frontend does not emit it yet. |
+| `ListScanners` is a snapshot, and v1 has no event for a scanner that comes or goes | Polling the drivers is not the way: `sane_get_devices` on a network takes seconds and stalls the other backends. The sources that know are udev for USB and Avahi for network scanners. An earlier draft had `CreateSession` and `ScannerEvents` for it. Nothing emitted the event, and a scanner has to be there to be granted, so it could only report a granted scanner that came back, which `ListScanners` answers. If events are added, it is one event per signal. |
 | Options are scalar in v1; array-valued ones are hidden | Gamma tables and calibration data are arrays. The descriptor has `size` for them, and an array form of the value could be added without changing what exists. |
 | An exclusive lock on the scanner | SANE backends are single-open and most scanners do one scan at a time, so `Busy` is the honest answer. Sharing would mean queueing, which has no good default. |
 | Applications need no permission beyond `--talk-name=org.freedesktop.portal.Desktop` | They already have it. Both Simple Scan and Negative Vibes run from Flatpaks without `--device=all` or `--share=network`, against the frontend in C, and scan on the 8200i. |
@@ -306,7 +304,7 @@ against it from inside a Flatpak with neither `--device=all` nor `--share=networ
 
 | Checked | How | Result |
 |---|---|---|
-| Interface behaviour | 53 scenario checks on a private bus, against SANE's `test` backend, with the frontend in C | Pass: grants, opaque ids, the exclusive lock, an application that leaves during `OpenScanner` not leaving the scanner locked, other applications refused on someone else's session, option errors, option order, automatic values, frame numbers, `Cancel()`, closing the pipe early, release when the application leaves the bus, hand scanner (`lines` = -1), `no-documents` from an empty feeder, the `type` vocabulary, `OpenScanner` answering at once and giving no `Response` when its request is closed. The Rust prototype passes all but one, which is a limit of its test double (it keeps grants for all applications, not each) |
+| Interface behaviour | 65 scenario checks on a private bus, against SANE's `test` backend, with the frontend in C | Pass: the shape of the interface as introspected (`StartFrame` returns the frame, `Cancel` takes it, no `ScannerEvents`), grants, opaque ids, the exclusive lock, an application that leaves during `OpenScanner` not leaving the scanner locked, other applications refused on someone else's session, option errors, option order, automatic values, frame numbers, `Cancel()` by frame number (a frame that is over is left alone, a number never returned is refused), the rows of a frame, closing the pipe early, release when the application leaves the bus, hand scanner (`lines` = -1), `no-documents` from an empty feeder, the `type` vocabulary, `OpenScanner` answering at once and giving no `Response` when its request is closed. The Rust prototype passes all but one, which is a limit of its test double (it keeps grants for all applications, not each) |
 | Drivers and curation | `tests/duplicates.py` with fake drivers, with the frontend in C | Pass: one scanner found by two drivers is one entry, the table names capabilities and an unusable entry applies to nothing, ties between drivers go by name, the driver a table entry names comes first and describes the scanner, a driver that does not drive the scanner is followed by the next, an I/O error is not |
 | Hardware buttons | `tests/buttons.py` with a fake backend, and the 8200i | Pass: a press is one event, a held button is one press, two buttons are told apart, a latch is read once, a button down when the session opened is not a press. On the 8200i 23 and 24 presses in 40 s of QuickScan and IntelliScan were reported through the portal, each under the right name, and Negative Vibes scanned and previewed from the buttons. The scanner went silent twice after it had been opened through `genesys`, which a power cycle cured; see `docs/HARDWARE-TEST.md` |
 | Pixel data correctness | Prototype client output compared with `scanimage` | Byte for byte identical for grayscale, 8-bit RGB, 16-bit RGB and three-pass red/green/blue |
@@ -321,7 +319,7 @@ The second application is what produced the frame numbers, the automatic values,
 field and a good deal of the interface documentation: the first application's needs alone
 were not enough to settle them.
 
-Not yet verified: window-handle attachment for the dialog, the dialog in portal-gtk and in
+Not yet verified: the patches for main since the frame number, the `feeder` and `type` words and the removal of `ScannerEvents` (they apply, and were tested on 1.22.1), Simple Scan since the same changes, window-handle attachment for the dialog, the dialog in portal-gtk and in
 KDE, more than one network scanner or backend (one eSCL scanner has been tried), a helper
 that stops answering without dying, two applications opening the same scanner at the same
 instant, buttons on any scanner but the 8200i (the `genesys` and Pixma entries of the table in
@@ -346,12 +344,12 @@ particular), and any provider other than SANE.
 2. Implement the frontend in C: `src/scanner.c` (`desktop-portal/scanner.c` on main), the
    helper, the in-memory grants, `data/org.freedesktop.portal.Scanner.xml`,
    `data/org.freedesktop.impl.portal.Scanner.xml`, `data/scanner-devices.json`, documentation and
-   tests in `tests/`. Written, as 16 patches for 1.22.1 and for main.
+   tests in `tests/`. Written, as 21 patches for 1.22.1 and for main.
 3. Implement the dialog in `xdg-desktop-portal-gtk`, as a plain GTK 4 window, which is where the
    print dialog lives and which serves GTK desktops other than GNOME (a sandboxed application
    there has no other way to scan), and in `xdg-desktop-portal-gnome` with libadwaita, where the
    USB dialog lives. A KDE counterpart follows. The libadwaita version is written and tested; the
-   GTK one is written (two patches) and not yet tested.
+   GTK one is written (three patches) and not yet tested.
 4. Land the Simple Scan port once the interface is accepted, as a non-prototype consumer.
 
 ## Prior art
