@@ -1,0 +1,30 @@
+From 6dae5f12306557cca025de56cba608196076ccb4 Mon Sep 17 00:00:00 2001
+From: "Christian F.K. Schaller" <christian.schaller@gmail.com>
+Date: Tue, 27 Oct 2026 23:12:08 -0400
+Subject: [PATCH] scanner: Rank plustek8200i above genesys
+
+The 8200i SE (07b3:1825) is found by both genesys and plustek8200i, and
+both ranked default_rank, so the order of the drivers decided and genesys
+won. Genesys does not report its buttons, and opening the scanner through
+it left the scanner without button events until it was power cycled.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ data/scanner-devices.json | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/data/scanner-devices.json b/data/scanner-devices.json
+index c4ecb8f..11ebbda 100644
+--- a/data/scanner-devices.json
++++ b/data/scanner-devices.json
+@@ -24,6 +24,7 @@
+       "_comment": "For a scanner that more than one driver found: the lower the better. Drivers that speak a standard protocol work on more scanners than the vendor's. A driver not named here ranks default_rank, and one that goes through another host comes last.",
+       "airscan": 0,
+       "escl": 1,
++      "plustek8200i": 1,
+       "hpaio": 8,
+       "net": 9
+   },
+-- 
+2.56.0
+
