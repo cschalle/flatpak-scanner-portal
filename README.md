@@ -16,9 +16,11 @@ from the data directories.
 This repository holds the proposal, the draft D-Bus interfaces, the conformance tests and the
 patches for the three portals. The applications that use it are separate projects:
 
-- **Negative Vibes**, a film scanning application: `../negative-vibes`. It has the portal client
-  (`crates/nv-sane-portal`) and a test double of the portal in Rust (`crates/nv-portal-proto`).
-- **GNOME Simple Scan**, ported to the draft: `../simplescan`.
+- **[Negative Vibes](https://github.com/cschalle/negative-vibes)**, a film scanning application.
+  It has the portal client (`crates/nv-sane-portal`) and a test double of the portal in Rust
+  (`crates/nv-portal-proto`).
+- **[GNOME Simple Scan](https://github.com/cschalle/gnome-simple-scan-portal)**, ported to the
+  draft.
 
 ## What is here
 
@@ -86,8 +88,9 @@ same page has what was seen with `genesys` and the scanner's buttons.
 
 ## Git policy
 
-The commit rules are the ones adopted from git-stage-batch, the same as in `../negative-vibes`
-and `../simplescan`.
+The commit rules are the ones adopted from git-stage-batch, the same as in
+[Negative Vibes](https://github.com/cschalle/negative-vibes) and
+[Simple Scan](https://github.com/cschalle/gnome-simple-scan-portal).
 
 - **No `Co-Authored-By` trailer and no other AI attribution line**, on commits or in pull
   request descriptions.
