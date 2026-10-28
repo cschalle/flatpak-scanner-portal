@@ -1,0 +1,730 @@
+From 685266c38caa0cfd694094b8457d13ce2c885120 Mon Sep 17 00:00:00 2001
+From: "Christian F.K. Schaller" <christian.schaller@gmail.com>
+Date: Tue, 27 Oct 2026 23:46:28 -0400
+Subject: [PATCH] scanner: Make OpenScanner a request, report a type of our
+ own, settle driver ties
+
+OpenScanner can take longer than D-Bus's default call timeout on a
+network scanner (16 and 25 s through airscan), so it is a request now:
+the call returns at once and the Response carries session_handle, or
+error (busy or failed) and message. Closing the request gives no
+Response and lets the scanner go.
+
+The type in the scanner info is the portal's word for the device,
+scanner, film, camera or virtual, and not the driver's own string,
+which differs between drivers and can hold an address.
+
+Driver order no longer depends on which driver answered first: ties go
+by name, and an entry of scanner-devices.json can name the driver that
+opens the scanner first. A second driver is tried only after one that
+says it does not drive the scanner (INVAL or UNSUPPORTED), not after a
+busy scanner or an I/O error, since a driver that failed half way may
+have left the device in a state a second one resets. The scanner info
+names the driver that will open it, also in the answer to
+SelectScanners.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ data/org.freedesktop.portal.Scanner.xml |  48 ++-
+ data/scanner-devices.json               |   4 +-
+ src/scanner-helper.c                    |  20 +-
+ src/scanner.c                           | 375 ++++++++++++++++++------
+ 4 files changed, 343 insertions(+), 104 deletions(-)
+
+diff --git a/data/org.freedesktop.portal.Scanner.xml b/data/org.freedesktop.portal.Scanner.xml
+index 803cac6..c6d4a11 100644
+--- a/data/org.freedesktop.portal.Scanner.xml
++++ b/data/org.freedesktop.portal.Scanner.xml
+@@ -143,11 +143,13 @@
+ 
+         * ``type`` (``s``)
+ 
+-          The backend's own device type, as SANE reports it, such as
+-          ``flatbed scanner``, ``film scanner``, ``video camera`` or
+-          ``virtual device``. It is untranslated and free text: use it to
+-          hide devices that are not scanners or to rank them, like
+-          ``capabilities`` as a hint, and never to identify a model.
++          What the device is, in the portal's words: ``scanner``, ``film``
++          for a scanner that is only for film, ``camera`` or ``virtual`` for
++          what is not a scanner at all. Use it to hide devices that are not
++          scanners. It is not the driver's own device type, which differs
++          between drivers and can hold an address; ``capabilities`` says
++          what a scanner can do. The portal leaves cameras out of its lists
++          itself, so ``camera`` is for a future driver.
+ 
+         * ``capabilities`` (``as``)
+ 
+@@ -217,7 +219,7 @@
+         OpenScanner:
+         @scanner_id: A scanner id granted to the application
+         @options: Vardict with optional further information
+-        @session_handle: Object path for the :ref:`org.freedesktop.portal.Session` of the open scanner
++        @handle: Object path for the :ref:`org.freedesktop.portal.Request` object representing this call
+ 
+         Supported keys in the @options vardict:
+ 
+@@ -229,10 +231,34 @@
+           token is already taken.
+ 
+         Opens a granted scanner and takes the host's exclusive lock on it.
+-        Fails with ``org.freedesktop.portal.Error.NotAllowed`` if the id was
+-        not granted, ``org.freedesktop.portal.Error.Busy`` if it is
+-        busy, and ``org.freedesktop.portal.Error.Failed`` if it is gone. May
+-        take several seconds (lamp warm-up, calibration).
++        Opening can take a long time: seconds for a scanner on USB (lamp
++        warm-up, calibration), and on a network scanner through ``airscan``
++        more than D-Bus's default call timeout of 25 seconds. The call is
++        therefore a request: it returns at once, and the outcome comes as a
++        Response. The call itself fails with
++        ``org.freedesktop.portal.Error.NotAllowed`` if the id was not
++        granted. Close the request to give up; no Response follows.
++
++        The following results get returned via the :ref:`org.freedesktop.portal.Request::Response` signal:
++
++        * ``session_handle`` (``s``)
++
++          Present on success: the object path for the
++          :ref:`org.freedesktop.portal.Session` of the open scanner, which is
++          the handle of every call that follows. It is a string, as it is in
++          the other portals that make a session in a request.
++
++        On failure the response code is 2, and the results have:
++
++        * ``error`` (``s``)
++
++          ``busy`` if another application, or another session, has the
++          scanner, and ``failed`` if it is gone or could not be opened.
++
++        * ``message`` (``s``)
++
++          Text for a log. It is not for the user.
++
+         Closing the session (Session.Close, or the application leaving the
+         bus) cancels any scan and releases the scanner. The portal emits
+         Session.Closed if access is revoked.
+@@ -241,7 +267,7 @@
+       <arg type="s" name="scanner_id" direction="in"/>
+       <annotation name="org.qtproject.QtDBus.QtTypeName.In1" value="QVariantMap"/>
+       <arg type="a{sv}" name="options" direction="in"/>
+-      <arg type="o" name="session_handle" direction="out"/>
++      <arg type="o" name="handle" direction="out"/>
+     </method>
+ 
+     <!--
+diff --git a/data/scanner-devices.json b/data/scanner-devices.json
+index 11ebbda..a46f26a 100644
+--- a/data/scanner-devices.json
++++ b/data/scanner-devices.json
+@@ -1,8 +1,8 @@
+ {
+-  "_comment": "What the scanner portal knows about scanners that SANE does not say. A scanner is matched by its USB id (exact) or by a lower case part of 'vendor model' (a product line). The first match in the list wins, USB ids before product lines. Capabilities: film, infrared, flatbed, adf, color. A scanner that is not named here and is not film by its driver's type is assumed to be for documents. A flatbed with a transparency unit has both film and flatbed.",
++  "_comment": "What the scanner portal knows about scanners that SANE does not say. A scanner is matched by its USB id (exact) or by a lower case part of 'vendor model' (a product line). The first match in the list wins, USB ids before product lines. Capabilities: film, infrared, flatbed, adf, color. A scanner that is not named here and is not film by its driver's type is assumed to be for documents. A flatbed with a transparency unit has both film and flatbed. An entry can also name a driver, which is then the one that opens the scanner when it is among the drivers that found it, ahead of any rank.",
+   "version": 1,
+   "scanners": [
+-    {"usb_id": "07b3:1825", "name": "Plustek OpticFilm 8200i SE", "capabilities": ["film", "infrared", "color"]},
++    {"usb_id": "07b3:1825", "name": "Plustek OpticFilm 8200i SE", "driver": "plustek8200i", "capabilities": ["film", "infrared", "color"]},
+     {"model_contains": "opticfilm", "capabilities": ["film", "color"]},
+     {"model_contains": "coolscan", "capabilities": ["film", "color"]},
+     {"model_contains": "dimage scan", "capabilities": ["film", "color"]},
+diff --git a/src/scanner-helper.c b/src/scanner-helper.c
+index da40618..3091f28 100644
+--- a/src/scanner-helper.c
++++ b/src/scanner-helper.c
+@@ -1247,6 +1247,23 @@ buttons_poll (Buttons    *buttons,
+     }
+ }
+ 
++/* Why a driver did not open a scanner, for the portal to decide whether another driver may try.
++ * `unsupported` is the driver saying it does not drive this device. An I/O error is not that: the
++ * driver may have talked to the device before it failed, and a second driver on a device in an
++ * unknown state is how a scanner gets reset. */
++static const char *
++open_failure_kind (SANE_Status status)
++{
++  if (status == SANE_STATUS_DEVICE_BUSY)
++    return "busy";
++  if (status == SANE_STATUS_ACCESS_DENIED)
++    return "denied";
++  if (status == SANE_STATUS_INVAL || status == SANE_STATUS_UNSUPPORTED)
++    return "unsupported";
++
++  return "failed";
++}
++
+ static int
+ run_session (const char *name,
+              int         argc,
+@@ -1278,8 +1295,7 @@ run_session (const char *name,
+   status = sane_open (name, &handle);
+   if (status != SANE_STATUS_GOOD)
+     {
+-      send_failure (0, status == SANE_STATUS_DEVICE_BUSY ? "busy" : "failed",
+-                    sane_strstatus (status));
++      send_failure (0, open_failure_kind (status), sane_strstatus (status));
+       sane_exit ();
+       return 1;
+     }
+diff --git a/src/scanner.c b/src/scanner.c
+index 74f8701..7d8f553 100644
+--- a/src/scanner.c
++++ b/src/scanner.c
+@@ -161,6 +161,7 @@ G_DEFINE_AUTOPTR_CLEANUP_FUNC (ScannerDevice, scanner_device_free)
+  * data directories, so that a distribution or an administrator can ship a newer one, and it is read
+  * again when it changes, so that the portal does not have to restart. */
+ #define SCANNER_DEFAULT_RANK 2
++#define SCANNER_PREFERRED_RANK (-1)
+ #define SCANNER_DEVICES_FILE "scanner-devices.json"
+ 
+ typedef struct
+@@ -168,6 +169,7 @@ typedef struct
+   char *usb_id;         /* lower case, or NULL */
+   char *model_contains; /* lower case, or NULL */
+   char *name;           /* a clean name to show, or NULL to keep the driver's */
++  char *driver;         /* the backend to open this scanner with before any other, or NULL */
+   char **capabilities;
+ } ScannerKnown;
+ 
+@@ -204,6 +206,7 @@ scanner_known_free (ScannerKnown *known)
+   g_free (known->usb_id);
+   g_free (known->model_contains);
+   g_free (known->name);
++  g_free (known->driver);
+   g_strfreev (known->capabilities);
+   g_free (known);
+ }
+@@ -256,6 +259,8 @@ scanner_known_from_json (JsonObject *object)
+   known->usb_id = usb_id != NULL ? g_ascii_strdown (usb_id, -1) : NULL;
+   known->model_contains = model != NULL ? g_ascii_strdown (model, -1) : NULL;
+   known->name = g_strdup (name);
++  if (json_object_has_member (object, "driver"))
++    known->driver = g_strdup (json_object_get_string_member (object, "driver"));
+   for (guint i = 0; i < json_array_get_length (caps); i++)
+     {
+       const char *cap = json_array_get_string_element (caps, i);
+@@ -462,6 +467,29 @@ scanner_buttons_for (const ScannerTable *table,
+   return backend != NULL ? g_hash_table_lookup (table->buttons, backend) : NULL;
+ }
+ 
++/* What kind of device it is, in the portal's words: `film` for a scanner that is only for film,
++ * `camera` and `virtual` for what is not a scanner, `scanner` for the rest. The driver's own type
++ * says little and differs between drivers; the capabilities are the portal's. */
++static const char *
++scanner_portal_type (const char         *raw,
++                     const char * const *capabilities)
++{
++  g_autofree char *lower = g_ascii_strdown (raw != NULL ? raw : "", -1);
++
++  if (strstr (lower, "camera") != NULL || strstr (lower, "webcam") != NULL)
++    return "camera";
++  if (strstr (lower, "virtual") != NULL)
++    return "virtual";
++
++  if (capabilities != NULL &&
++      g_strv_contains (capabilities, "film") &&
++      !g_strv_contains (capabilities, "flatbed") &&
++      !g_strv_contains (capabilities, "adf"))
++    return "film";
++
++  return "scanner";
++}
++
+ /* From one entry of the helper's list: an id, the SANE name and the information vardict. What the
+  * portal knows about the scanner is added: its capabilities, and an id that is the same for every
+  * driver that finds it, so that they are one scanner to the dialog and to applications. */
+@@ -531,9 +559,22 @@ scanner_device_new_from_helper (const char *id,
+   g_variant_dict_insert_value (&dict, "capabilities", g_variant_new_strv ((const char * const *) caps->pdata, -1));
+   device->capabilities = g_strdupv ((char **) caps->pdata);
+ 
++  /* The driver's own type is free text and can hold an address, so applications get the portal's
++   * word for what the device is instead */
++  {
++    const char *raw = NULL;
++
++    g_variant_dict_lookup (&dict, "type", "&s", &raw);
++    g_variant_dict_insert (&dict, "type", "s", scanner_portal_type (raw, (const char * const *) device->capabilities));
++  }
++
+   device->physical = g_strdup (physical);
+   device->sane_name = g_strdup (sane_name);
+   device->rank = scanner_backend_rank (table, backend);
++  /* A scanner whose entry names a driver is opened with that one when it is among the drivers that
++   * found it: ahead of every rank, so that it does not depend on how the others compare */
++  if (known != NULL && known->driver != NULL && g_strcmp0 (known->driver, backend) == 0)
++    device->rank = SCANNER_PREFERRED_RANK;
+   device->candidates = g_ptr_array_new_with_free_func ((GDestroyNotify) scanner_candidate_free);
+   {
+     ScannerCandidate *candidate = g_new0 (ScannerCandidate, 1);
+@@ -562,6 +603,30 @@ scanner_device_new_from_helper (const char *id,
+   return device;
+ }
+ 
++/* Says in the information that the best driver is the one that drives the scanner, since
++ * applications match quirks on it, and the scanner may have been found by another first */
++static void
++scanner_device_set_backend (ScannerDevice *device)
++{
++  g_auto(GVariantDict) dict = G_VARIANT_DICT_INIT (device->info);
++  g_autofree char *backend = g_strndup (device->sane_name, strchrnul (device->sane_name, ':') - device->sane_name);
++
++  g_variant_dict_insert (&dict, "backend", "s", backend);
++  g_variant_unref (device->info);
++  device->info = g_variant_ref_sink (g_variant_dict_end (&dict));
++}
++
++/* Whether a comes before b: the lower rank, and for equal ranks the driver whose name sorts first */
++static gboolean
++scanner_candidate_before (const ScannerCandidate *a,
++                          const ScannerCandidate *b)
++{
++  if (a->rank != b->rank)
++    return a->rank < b->rank;
++
++  return g_strcmp0 (a->name, b->name) < 0;
++}
++
+ /* One scanner for each physical scanner. The drivers that found it are kept, best first, in the
+  * scanner that stays, and OpenScanner tries them in that order, so that a driver that cannot open
+  * the scanner, such as HPLIP's for a network printer that only speaks eSCL, is not the end of it.
+@@ -596,7 +661,8 @@ scanner_merge_duplicates (GPtrArray *devices)
+           ScannerCandidate *candidate = g_ptr_array_index (device->candidates, k);
+           guint at = first->candidates->len;
+ 
+-          while (at > 0 && ((ScannerCandidate *) g_ptr_array_index (first->candidates, at - 1))->rank > candidate->rank)
++          /* Equal ranks are ordered by the driver's name, never by which one answered first */
++          while (at > 0 && scanner_candidate_before (candidate, g_ptr_array_index (first->candidates, at - 1)))
+             at--;
+           g_ptr_array_insert (first->candidates, at, candidate);
+         }
+@@ -604,6 +670,7 @@ scanner_merge_duplicates (GPtrArray *devices)
+       g_free (first->sane_name);
+       first->sane_name = g_strdup (((ScannerCandidate *) g_ptr_array_index (first->candidates, 0))->name);
+       first->rank = ((ScannerCandidate *) g_ptr_array_index (first->candidates, 0))->rank;
++      scanner_device_set_backend (first);
+       scanner_device_free (device);
+     }
+   g_free (items);
+@@ -629,7 +696,8 @@ scanner_device_new (const char *id,
+   g_variant_builder_add (&builder, "{sv}", "name", g_variant_new_string (name));
+   g_variant_builder_add (&builder, "{sv}", "backend", g_variant_new_string ("fake"));
+   g_variant_builder_add (&builder, "{sv}", "kind", g_variant_new_string (kind));
+-  g_variant_builder_add (&builder, "{sv}", "type", g_variant_new_string (type));
++  g_variant_builder_add (&builder, "{sv}", "type",
++                         g_variant_new_string (scanner_portal_type (type, capabilities)));
+   g_variant_builder_add (&builder, "{sv}", "capabilities",
+                          g_variant_new_strv (capabilities, -1));
+   g_variant_builder_add (&builder, "{sv}", "available", g_variant_new_boolean (available));
+@@ -1282,6 +1350,23 @@ select_data_free (SelectData *data)
+   g_free (data);
+ }
+ 
++/* The information of a scanner in the list of the last complete search, or NULL if there is none or
++ * it is not in it. The scanner mutex must be held. */
++static GVariant *
++scanner_cached_info (XdpScanner *self,
++                     const char *id)
++{
++  for (guint i = 0; self->cached_devices != NULL && i < self->cached_devices->len; i++)
++    {
++      ScannerDevice *device = g_ptr_array_index (self->cached_devices, i);
++
++      if (g_strcmp0 (device->id, id) == 0)
++        return g_variant_ref (device->info);
++    }
++
++  return NULL;
++}
++
+ static void
+ select_scanners_cb (GObject      *source_object,
+                     GAsyncResult *result,
+@@ -1342,7 +1427,16 @@ select_scanners_cb (GObject      *source_object,
+         continue;
+ 
+       g_hash_table_add (grants, g_strdup (ids[i]));
+-      g_variant_builder_add_value (&chosen_builder, candidate);
++      /* The dialog was offered the entry of the driver that answered first. Once the search is over
++       * the merged one is known, whose backend is the driver that will open the scanner. */
++      {
++        GVariant *merged = scanner_cached_info (self, ids[i]);
++
++        if (merged != NULL)
++          g_variant_builder_add_value (&chosen_builder, g_variant_new ("(s@a{sv})", ids[i], merged));
++        else
++          g_variant_builder_add_value (&chosen_builder, candidate);
++      }
+       n_chosen++;
+     }
+   g_debug ("[scanner] Granted %u scanner(s) to '%s' (%u in all)", n_chosen,
+@@ -2034,6 +2128,7 @@ helper_exited_cb (GObject      *source_object,
+ static gboolean
+ scanner_session_open (XdpScannerSession  *self,
+                       const char         *sane_name,
++                      gboolean           *try_next,
+                       GError            **error)
+ {
+   g_autoptr(GSubprocessLauncher) launcher = NULL;
+@@ -2047,6 +2142,9 @@ scanner_session_open (XdpScannerSession  *self,
+   guint32 serial;
+   int fds[2];
+ 
++  /* Another driver may try only when this one has said that it does not drive the scanner */
++  *try_next = FALSE;
++
+   if (helper_path == NULL)
+     helper_path = LIBEXECDIR "/xdg-desktop-portal-scanner-helper";
+ 
+@@ -2109,6 +2207,7 @@ scanner_session_open (XdpScannerSession  *self,
+                    g_strcmp0 (kind, "busy") == 0 ? XDG_DESKTOP_PORTAL_ERROR_BUSY
+                                                   : XDG_DESKTOP_PORTAL_ERROR_FAILED,
+                    "Could not open the scanner: %s", message ? message : "unknown error");
++      *try_next = g_strcmp0 (kind, "unsupported") == 0;
+       g_subprocess_force_exit (helper);
+       close (fds[0]);
+       return FALSE;
+@@ -2144,60 +2243,71 @@ sender_is_on_bus (GDBusConnection *connection,
+   return has_owner;
+ }
+ 
+-static gboolean
+-handle_open_scanner (XdpDbusScanner         *object,
+-                     GDBusMethodInvocation  *invocation,
+-                     const char             *arg_scanner_id,
+-                     GVariant               *arg_options)
++/* What an OpenScanner Response says when it was not a success: the response code is `other`, and
++ * `error` says why, in the words of the portal's errors, so that Busy can be told from a failure. */
++static GVariant *
++open_scanner_failure (const char *error,
++                      const char *message)
+ {
+-  XdpScanner *self = XDP_SCANNER (object);
+-  XdpAppInfo *app_info = xdp_invocation_get_app_info (invocation);
+-  g_autoptr(GPtrArray) devices = NULL;
+-  /* The session lives until xdp_session_close () drops the reference it was created with, which
+-   * the peer leaving can do at any moment from the moment it exists. This call has its own. */
+-  XdpScannerSession *session = NULL;
+-  g_autoptr(XdpScannerSession) holder = NULL;
+-  g_autoptr(GError) error = NULL;
+-  g_autoptr(GVariant) options = NULL;
+-  GVariantBuilder options_builder;
+-  ScannerDevice *device = NULL;
+-  const char *token;
+-  gboolean granted;
++  GVariantBuilder builder;
+ 
+-  static const XdpOptionKey scanner_open_options[] = {
+-    { "session_handle_token", G_VARIANT_TYPE_STRING, NULL },
+-  };
++  g_variant_builder_init (&builder, G_VARIANT_TYPE_VARDICT);
++  g_variant_builder_add (&builder, "{sv}", "error", g_variant_new_string (error));
++  g_variant_builder_add (&builder, "{sv}", "message", g_variant_new_string (message));
+ 
+-  g_debug ("[scanner] Handling OpenScanner");
++  return g_variant_builder_end (&builder);
++}
+ 
+-  g_variant_builder_init (&options_builder, G_VARIANT_TYPE_VARDICT);
+-  if (!xdp_filter_options (arg_options, &options_builder,
+-                           scanner_open_options, G_N_ELEMENTS (scanner_open_options),
+-                           NULL, &error))
++/* Ends the request with a Response, unless the application closed it, in which case it wants none */
++static gboolean
++open_scanner_respond (XdpRequest *request,
++                      guint       response,
++                      GVariant   *results)
++{
++  g_autoptr(GVariant) sunk = g_variant_ref_sink (results);
++  gboolean exported;
++
++  REQUEST_AUTOLOCK (request);
++
++  exported = request->exported;
++  if (exported)
+     {
+-      g_variant_builder_clear (&options_builder);
+-      g_dbus_method_invocation_return_gerror (invocation, error);
+-      return G_DBUS_METHOD_INVOCATION_HANDLED;
++      xdp_dbus_request_emit_response (XDP_DBUS_REQUEST (request), response, sunk);
++      xdp_request_unexport (request);
+     }
+-  options = g_variant_ref_sink (g_variant_builder_end (&options_builder));
+ 
+-  /* Like a request's handle_token, the token is optional here; the portal makes the handle
+-   * unique if the application's token is taken. */
+-  token = lookup_session_token (options);
+-  if (token == NULL)
+-    token = "t";
++  return exported;
++}
+ 
+-  g_mutex_lock (&self->mutex);
+-  granted = g_hash_table_contains (scanner_grants_from_app_info (app_info), arg_scanner_id);
+-  g_mutex_unlock (&self->mutex);
++static void
++open_scanner_fail (XdpRequest *request,
++                   GError     *error)
++{
++  open_scanner_respond (request, XDG_DESKTOP_PORTAL_RESPONSE_OTHER,
++                        open_scanner_failure (g_error_matches (error, XDG_DESKTOP_PORTAL_ERROR,
++                                                               XDG_DESKTOP_PORTAL_ERROR_BUSY) ? "busy" : "failed",
++                                              error->message));
++}
+ 
+-  if (!granted)
+-    {
+-      g_dbus_method_invocation_return_error (invocation, XDG_DESKTOP_PORTAL_ERROR,
+-                                             XDG_DESKTOP_PORTAL_ERROR_NOT_ALLOWED,
+-                                             "The scanner was not granted to this application");
+-      return G_DBUS_METHOD_INVOCATION_HANDLED;
+-    }
++/* The work of OpenScanner, after the call has been answered with the request. Listing and opening
++ * take seconds, on a network scanner more than D-Bus's default timeout, which is why the call is a
++ * request and its outcome a Response. */
++static void
++open_scanner_run (XdpScanner      *self,
++                  XdpRequest      *request,
++                  XdpAppInfo      *app_info,
++                  GDBusConnection *connection,
++                  const char      *sender,
++                  const char      *scanner_id,
++                  const char      *token)
++{
++  g_autoptr(GPtrArray) devices = NULL;
++  /* The session lives until xdp_session_close () drops the reference it was created with, which
++   * the peer leaving can do at any moment from the moment it exists. This function has its own. */
++  XdpScannerSession *session = NULL;
++  g_autoptr(XdpScannerSession) holder = NULL;
++  g_autoptr(GError) error = NULL;
++  ScannerDevice *device = NULL;
+ 
+   /* Where the scanner is now, since a USB scanner that was unplugged and plugged in again has a
+    * new SANE name */
+@@ -2212,7 +2322,7 @@ handle_open_scanner (XdpDbusScanner         *object,
+         {
+           ScannerDevice *candidate = g_ptr_array_index (devices, i);
+ 
+-          if (g_strcmp0 (candidate->id, arg_scanner_id) == 0)
++          if (g_strcmp0 (candidate->id, scanner_id) == 0)
+             {
+               device = candidate;
+               break;
+@@ -2222,38 +2332,36 @@ handle_open_scanner (XdpDbusScanner         *object,
+ 
+   if (device == NULL || device->sane_name == NULL)
+     {
+-      g_dbus_method_invocation_return_error (invocation, XDG_DESKTOP_PORTAL_ERROR,
+-                                             XDG_DESKTOP_PORTAL_ERROR_FAILED,
+-                                             "The scanner is not available");
+-      return G_DBUS_METHOD_INVOCATION_HANDLED;
++      open_scanner_respond (request, XDG_DESKTOP_PORTAL_RESPONSE_OTHER,
++                            open_scanner_failure ("failed", "The scanner is not available"));
++      return;
+     }
+ 
+-  session = xdp_scanner_session_new (self, g_dbus_method_invocation_get_connection (invocation),
+-                                     g_dbus_method_invocation_get_sender (invocation),
+-                                     app_info, arg_scanner_id, token, &error);
++  session = xdp_scanner_session_new (self, connection, sender, app_info, scanner_id, token, &error);
+   if (session == NULL)
+     {
+-      g_dbus_method_invocation_return_gerror (invocation, error);
+-      return G_DBUS_METHOD_INVOCATION_HANDLED;
++      open_scanner_fail (request, error);
++      return;
+     }
+   holder = g_object_ref (session);
+ 
+   /* Take the lock before opening, so that two applications asking at once cannot both open it */
+   g_mutex_lock (&self->mutex);
+-  if (g_hash_table_contains (self->open_scanners, arg_scanner_id))
++  if (g_hash_table_contains (self->open_scanners, scanner_id))
+     {
+       g_mutex_unlock (&self->mutex);
+-      g_dbus_method_invocation_return_error (invocation, XDG_DESKTOP_PORTAL_ERROR,
+-                                             XDG_DESKTOP_PORTAL_ERROR_BUSY,
+-                                             "The scanner is in use");
++      open_scanner_respond (request, XDG_DESKTOP_PORTAL_RESPONSE_OTHER,
++                            open_scanner_failure ("busy", "The scanner is in use"));
+       xdp_session_close (XDP_SESSION (session), FALSE);
+-      return G_DBUS_METHOD_INVOCATION_HANDLED;
++      return;
+     }
+-  g_hash_table_insert (self->open_scanners, g_strdup (arg_scanner_id), session);
++  g_hash_table_insert (self->open_scanners, g_strdup (scanner_id), session);
+   g_mutex_unlock (&self->mutex);
+ 
+-  /* The drivers that found it, best first. One that cannot open the scanner is not the end of it,
+-   * unless the scanner is busy, which another driver would only meet too. */
++  /* The drivers that found it, best first. Another driver is tried only when the one before said
++   * that it does not drive the scanner. Not after a busy scanner, which another driver would only
++   * meet too, and not after an I/O error, since the driver may have talked to the device and a
++   * second one on a device in an unknown state is how a scanner gets reset. */
+   {
+     guint n_names = device->candidates != NULL ? device->candidates->len : 1;
+     gboolean opened = FALSE;
+@@ -2262,51 +2370,140 @@ handle_open_scanner (XdpDbusScanner         *object,
+       {
+         const char *name = device->candidates != NULL ? ((ScannerCandidate *) g_ptr_array_index (device->candidates, i))->name
+                                                         : device->sane_name;
++        gboolean try_next = FALSE;
+ 
+         g_clear_error (&error);
+-        opened = scanner_session_open (session, name, &error);
+-        if (!opened && !g_error_matches (error, XDG_DESKTOP_PORTAL_ERROR, XDG_DESKTOP_PORTAL_ERROR_BUSY) && i + 1 < n_names)
+-          g_debug ("[scanner] %s did not open (%s), trying the next driver", name, error->message);
+-        else if (!opened)
++        opened = scanner_session_open (session, name, &try_next, &error);
++        if (opened)
++          break;
++        if (try_next && i + 1 < n_names)
++          g_debug ("[scanner] %s does not drive this scanner (%s), trying the next driver", name, error->message);
++        else
+           break;
+       }
+ 
+     if (!opened)
+       {
+         /* Never exported or registered; closing releases the lock and the object path */
+-        g_dbus_method_invocation_return_gerror (invocation, error);
++        open_scanner_fail (request, error);
+         xdp_session_close (XDP_SESSION (session), FALSE);
+-        return G_DBUS_METHOD_INVOCATION_HANDLED;
++        return;
+       }
+   }
+ 
+-  /* Listing and opening take seconds, and the application may have left the bus meanwhile.
+-   * Nothing would tell this session, which did not exist yet when the application went, so it
+-   * would hold the scanner for as long as the portal runs. */
+-  if (!sender_is_on_bus (g_dbus_method_invocation_get_connection (invocation),
+-                         g_dbus_method_invocation_get_sender (invocation)))
+-    {
+-      g_dbus_method_invocation_return_error (invocation, G_DBUS_ERROR, G_DBUS_ERROR_NAME_HAS_NO_OWNER,
+-                                             "The application has left the bus");
+-      /* The session may have been closed already, when the application left while the helper was
+-       * starting; closing it again would do nothing, and the helper has come up since. */
+-      xdp_scanner_session_close (XDP_SESSION (session));
+-      xdp_session_close (XDP_SESSION (session), FALSE);
+-      return G_DBUS_METHOD_INVOCATION_HANDLED;
++  /* Listing and opening take seconds, and the application may have left the bus meanwhile, or
++   * closed the request. Nothing would tell this session, which did not exist yet when it
++   * happened, so it would hold the scanner for as long as the portal runs. */
++  {
++    gboolean closed;
++
++    {
++      REQUEST_AUTOLOCK (request);
++      closed = !request->exported;
+     }
+ 
++    if (closed || !sender_is_on_bus (connection, sender))
++      {
++        /* The session may have been closed already, when the application left while the helper
++         * was starting; closing it again would do nothing, and the helper has come up since. */
++        xdp_scanner_session_close (XDP_SESSION (session));
++        xdp_session_close (XDP_SESSION (session), FALSE);
++        return;
++      }
++  }
++
+   if (!xdp_session_export (XDP_SESSION (session), &error))
+     {
+-      g_dbus_method_invocation_return_gerror (invocation, error);
++      open_scanner_fail (request, error);
+       xdp_session_close (XDP_SESSION (session), FALSE);
+-      return G_DBUS_METHOD_INVOCATION_HANDLED;
++      return;
+     }
+ 
+   xdp_session_register (XDP_SESSION (session));
+ 
+-  g_debug ("[scanner] Opened %s as session %s", arg_scanner_id, XDP_SESSION (session)->id);
++  g_debug ("[scanner] Opened %s as session %s", scanner_id, XDP_SESSION (session)->id);
++
++  {
++    GVariantBuilder results;
++
++    g_variant_builder_init (&results, G_VARIANT_TYPE_VARDICT);
++    g_variant_builder_add (&results, "{sv}", "session_handle",
++                           g_variant_new_string (XDP_SESSION (session)->id));
++
++    /* The application can close the request between the check above and here; then the session
++     * has no one to use it, and is closed with it, as when the application leaves */
++    if (!open_scanner_respond (request, XDG_DESKTOP_PORTAL_RESPONSE_SUCCESS,
++                               g_variant_builder_end (&results)))
++      {
++        xdp_scanner_session_close (XDP_SESSION (session));
++        xdp_session_close (XDP_SESSION (session), FALSE);
++      }
++  }
++}
++
++static gboolean
++handle_open_scanner (XdpDbusScanner         *object,
++                     GDBusMethodInvocation  *invocation,
++                     const char             *arg_scanner_id,
++                     GVariant               *arg_options)
++{
++  XdpScanner *self = XDP_SCANNER (object);
++  XdpRequest *request = xdp_request_from_invocation (invocation);
++  g_autoptr(XdpAppInfo) app_info = g_object_ref (xdp_invocation_get_app_info (invocation));
++  g_autoptr(GDBusConnection) connection = g_object_ref (g_dbus_method_invocation_get_connection (invocation));
++  g_autofree char *sender = g_strdup (g_dbus_method_invocation_get_sender (invocation));
++  g_autofree char *scanner_id = g_strdup (arg_scanner_id);
++  g_autofree char *token_copy = NULL;
++  g_autoptr(GError) error = NULL;
++  g_autoptr(GVariant) options = NULL;
++  GVariantBuilder options_builder;
++  const char *token;
++  gboolean granted;
++
++  static const XdpOptionKey scanner_open_options[] = {
++    { "session_handle_token", G_VARIANT_TYPE_STRING, NULL },
++  };
++
++  g_debug ("[scanner] Handling OpenScanner");
++
++  g_variant_builder_init (&options_builder, G_VARIANT_TYPE_VARDICT);
++  if (!xdp_filter_options (arg_options, &options_builder,
++                           scanner_open_options, G_N_ELEMENTS (scanner_open_options),
++                           NULL, &error))
++    {
++      g_variant_builder_clear (&options_builder);
++      g_dbus_method_invocation_return_gerror (invocation, error);
++      return G_DBUS_METHOD_INVOCATION_HANDLED;
++    }
++  options = g_variant_ref_sink (g_variant_builder_end (&options_builder));
++
++  /* Like a request's handle_token, the token is optional here; the portal makes the handle
++   * unique if the application's token is taken. */
++  token = lookup_session_token (options);
++  token_copy = g_strdup (token != NULL ? token : "t");
++
++  g_mutex_lock (&self->mutex);
++  granted = g_hash_table_contains (scanner_grants_from_app_info (app_info), scanner_id);
++  g_mutex_unlock (&self->mutex);
++
++  if (!granted)
++    {
++      g_dbus_method_invocation_return_error (invocation, XDG_DESKTOP_PORTAL_ERROR,
++                                             XDG_DESKTOP_PORTAL_ERROR_NOT_ALLOWED,
++                                             "The scanner was not granted to this application");
++      return G_DBUS_METHOD_INVOCATION_HANDLED;
++    }
++
++  /* From here the call is answered with the request, and the outcome comes as a Response. The
++   * request is not locked while the scanner opens, so that Close can reach it meanwhile. */
++  {
++    REQUEST_AUTOLOCK (request);
++
++    xdp_request_export (request, connection);
++  }
++  xdp_dbus_scanner_complete_open_scanner (object, invocation, request->id);
+ 
+-  xdp_dbus_scanner_complete_open_scanner (object, invocation, XDP_SESSION (session)->id);
++  open_scanner_run (self, request, app_info, connection, sender, scanner_id, token_copy);
+ 
+   return G_DBUS_METHOD_INVOCATION_HANDLED;
+ }
+-- 
+2.56.0
+

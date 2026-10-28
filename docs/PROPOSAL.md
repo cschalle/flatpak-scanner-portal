@@ -41,8 +41,8 @@ the same kind of consent question, has none.
 
 - A sandboxed application can scan with no device, network or filesystem access.
 - The user chooses which scanners an application may use, in a dialog. The choice lasts while
-  the application runs, so nothing is stored and there is nothing to revoke; remembering it
-  across runs is a possible later addition (open question 8).
+  the application runs, so nothing is stored and there is nothing to revoke. The choice is not
+  remembered across runs, on purpose (open question 8).
 - libsane and its backends run on the host, so host and proprietary drivers work and the
   host's SANE configuration applies.
 - The API is rich enough for demanding applications: multi-bit-depth, infrared, multi-pass,
@@ -78,32 +78,12 @@ the same kind of consent question, has none.
 
 What v1 leaves out on purpose, in the order it is worth doing. None of them breaks what v1 defines; some add to it.
 
-1. **Persistent grants.** The most important item. In v1 a grant lasts while the application is
-   on the bus, so the user chooses the scanner on every launch. That costs a dialog each time
-   and means the Problem section's "the user cannot see or revoke which applications may scan"
-   is only half answered: closing the application is the only revocation. Phase 2 stores the
-   grant in the permission store, in a `scanner` table keyed by the scanner's id, adds a
-   `remember` option to `SelectScanners`, and gives the user a place in Settings to review and
-   revoke. It needs more than a table and a dialog checkbox:
-
-   - **A stable id.** The id today comes from the USB bus and device number, or the host
-     address, which is right for merging duplicates within a run and wrong for remembering
-     anything: both change when a scanner is replugged, rebooted or given a new DHCP lease. A
-     stored grant needs a key that survives that: for USB the vendor and product id with the
-     serial number, or the port path when there is none, and for a network scanner the name it
-     advertises (the eSCL service name carries a part of the MAC address), not its address.
-   - **The user decides, not the application.** The choice to remember belongs in the dialog,
-     as a switch, so the backend interface gains an answer field and both dialogs change. A
-     `remember` option the application sets would let it decide for the user.
-   - **Settings.** A panel to list and revoke grants, or the permission store's existing one.
-
-2. **Hardware buttons** (scan-to-application). Designed below, in three stages; the first is
-   built.
-3. **A native eSCL and IPP-Scan provider.** In v1 network scanners work through `sane-airscan`,
+1. **Hardware buttons** (scan-to-application). Designed below and built.
+2. **A native eSCL and IPP-Scan provider.** In v1 network scanners work through `sane-airscan`,
    which speaks eSCL, so this adds no scanners that are not reachable today. It would remove the
    dependency on a SANE backend for them and make a provider other than SANE real, which the
    option model is meant to allow.
-4. **The curation table upstream.** The film scanners the portal knows are in
+3. **The curation table upstream.** The film scanners the portal knows are in
    `scanner-devices.json`, which the portal reads from the data directories and again when it
    changes, so a distribution or an administrator can ship a newer list without a new portal.
    What is left is where the list should live: with the portal, or in SANE's own description
@@ -150,32 +130,21 @@ before `button-1` is valid. What is a button, what it is called in the vocabular
 press first and the interval are per backend, in `scanner-devices.json`, in a `buttons` section.
 A backend that is not named there gets no `ButtonEvent`, and `buttons` is empty.
 
-**Stages.**
+**Events in a scan session.** The helper polls between frames and the frontend emits
+`ButtonEvent` on the session that has the scanner open. Nothing new for an application to call.
+There is no way to watch the buttons without holding the scanner, and no launch of an
+application on a press: both would need the portal to know an application across launches, which
+it does not, because grants are not remembered.
 
-1. **Events in a scan session.** The helper polls between frames and the frontend emits
-   `ButtonEvent` on the session that has the scanner open. Nothing new for an application to
-   call. This needs the table section, the polling, the signal and `buttons`.
-2. **Watching without holding the scanner.** `WatchButtons(session, scanner_id)` on a session
-   from `CreateSession`. The portal opens a watcher helper for the scanner. When an application
-   calls `OpenScanner`, the portal closes the watcher and opens it again after that session
-   closes, so the exclusive lock stays honest and `OpenScanner` is never refused by the
-   portal's own watcher.
-3. **Launch on press.** An application registers for a button, for example with a key in its
-   desktop file, and the portal starts it on a press, with a notification that lets the user
-   choose when several qualify. This depends on persistent grants, since the portal must know
-   the application and the scanner across launches.
-
-**Who gets a press.** All the sessions watching the scanner. The first `OpenScanner` wins and the
-others get `Busy`. The portal cannot know which window has focus on Wayland, so it does not guess.
-A notification that asks is the later refinement. A press goes only to an application that was
-granted the scanner; it tells it nothing a scan would not.
+**Who gets a press.** The session that has the scanner open, which is one at a time because the
+lock is exclusive. A press goes only to an application that was granted the scanner; it tells it
+nothing a scan would not.
 
 **Rejected.** Leaving it to applications is the fallback above, not the design. Depending on
 `scanbd` is not an option for a portal: it is not installed by default, it has its own
 configuration, and it fights the portal over who opens the device.
 
-**Open.** Whether to send to all watchers or only to the newest. Whether the vocabulary is
-enough; `extra` and the raw option name cover the odd cases. Who keeps the per-backend table: it
+**Open.** Whether the vocabulary is enough; `extra` and the raw option name cover the odd cases. Who keeps the per-backend table: it
 is in the same file as the film scanners. A host tool that holds the device, such as `scanbd`,
 will conflict with the portal, which the documentation should say.
 
@@ -218,7 +187,7 @@ Consent and enumeration:
 | Member | Purpose |
 |---|---|
 | `SelectScanners(parent_window, options) → Request` | Shows the dialog and records the grant for the application's connection. Called on a user action, or when `ListScanners` comes back empty, which is the case on every start while grants are not remembered. `options` can ask for `multiple` and filter on `required_capabilities` (all of them) or `any_capabilities` (at least one of them), from `film`, `adf`, `infrared`, `flatbed`, `color`. |
-| `ListScanners(options) → a(sa{sv})` | The granted, currently available scanners. Each is an opaque id plus `name`, `vendor`, `model`, `backend`, `kind`, `type`, `capabilities`, `available`. |
+| `ListScanners(options) → a(sa{sv})` | The granted, currently available scanners. Each is an opaque id plus `name`, `vendor`, `model`, `backend`, `kind`, `type` (`scanner`, `film`, `camera` or `virtual`), `capabilities`, `buttons`, `available`. |
 | `CreateSession(options) → Session` | A monitoring session, needed only for `ScannerEvents`. |
 | `ScannerEvents(session, a(ssa{sv}))` | `add`, `change` or `remove` for granted scanners only. |
 
@@ -226,7 +195,7 @@ Scanning, on a `Session` from `OpenScanner`:
 
 | Member | Purpose |
 |---|---|
-| `OpenScanner(scanner_id, options) → Session` | Opens a granted scanner and takes the host's exclusive lock. Can take tens of seconds: lamp warm-up and calibration, and on a network scanner 16 to 25 s in testing, which is at D-Bus's default 25 s call timeout (open question 11). Closing the session, or leaving the bus, cancels any scan and releases the scanner. |
+| `OpenScanner(scanner_id, options) → Request` | Opens a granted scanner and takes the host's exclusive lock. It is a request, answered at once: opening can take tens of seconds, lamp warm-up and calibration, and on a network scanner 16 to 25 s in testing, at D-Bus's default 25 s call timeout. The `Response` carries `session_handle`, or, with response code 2, `error` (`busy` or `failed`) and `message`. Closing the request gives up, and no `Response` follows. Closing the session, or leaving the bus, cancels any scan and releases the scanner. |
 | `GetOptions(session, options) → aa{sv}` | SANE-shaped option descriptors in backend order: `name`, `title`, `description`, `type`, `unit`, `size`, `constraint`, `capabilities`. |
 | `GetOptionValues(session, options) → a{sv}` | The current value of every readable, active option. |
 | `SetOptions(session, a(sv), options) → applied, flags` | Sets options **in array order**. Returns what each option ended up with, and flags `inexact`, `reload-options`, `reload-params`. |
@@ -240,7 +209,7 @@ A typical exchange:
 ```
 SelectScanners()                     once, on a user action
 ListScanners()                       → [(id, {name: "Plustek OpticFilm 8200i", …})]
-OpenScanner(id)                      → session
+OpenScanner(id)                      → request; Response gives the session
 GetOptions(session)                  → descriptors
 SetOptions(session, [("mode","Color"), ("resolution",3600)])
 loop:
@@ -272,7 +241,7 @@ memory for as long as the application stays on the bus; nothing is written to di
 | A frame number on every `FrameEvent` | A client that cancels a frame and immediately starts another must be able to tell the old frame's trailing events from the new frame's. A per-session counter, and the rule that a frame ends with exactly one non-`started` event, let it discard anything not newer than the last frame it saw end. Without it every client reimplements a drain-and-wait by hand. |
 | Automatic values as the vardict `{'auto': <true>}` | SANE has `SANE_ACTION_SET_AUTO` and real applications use it, for example to let the scanner pick the source. D-Bus has no empty structure, so a vardict stands in for the "no value" marker, and leaves room for further per-option modifiers. |
 | `backend` in the scanner info | The scanner id is opaque, so applications cannot match device quirks on it — and device quirks are unavoidable in practice. The driver name has to be exposed on purpose. |
-| `type` in the scanner info, alongside `kind` | Applications hide devices that are not scanners (webcams through `v4l`) and rank by device type. `kind`, the connection, cannot express that. SANE's own type string can, as an untranslated hint, never as an identifier. |
+| `type` in the scanner info, alongside `kind`, in the portal's own words | Applications hide devices that are not scanners (webcams through `v4l`, SANE's `test` backend). `kind`, the connection, cannot express that. SANE's own type string can, but it differs between drivers, is free text and can hold an address (`ip=192.0.2.10` for `airscan`), so the portal says `scanner`, `film`, `camera` or `virtual` and keeps the driver's string out. |
 | `GetFrameParameters` as an estimate | SANE allows `sane_get_parameters` before `sane_start` and applications use it to size buffers and previews. Without it a client cannot know the frame size until data is already flowing. |
 | `org.freedesktop.DBus.Error.AccessDenied` for a session that is not the caller's, closed or unknown | The other portals that have sessions answer this way, and it does not tell an application whether the session exists for someone else. `NotAllowed` stays for a scanner that was not granted, which is a decision of the user's. |
 | A dedicated `Busy` error | A locked scanner, a frame in progress and an option set during a frame are ordinary, expected conditions that an application must handle differently from a real failure. Folding them into `Failed` forces clients to guess from the message. |
@@ -280,7 +249,7 @@ memory for as long as the application stays on the bus; nothing is written to di
 | The application sees only granted scanners | Enumerating the LAN's scanners is a fingerprinting and privacy problem, and not something an application needs before the user has chosen anything. |
 | A `Session` for an open scanner | Lifecycle comes for free: the application exiting releases the hardware lock, and the portal can revoke access with `Session.Closed`. |
 | No per-scan prompt once granted | An application with a grant can scan only what is on the glass or in the feeder, and the dialog names the scanner, so one choice per run of the application is proportionate. It is not true that a scan cannot happen unnoticed: a page left in the scanner can be read. The exposure is small, and a prompt for every scan would make the scanning applications unusable. Open to argument if reviewers disagree. |
-| Grants last for the application's run and are kept in memory | The print portal asks every time and keeps nothing, and scanning is an occasional, deliberate act like printing, so a dialog at the start of a scanning session is the expected cost. It removes the permission table, a revocation path and a settings panel from v1, and the user's only revocation is to close the application. Remembering the choice is the first item of phase 2 and does not change the API; see open question 8. |
+| Grants last for the application's run and are kept in memory | The print portal asks every time and keeps nothing, and scanning is an occasional, deliberate act like printing, so a dialog at the start of a scanning session is the expected cost. It removes the permission table, a revocation path and a settings panel from v1, and the user's only revocation is to close the application. The choice is not remembered across runs; see open question 8. |
 | The backend does UI only | Same split as `org.freedesktop.impl.portal.Usb`, and it keeps libsane out of the desktop shell's process as well as out of the frontend's. |
 
 ## Security and privacy
@@ -369,13 +338,13 @@ instant, and any provider other than SANE.
    `--talk-name=org.freedesktop.portal.Desktop`, which they already have, should cover it,
    and `--device=all` can then be dropped. This has not been tested against the real
    frontend.
-8. **Remember the choice?** This proposal follows the print portal: the dialog is shown when
-   the application first needs a scanner, and the choice lasts until the application exits.
-   The USB portal stores grants in the permission store, where they are revocable. Storing
-   them costs a permission table, a revocation path and a place in Settings to review them;
-   not storing them costs a dialog on every launch of a scanning application. If reviewers
-   want persistence it can be added as a `remember` option on `SelectScanners` and a
-   `scanner` table, without changing anything else. Which does upstream prefer?
+8. **Remember the choice?** No. This proposal follows the print portal: the dialog is shown when
+   the application first needs a scanner, and the choice lasts until the application exits. The
+   USB portal stores grants in the permission store, where they are revocable; doing that here
+   would cost a permission table, a stable scanner id, a revocation path and a place in Settings,
+   and the cost it saves is one dialog on the launch of a scanning application. We do not plan
+   to add it. If upstream reviewers want it, it could be added as a `remember` option answered
+   in the dialog, without changing anything else.
 9. **Settings in the dialog.** Print's dialog also collects settings. This one only chooses
    devices, because film and document scanning need the application's own option UI. A
    simple resolution, mode and source step, for applications that have no UI of their own,
@@ -384,22 +353,22 @@ instant, and any provider other than SANE.
    8200i is one — still need the USB portal and bundled backends. Worth saying so explicitly
    in the documentation.
 
-11. **How long may `OpenScanner` take?** On the 8200i it is quick, but on a network scanner
-    through `airscan` it took 16 and 25 s, and D-Bus's default call timeout is 25 s, so a
-    client that keeps the default can fail on a scanner that would have opened. Either the
-    documentation tells clients to use a long timeout for this one call, or `OpenScanner`
-    becomes a request, answered with a `Response` that carries the session handle, as the
-    portals that create sessions upstream (ScreenCast, GlobalShortcuts) do. The second fits
-    the existing pattern and lets an application show progress, and costs a round trip and
-    one more signal to handle; it is the recommendation, and has not been prototyped.
-12. **What is `type`?** It is the backend's own device type string, passed through, and it
-    is whatever the backend puts there: `film scanner`, `virtual device`, and for `airscan`
-    the scanner's address, `ip=192.0.2.10`. Applications use it to hide devices that are
-    not scanners, and Simple Scan hides `virtual device`. An application that was granted the
-    scanner sees the address, which is probably acceptable, but should be a choice. Either
-    the documentation says that `type` is a backend-defined hint that can contain an address
-    and must not be parsed beyond that, or the portal reports its own small vocabulary
-    (`virtual`, `scanner`, `camera`) and keeps the raw string out.
+11. **How long may `OpenScanner` take?** Settled: it is a request. On the 8200i it is quick, but
+    on a network scanner through `airscan` it took 16 and 25 s, and D-Bus's default call timeout
+    is 25 s, so a client that kept the default could fail on a scanner that would have opened.
+    `OpenScanner` now returns a `Request` and answers with a `Response` that carries the session
+    handle, as the portals that create sessions upstream (ScreenCast, GlobalShortcuts) do, and an
+    application can show progress while it waits. It costs a round trip and one signal to handle.
+    The portal, Simple Scan, Negative Vibes and the test double all use it, and the scenarios
+    check that the call returns before the scanner is open and that closing the request gives no
+    `Response` and lets the scanner go. Still open: whether the `Response` should carry progress.
+12. **What is `type`?** Settled: the portal's own small vocabulary. SANE's device string is
+    whatever the backend puts there (`film scanner`, `virtual device`, and for `airscan` the
+    scanner's address, `ip=192.0.2.10`), which an application that was granted the scanner would
+    see. The portal now reports `scanner`, `film` (a scanner only for film), `camera` or `virtual`,
+    worked out from the driver's string and the capabilities, and keeps the raw string out. The
+    portal leaves cameras out of its lists itself, so `camera` is for a future driver. Simple Scan
+    and Negative Vibes hide `virtual`.
 13. **Where do `capabilities` come from?** Not from SANE, whose device type says little and
     differs between drivers: one calls a Plustek OpticFilm a film scanner and another a flatbed,
     and `airscan` gives its address. The frontend keeps a list of the scanners that are for
@@ -416,12 +385,27 @@ instant, and any provider other than SANE.
 14. **The same scanner twice.** A network printer is found by an eSCL driver and by the vendor's,
     and a USB scanner by more than one backend. The helper reports which physical scanner a
     device is (the USB bus address, or the host of a network scanner), and the frontend gives
-    those one id, offers the dialog one entry and keeps the drivers in rank order, `airscan`
-    and `escl` before the others and HPLIP's `hpaio` last. `OpenScanner` tries them in turn, so
-    a driver that cannot open the scanner, which HPLIP does for a printer that only speaks eSCL,
-    is not the end of it. Scanners found only through SANE's `net` driver are not merged, since
-    the host may serve several. Open: the ranking is a guess made from the drivers seen so far,
-    and a USB scanner is only matched by its bus address while the helper is listing it.
+    those one id, offers the dialog one entry and keeps the drivers in order, `airscan` and `escl`
+    before the others and HPLIP's `hpaio` last. Three rules came out of the 8200i SE, which both
+    `genesys` and `plustek8200i` find. They ranked the same, the order of the search decided,
+    and `genesys` won: it does not report the scanner's buttons, and opening the scanner through
+    it is the likely reason the buttons went silent until a power cycle (see
+    `docs/HARDWARE-TEST.md`).
+    - **Ties are settled by the driver's name,** never by which driver answered first.
+    - **A table entry can name a driver** (`"driver": "plustek8200i"`), which then opens the
+      scanner before any other that found it, whatever the ranks. This is where a known problem
+      scanner is fixed, at its description and not in the global ranks. The scanner info's
+      `backend` is that of the driver that will open it, also in the answer to
+      `SelectScanners`.
+    - **A second driver is tried only when the first says it does not drive the scanner**
+      (SANE's `INVAL` or `UNSUPPORTED`), the way HPLIP does for a printer that only speaks eSCL.
+      Not after a busy scanner, which another driver would only meet too, and not after an I/O
+      error: the driver may have talked to the device, and a second one on a device in an
+      unknown state is how a scanner gets reset.
+
+    Scanners found only through SANE's `net` driver are not merged, since the host may serve
+    several. Open: a USB scanner is only matched by its bus address while the helper is listing
+    it, so a name from before a power cycle is stale; the portal treats ids as opaque and per run.
 
 ## Upstreaming plan
 

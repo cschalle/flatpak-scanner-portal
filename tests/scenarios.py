@@ -23,7 +23,7 @@ def main():
     sid = scanners[0][0]
     info = scanners[0][1]
     check("scanner info names the SANE backend", info.get("backend") == "test", info)
-    check("scanner info carries SANE's device type", info.get("type") == "virtual device", info)
+    check("scanner info carries the portal's device type, not SANE's", info.get("type") == "virtual", info)
 
     # ---- scanners found after the dialog is shown. The runner's helper wrapper makes the listing
     # take two seconds while this file exists; the call must still return at once, with the
@@ -68,7 +68,7 @@ def main():
     docs.bus.close_sync(None)
 
     # ---- permissions
-    check("OpenScanner on a scanner that was never granted is NotAllowed", (c.error("OpenScanner", ("deadbeef", {}), "(sa{sv})") or "").endswith("Error.NotAllowed"))
+    check("OpenScanner on a scanner that was never granted is NotAllowed", (c.open_error("deadbeef") or "").endswith("Error.NotAllowed"))
     bad_token = c.error("SelectScanners", ("", {"handle_token": v("s", "has space")}), "(sa{sv})")
     check("invalid handle_token is InvalidArgument", (bad_token or "").endswith("Error.InvalidArgument"), bad_token)
 
@@ -76,7 +76,7 @@ def main():
     check("session path follows the portal convention", sess == f"{PATH}/session/{c.me[1:].replace('.', '_')}/s1", sess)
 
     # ---- exclusive lock
-    check("a second open of the same scanner is Busy (lock)", (c.error("OpenScanner", (sid, {}), "(sa{sv})") or "").endswith("Error.Busy"))
+    check("a second open of the same scanner is Busy (lock)", (c.open_error(sid) or "").endswith("Error.Busy"))
 
     # ---- a different app cannot use our session
     other = Client()
@@ -181,7 +181,7 @@ def main():
     check("after Close the scanner can be opened again", bool(sess))
     ghost = Client()
     ghost.select()
-    gsess_err = ghost.error("OpenScanner", (sid, {}), "(sa{sv})")
+    gsess_err = ghost.open_error(sid)
     check("scanner is held while c has it open (Busy)", (gsess_err or "").endswith("Error.Busy"), gsess_err)
     c.call("Close", (), "()", iface="org.freedesktop.portal.Session", path=sess)
     # An app that leaves while its OpenScanner is still running. The runner's helper wrapper
@@ -206,6 +206,23 @@ def main():
         else:
             check("a scanner is free after its app left during OpenScanner", True)
             c.call("Close", (), "()", iface="org.freedesktop.portal.Session", path=path)
+    if slow:
+        # The call is answered at once and the Response comes when the scanner is open
+        open(slow, "w").close()
+        try:
+            t0 = time.time()
+            code, results = c.open_response(sid, "slow1")
+            took = time.time() - t0
+            check("OpenScanner answers the call at once, and the Response comes when the scanner is open",
+                  code == 0 and c.last_open_call_seconds < 1.0 and took >= 1.5, (code, c.last_open_call_seconds, took))
+            c.call("Close", (), "()", iface="org.freedesktop.portal.Session", path=results["session_handle"])
+            # Closing the request before it answers: no Response, and the scanner is let go
+            gone = c.open_response(sid, "slow2", cancel_after=0.5)
+            check("closing an OpenScanner request gives no Response", gone is None, gone)
+        finally:
+            os.unlink(slow)
+        again = c.open_error(sid)
+        check("the scanner is free after its OpenScanner request was closed", again is None, again)
     gs = ghost.open(sid, "g1")
     ghost.bus.close_sync(None)
     time.sleep(1.0)

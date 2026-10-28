@@ -105,6 +105,33 @@ the installed `plustek8200i` 0.1.28 driver: 23 passed, 0 failed, 0 warnings. Tha
 starts the frontend with its helper and a stand-in for the dialog that grants the scanner
 without asking, and `--dry-run` works with it too.
 
+### The 8200i SE and `genesys` (2026-10-27)
+
+libsane finds the 8200i SE (USB `07b3:1825`) twice with the system configuration: through
+`plustek8200i`, and through the stock `genesys` backend. Both ranked the same in the portal's
+table, so the order of the drivers decided, and `genesys` won. Three things were seen:
+
+- `genesys` does not report the scanner's IntelliScan and QuickScan buttons. Through it
+  `nv-cli buttons` printed nothing.
+- Twice the buttons then stopped working for every driver. A direct libsane probe of the two
+  sensor options read 340 and then 514 times with no press, and `usbmon` showed 257 polls of the
+  interrupt endpoint 0x83 in 45 seconds that all timed out with no data. The scanner sent nothing
+  while its buttons were pressed. A power cycle (USB and mains, about 10 seconds) brought the
+  buttons back each time, and the same probe then read the presses.
+- The stall came after the portal had opened the scanner through `genesys`. That is a pattern
+  seen twice, not a cause that has been shown, but it fits the reset on 2026-10-16.
+
+The portal's table now ranks `plustek8200i` above `genesys` (`driver_ranks`) and names it for this
+scanner (`"driver": "plustek8200i"` in its entry), so the portal opens it with `plustek8200i`. Ties
+between drivers are settled by name, and a second driver is tried only when the first says it does
+not drive the scanner, not after an I/O error. After that, 23 and then 24 presses in 40 seconds were reported
+through the portal, each correctly named, and the scanner stayed responsive through listing,
+choosing and opening. An application that uses libsane directly with the system configuration is
+not helped by this: it can still open the `genesys` entry. If the buttons are silent, power cycle
+the scanner first, and check that the helper was started with `plustek8200i:` and not
+`genesys:`; its arguments are in `ps`. The scanner's USB address changes after a power cycle, so a
+device name from before it is stale.
+
 ## From the Flatpak sandbox
 
 `build-aux/io.github.cschalle.NegativeVibes.PortalTest.json` builds the app with `-Dportal=true`

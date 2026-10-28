@@ -70,12 +70,48 @@ class Client:
         code, results = got[0]
         return code, results
 
-    def open(self, sid, token=None):
-        o = {}
+    def open_response(self, sid, token=None, timeout=65, cancel_after=None):
+        """OpenScanner is a request: returns (response code, results), or raises GLib.Error if the
+        call itself is refused (NotAllowed)."""
+        self.n += 1
+        handle_token = f"open{self.n}"
+        sig_path = f"{PATH}/request/{self.me[1:].replace('.', '_')}/{handle_token}"
+        got = []
+        sub = self.bus.signal_subscribe(NAME, "org.freedesktop.portal.Request", "Response", sig_path, None, Gio.DBusSignalFlags.NONE, lambda *a: got.append(a[-1].unpack()))
+        o = {"handle_token": GLib.Variant("s", handle_token)}
         if token:
             o["session_handle_token"] = GLib.Variant("s", token)
-        (path,) = self.call("OpenScanner", (sid, o), "(sa{sv})")
-        return path
+        try:
+            t0 = time.time()
+            (handle,) = self.call("OpenScanner", (sid, o), "(sa{sv})")
+            self.last_open_call_seconds = time.time() - t0
+            if cancel_after is not None:
+                # Give up on the request: no Response follows, and what was opened is let go
+                self.pump(lambda: got, cancel_after)
+                self.call("Close", (), "()", iface="org.freedesktop.portal.Request", path=handle)
+                self.pump(lambda: False, 4)
+                return got[0] if got else None
+            self.pump(lambda: got, timeout)
+        finally:
+            self.bus.signal_unsubscribe(sub)
+        return got[0]
+
+    def open(self, sid, token=None):
+        code, results = self.open_response(sid, token)
+        if code != 0:
+            raise GLib.Error(f"{results.get('error')}: {results.get('message')}")
+        return results["session_handle"]
+
+    def open_error(self, sid, token=None):
+        """The name of the error OpenScanner gives, as a D-Bus error would be named, or None if it opens."""
+        try:
+            code, results = self.open_response(sid, token)
+        except GLib.Error as e:
+            return Gio.DBusError.get_remote_error(e) or str(e)
+        if code == 0:
+            self.call("Close", (), "()", iface="org.freedesktop.portal.Session", path=results["session_handle"])
+            return None
+        return "org.freedesktop.portal.Error." + results.get("error", "failed").capitalize()
 
     def opts(self, sess):
         (d,) = self.call("GetOptions", (sess, {}), "(oa{sv})")

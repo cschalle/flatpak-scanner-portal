@@ -40,7 +40,7 @@ patches:
 
 | Package | `<release>/` | `main/` |
 |---|---|---|
-| xdg-desktop-portal | 1.22.1 (15 patches) | main (15) |
+| xdg-desktop-portal | 1.22.1 (16 patches) | main (16) |
 | xdg-desktop-portal-gnome | 50.0 (4) | main (4) |
 | xdg-desktop-portal-gtk | 1.15.3 (2) | main (2) |
 
@@ -67,7 +67,8 @@ backend. Neither of them touches a real scanner or your session bus.
     NEGATIVE_VIBES_DIR=../negative-vibes tests/run-scenarios.sh
 
 Read `docs/HARDWARE-TEST.md` before `tools/portal-hw-check.sh` is run on a scanner: opening the
-stock `genesys` entry for the 8200i resets it, so the check uses its own SANE configuration.
+stock `genesys` entry for the 8200i resets it, so the check uses its own SANE configuration; the
+same page has what was seen with `genesys` and the scanner's buttons.
 
 ## Git policy
 

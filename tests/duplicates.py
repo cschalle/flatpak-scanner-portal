@@ -13,7 +13,7 @@ def main():
     scanners = results.get("scanners", [])
     names = sorted(s[1]["name"] for s in scanners)
     check("two drivers finding one scanner is one entry, and another scanner is another",
-          code == 0 and len(scanners) == 2, (code, names))
+          code == 0 and len(scanners) == 4, (code, names))
     for s in scanners:
         check("the entry has no address or bookkeeping", "physical" not in s[1] and "usb_id" not in s[1], s[1])
     film = [s for s in scanners if s[1]["name"] == "Fake Film Thing"]
@@ -21,9 +21,11 @@ def main():
           len(film) == 1 and film[0][1]["capabilities"] == ["film", "color"], names)
     others = [s for s in scanners if s not in film]
     check("a scanner it does not name is for documents",
-          len(others) == 1 and others[0][1]["capabilities"] == ["flatbed"], others)
+          len(others) == 3 and all(s[1]["capabilities"] == ["flatbed"] for s in others), others)
+    check("the type is the portal's word, not the driver's",
+          film[0][1]["type"] == "film" and all(s[1]["type"] == "scanner" for s in others), [s[1]["type"] for s in scanners])
     listed = c.call("ListScanners", ({},), "(a{sv})")[0]
-    check("ListScanners lists them the same", len(listed) == 2, listed)
+    check("ListScanners lists them the same", len(listed) == 4, listed)
 
     # An entry of the file that has nothing to match on is ignored, not taken for everything
     check("an unusable entry of the file does not apply to every scanner",
@@ -34,8 +36,22 @@ def main():
     check("it opens through the second driver, as the first cannot", bool(sess), sess)
     check("... and works", len(c.opts(sess)) > 0)
 
-    other = c.error("OpenScanner", ([s for s in scanners if s is not copier[0]][0][0], {}), "(sa{sv})")
+    other = c.open_error(film[0][0])
     check("a scanner with only the failing driver does not open", other is not None, other)
+
+    # Two drivers of equal rank: the one whose name sorts first, however the search went. A table
+    # entry that names a driver puts it first. An I/O error is not an answer to try another on.
+    import os
+    log = os.environ["OPEN_LOG"]
+    tie = [s for s in scanners if s[1]["name"] == "Fake Tie Pair"][0]
+    pinned = [s for s in scanners if s[1]["name"] == "Fake Pinned Pair"][0]
+    check("a tie between drivers is settled by name", tie[1]["backend"] == "fakey", tie[1]["backend"])
+    check("the table's driver comes first, whatever the others rank", pinned[1]["backend"] == "fakez", pinned[1]["backend"])
+    open(log, "w").close()
+    c.open_error(tie[0])
+    c.open_error(pinned[0])
+    tried = open(log).read().split()
+    check("the first driver is tried, and after an I/O error not another", tried == ["fakey:tie", "fakez:pin"], tried)
     c.bus.close_sync(None)
 
     if failures:

@@ -143,11 +143,13 @@
 
         * ``type`` (``s``)
 
-          The backend's own device type, as SANE reports it, such as
-          ``flatbed scanner``, ``film scanner``, ``video camera`` or
-          ``virtual device``. It is untranslated and free text: use it to
-          hide devices that are not scanners or to rank them, like
-          ``capabilities`` as a hint, and never to identify a model.
+          What the device is, in the portal's words: ``scanner``, ``film``
+          for a scanner that is only for film, ``camera`` or ``virtual`` for
+          what is not a scanner at all. Use it to hide devices that are not
+          scanners. It is not the driver's own device type, which differs
+          between drivers and can hold an address; ``capabilities`` says
+          what a scanner can do. The portal leaves cameras out of its lists
+          itself, so ``camera`` is for a future driver.
 
         * ``capabilities`` (``as``)
 
@@ -217,7 +219,7 @@
         OpenScanner:
         @scanner_id: A scanner id granted to the application
         @options: Vardict with optional further information
-        @session_handle: Object path for the :ref:`org.freedesktop.portal.Session` of the open scanner
+        @handle: Object path for the :ref:`org.freedesktop.portal.Request` object representing this call
 
         Supported keys in the @options vardict:
 
@@ -229,10 +231,34 @@
           token is already taken.
 
         Opens a granted scanner and takes the host's exclusive lock on it.
-        Fails with ``org.freedesktop.portal.Error.NotAllowed`` if the id was
-        not granted, ``org.freedesktop.portal.Error.Busy`` if it is
-        busy, and ``org.freedesktop.portal.Error.Failed`` if it is gone. May
-        take several seconds (lamp warm-up, calibration).
+        Opening can take a long time: seconds for a scanner on USB (lamp
+        warm-up, calibration), and on a network scanner through ``airscan``
+        more than D-Bus's default call timeout of 25 seconds. The call is
+        therefore a request: it returns at once, and the outcome comes as a
+        Response. The call itself fails with
+        ``org.freedesktop.portal.Error.NotAllowed`` if the id was not
+        granted. Close the request to give up; no Response follows.
+
+        The following results get returned via the :ref:`org.freedesktop.portal.Request::Response` signal:
+
+        * ``session_handle`` (``s``)
+
+          Present on success: the object path for the
+          :ref:`org.freedesktop.portal.Session` of the open scanner, which is
+          the handle of every call that follows. It is a string, as it is in
+          the other portals that make a session in a request.
+
+        On failure the response code is 2, and the results have:
+
+        * ``error`` (``s``)
+
+          ``busy`` if another application, or another session, has the
+          scanner, and ``failed`` if it is gone or could not be opened.
+
+        * ``message`` (``s``)
+
+          Text for a log. It is not for the user.
+
         Closing the session (Session.Close, or the application leaving the
         bus) cancels any scan and releases the scanner. The portal emits
         Session.Closed if access is revoked.
@@ -241,7 +267,7 @@
       <arg type="s" name="scanner_id" direction="in"/>
       <annotation name="org.qtproject.QtDBus.QtTypeName.In1" value="QVariantMap"/>
       <arg type="a{sv}" name="options" direction="in"/>
-      <arg type="o" name="session_handle" direction="out"/>
+      <arg type="o" name="handle" direction="out"/>
     </method>
 
     <!--

@@ -17,7 +17,7 @@ export XDP_BUILD here root PYTHONUNBUFFERED=1
 exec dbus-run-session -- bash -c '
   tmp=$(mktemp -d)
   mkdir "$tmp/portals" "$tmp/sane"
-  printf "fakea\nhpaio\ntest\n" > "$tmp/sane/dll.conf"
+  printf "fakea\nhpaio\nfakez\nfakey\ntest\n" > "$tmp/sane/dll.conf"
   cat > "$tmp/portals/nvtest.portal" <<PORTAL
 [portal]
 DBusName=org.freedesktop.impl.portal.desktop.nvtest
@@ -32,7 +32,8 @@ PORTAL
   "version": 1,
   "scanners": [
     { "capabilities": ["adf"] },
-    { "model_contains": "other", "name": "Fake Film Thing", "capabilities": ["film", "color"] }
+    { "model_contains": "other", "name": "Fake Film Thing", "capabilities": ["film", "color"] },
+    { "model_contains": "pinned", "driver": "fakez", "capabilities": ["flatbed"] }
   ],
   "driver_ranks": { "_comment": "not a number", "fakea": 0, "hpaio": 8 }
 }
@@ -45,6 +46,7 @@ JSON
   for XDP_BIN in "$XDP_BUILD/desktop-portal" "$XDP_BUILD/src"; do [ -x "$XDP_BIN/xdg-desktop-portal" ] && break; done
   export REAL_HELPER="$XDP_BIN/xdg-desktop-portal-scanner-helper"
   export XDP_SCANNER_HELPER=$here/duplicates-helper.py
+  export OPEN_LOG=$tmp/opened.log
   export PORTAL_NAME=org.freedesktop.portal.Desktop
   python3 "$here/impl_auto_grant.py" org.freedesktop.impl.portal.desktop.nvtest \
       "$root/docs/org.freedesktop.impl.portal.Scanner.xml" > "$tmp/backend.log" 2>&1 &
