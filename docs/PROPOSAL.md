@@ -185,7 +185,7 @@ Scanning, on a `Session` from `OpenScanner`:
 
 | Member | Purpose |
 |---|---|
-| `OpenScanner(scanner_id, options) → Request` | Opens a granted scanner and takes the host's exclusive lock. It is a request, answered at once: opening can take tens of seconds, lamp warm-up and calibration, and on a network scanner 16 to 25 s in testing, at D-Bus's default 25 s call timeout. The `Response` carries `session_handle`, or, with response code 2, `error` (`busy` or `failed`) and `message`. Closing the request gives up, and no `Response` follows. Closing the session, or leaving the bus, cancels any scan and releases the scanner. |
+| `OpenScanner(scanner_id, options) → Request` | Opens a granted scanner and takes the host's exclusive lock. It is a request, answered at once: opening can take tens of seconds, lamp warm-up and calibration, and on a network scanner 16 to 25 s in testing, at D-Bus's default 25 s call timeout. The `Response` carries `session_handle`, or, with response code 2, `error` (`busy` or `failed`) and `message`. Closing the request gives up, and no `Response` follows. Closing the session, or leaving the bus, cancels any scan and releases the scanner. An application that leaves the bus while the scanner is still opening does not keep it locked: the portal checks that the caller is still there once the helper is up, and if not closes the session and gives up. |
 | `GetOptions(session, options) → aa{sv}` | SANE-shaped option descriptors in backend order: `name`, `title`, `description`, `type`, `unit`, `size`, `constraint`, `capabilities`. |
 | `GetOptionValues(session, options) → a{sv}` | The current value of every readable, active option. |
 | `SetOptions(session, a(sv), options) → applied, flags` | Sets options **in array order**. Returns what each option ended up with, and flags `inexact`, `reload-options`, `reload-params`. |
@@ -216,9 +216,13 @@ An application detects the portal by checking for the `version` property of
 `org.freedesktop.portal.Scanner` on `org.freedesktop.portal.Desktop`, and falls back to
 libsane when it is absent.
 
-The backend interface has a single method, `SelectScanners`, which receives the scanner list
-the frontend assembled and returns the ids the user picked. The frontend keeps the grant in
-memory for as long as the application stays on the bus; nothing is written to disk.
+The backend interface has two methods. `SelectScanners` receives the scanner list the frontend
+assembled and returns the ids the user picked. Searching can take seconds, since a network driver
+waits on the network, so the frontend shows the dialog after at most 300 ms with what has been
+found, sets `searching` in the options, and sends the rest with `UpdateScanners` as the drivers
+answer; the last call says the search is over. Only scanners that were offered to the dialog can be
+granted. The frontend keeps the grant in memory for as long as the application stays on the bus;
+nothing is written to disk.
 
 ## Decisions and why
 
@@ -302,7 +306,7 @@ against it from inside a Flatpak with neither `--device=all` nor `--share=networ
 
 | Checked | How | Result |
 |---|---|---|
-| Interface behaviour | 53 scenario checks on a private bus, against SANE's `test` backend, with the frontend in C | Pass: grants, opaque ids, the exclusive lock, other applications refused on someone else's session, option errors, option order, automatic values, frame numbers, `Cancel()`, closing the pipe early, release when the application leaves the bus, hand scanner (`lines` = -1), `no-documents` from an empty feeder, the `type` vocabulary, `OpenScanner` answering at once and giving no `Response` when its request is closed. The Rust prototype passes all but one, which is a limit of its test double (it keeps grants for all applications, not each) |
+| Interface behaviour | 53 scenario checks on a private bus, against SANE's `test` backend, with the frontend in C | Pass: grants, opaque ids, the exclusive lock, an application that leaves during `OpenScanner` not leaving the scanner locked, other applications refused on someone else's session, option errors, option order, automatic values, frame numbers, `Cancel()`, closing the pipe early, release when the application leaves the bus, hand scanner (`lines` = -1), `no-documents` from an empty feeder, the `type` vocabulary, `OpenScanner` answering at once and giving no `Response` when its request is closed. The Rust prototype passes all but one, which is a limit of its test double (it keeps grants for all applications, not each) |
 | Drivers and curation | `tests/duplicates.py` with fake drivers, with the frontend in C | Pass: one scanner found by two drivers is one entry, the table names capabilities and an unusable entry applies to nothing, ties between drivers go by name, the driver a table entry names comes first and describes the scanner, a driver that does not drive the scanner is followed by the next, an I/O error is not |
 | Hardware buttons | `tests/buttons.py` with a fake backend, and the 8200i | Pass: a press is one event, a held button is one press, two buttons are told apart, a latch is read once, a button down when the session opened is not a press. On the 8200i 23 and 24 presses in 40 s of QuickScan and IntelliScan were reported through the portal, each under the right name, and Negative Vibes scanned and previewed from the buttons. The scanner went silent twice after it had been opened through `genesys`, which a power cycle cured; see `docs/HARDWARE-TEST.md` |
 | Pixel data correctness | Prototype client output compared with `scanimage` | Byte for byte identical for grayscale, 8-bit RGB, 16-bit RGB and three-pass red/green/blue |
@@ -310,7 +314,7 @@ against it from inside a Flatpak with neither `--device=all` nor `--share=networ
 | Real hardware | Plustek OpticFilm 8200i film scanner, 23 checks | Pass, including colour plus infrared, two numbered frames in one session, and cancel then rescan; colour, infrared, repeat and cancel match libsane within sensor noise |
 | Flatpak sandbox | Scenarios and a GTK application, no `--device=all`, no network | Pass: preview and raw scan on the 8200i, so fd passing and signals work through the Flatpak D-Bus proxy |
 | A second, independent application | GNOME Simple Scan ported to the draft | Scanned from the sandbox on the 8200i, was cancelled mid-frame and scanned again in the same session; the device arrived as a film scanner, and the application hid it itself |
-| The dialog | A libadwaita implementation of `org.freedesktop.impl.portal.Scanner` for xdg-desktop-portal-gnome, called directly with made-up scanners on a private bus on a Wayland session | Pass: select returns the chosen id, Escape and Cancel answer "cancelled" with no results, `Request.Close` destroys the window without an answer; unavailable scanners are shown and cannot be chosen; the application's title shows as secondary text under the heading the portal writes |
+| The dialog | A libadwaita implementation of `org.freedesktop.impl.portal.Scanner` for xdg-desktop-portal-gnome, called directly with made-up scanners on a private bus on a Wayland session | Pass: select returns the chosen id, Escape and Cancel answer "cancelled" with no results, `Request.Close` destroys the window without an answer; unavailable scanners are shown and cannot be chosen; the application's title shows as secondary text under the heading the portal writes. Shown before the search is over: with the system's SANE configuration the dialog is up after 0.30 s where a full listing took about 6 s, scanners found later are added to it, and it says "Searching for Scanners…" until the search ends, not "No Scanners Found" |
 | The frontend in C, in xdg-desktop-portal | The frontend, a helper process that holds libsane, and the dialog above, on a private bus: both applications, the SANE `test` backend, the 8200i and a network scanner | Pass for the grant and the dialog, `OpenScanner` with the exclusive lock and `Busy`, options, `auto`, `StartFrame` with the pipe, frame events and numbers, `Cancel`, closing the pipe early, the helper killed in the middle of a frame (the pipe ends and the application gets `Session.Closed`) and the application leaving in the middle of a frame, checked with scripted clients against the `test` backend. Negative Vibes scanned and rescanned after a stop on the 8200i; Simple Scan, from its Flatpak sandbox, scanned on the 8200i and on an HP Color LaserJet MFP M283cdw through the `airscan` backend. The stop on the 8200i was confirmed by hand, and Simple Scan has no cancel button. The 23 hardware checks (`tools/portal-hw-check.sh --frontend c`) also passed on the 8200i with the frontend in C: colour and infrared scans against `scanimage`, a repeat scan, progress, and a cancel at 30% followed by a rescan |
 
 The second application is what produced the frame numbers, the automatic values, the `type`
@@ -324,6 +328,7 @@ instant, buttons on any scanner but the 8200i (the `genesys` and Pixma entries o
 particular), and any provider other than SANE.
 
 ## Open questions
+
 1. **Is `Busy` an acceptable error name?** `org.freedesktop.portal.Error.Busy` is not in
    xdg-desktop-portal's existing error set, and the condition is real and common. Add it, or
    use another name?
