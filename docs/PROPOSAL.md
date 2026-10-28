@@ -3,10 +3,12 @@
 A proposal for a scanner portal in xdg-desktop-portal, so that sandboxed applications can
 scan without bundling drivers or holding `--device=all`.
 
-Status: draft for review. The interfaces below are implemented by a prototype service and
-have been driven by two applications, on real hardware and from inside a Flatpak sandbox.
-Nothing is final; the open questions in the last section are the parts that most need a
-decision from upstream.
+Status: draft for review. The interfaces below are implemented in C for xdg-desktop-portal (as
+patches for 1.22.1 and for main, with a helper process that holds libsane, and dialogs for
+xdg-desktop-portal-gnome and -gtk), and by a prototype service in Rust. Two applications, Simple
+Scan and Negative Vibes, use them on real hardware and from inside a Flatpak sandbox. Nothing is
+final; the open questions in the last section are the parts that most need a decision from
+upstream.
 
 Scope of v1: scanners driven by SANE. eSCL and IPP-Scan providers are not part of v1, but
 the option model is deliberately abstract enough to be fed by one later.
@@ -51,8 +53,8 @@ the same kind of consent question, has none.
   needs no special cases.
 - One entry per physical scanner, with capabilities the portal sets. SANE reports a network
   printer once for each driver that finds it, and its device type differs between drivers, so
-  the portal merges the duplicates, tries the drivers in rank order and says which scanners are
-  for film, so that a film application and a document application are each offered theirs.
+  the portal merges the duplicates, tries the drivers in order and says which scanners are for
+  film, so that a film application and a document application are each offered theirs.
 
 ## Non-goals
 
@@ -78,7 +80,8 @@ the same kind of consent question, has none.
 
 What v1 leaves out on purpose, in the order it is worth doing. None of them breaks what v1 defines; some add to it.
 
-1. **Hardware buttons** (scan-to-application). Designed below and built.
+1. **Hardware buttons** (scan-to-application). Designed below and built: the helper, the signal,
+   the table, and Negative Vibes acting on QuickScan and IntelliScan of the 8200i.
 2. **A native eSCL and IPP-Scan provider.** In v1 network scanners work through `sane-airscan`,
    which speaks eSCL, so this adds no scanners that are not reachable today. It would remove the
    dependency on a SANE backend for them and make a provider other than SANE real, which the
@@ -97,8 +100,8 @@ but one kind, and there is none yet.
 
 ## Hardware buttons
 
-Some scanners have buttons, and an application can want to react to them: Negative Vibes would
-continue a multi-frame loop when the user presses QuickScan on the 8200i. SANE has no event for
+Some scanners have buttons, and an application can want to react to them: Negative Vibes scans
+when the user presses QuickScan on the 8200i and previews on IntelliScan. SANE has no event for
 them. A backend that has buttons exposes them as sensor options (the Plustek 8200i has
 `intelliscan` and `scan`), which an application polls with `GetOptionValues` on an open
 session. That works in v1, and is the fallback for a backend the portal does not know, but it
@@ -125,10 +128,19 @@ works.
 session is open and no frame is running, since many backends cannot read a sensor in the middle of
 a scan: a press during a scan is lost. A press is a read of true after a read of false. That
 handles backends that latch (reading clears the value) and backends that report a held button.
-Some backends need a nudge first: the Pixma backend wants its `button-update` action pressed
-before `button-1` is valid. What is a button, what it is called in the vocabulary, the option to
-press first and the interval are per backend, in `scanner-devices.json`, in a `buttons` section.
-A backend that is not named there gets no `ButtonEvent`, and `buttons` is empty.
+What the scanner had queued when the session opened is discarded, since a press from before is
+not one the application is waiting for. Some backends need a nudge first: the Pixma backend wants
+its `button-update` action pressed before `button-1` is valid, which the table can express and
+which has not been tried on a Pixma. What is a button, what it is called in the vocabulary, the
+option to press first and the interval are per backend, in `scanner-devices.json`, in a `buttons`
+section. A backend that is not named there gets no `ButtonEvent`, and `buttons` is empty. Only the
+`plustek8200i` entry has been checked on hardware; the `genesys` entry is taken from that
+backend's documentation.
+
+**An application that gets `ButtonEvent` must not read the sensor options too.** A reading clears
+a latched press, the helper reads the same options for its events, and whoever reads second sees
+nothing. Negative Vibes had both until it was changed to take presses from the events when the
+portal reports them.
 
 **Events in a scan session.** The helper polls between frames and the frontend emits
 `ButtonEvent` on the session that has the scanner open. Nothing new for an application to call.
@@ -186,7 +198,7 @@ Consent and enumeration:
 
 | Member | Purpose |
 |---|---|
-| `SelectScanners(parent_window, options) → Request` | Shows the dialog and records the grant for the application's connection. Called on a user action, or when `ListScanners` comes back empty, which is the case on every start while grants are not remembered. `options` can ask for `multiple` and filter on `required_capabilities` (all of them) or `any_capabilities` (at least one of them), from `film`, `adf`, `infrared`, `flatbed`, `color`. |
+| `SelectScanners(parent_window, options) → Request` | Shows the dialog and records the grant for the application's connection. Called on a user action, or when `ListScanners` comes back empty, which is the case on every start, since grants are not remembered. `options` can ask for `multiple` and filter on `required_capabilities` (all of them) or `any_capabilities` (at least one of them), from `film`, `adf`, `infrared`, `flatbed`, `color`. |
 | `ListScanners(options) → a(sa{sv})` | The granted, currently available scanners. Each is an opaque id plus `name`, `vendor`, `model`, `backend`, `kind`, `type` (`scanner`, `film`, `camera` or `virtual`), `capabilities`, `buttons`, `available`. |
 | `CreateSession(options) → Session` | A monitoring session, needed only for `ScannerEvents`. |
 | `ScannerEvents(session, a(ssa{sv}))` | `add`, `change` or `remove` for granted scanners only. |
@@ -203,6 +215,7 @@ Scanning, on a `Session` from `OpenScanner`:
 | `StartFrame(session, options) → fd` | Starts one frame and returns at once with the read end of a pipe. |
 | `Cancel(session)` | Cancels the frame in progress. |
 | `FrameEvent(session, state, details)` | `started`, `finished`, `cancelled`, `no-documents` or `error`. `started` carries `format`, `depth`, `pixels_per_line`, `bytes_per_line`, `lines` and `last_frame`. Every event carries its frame number. |
+| `ButtonEvent(session, scanner_id, button, details)` | A press of a button on the scanner, while no frame is running: `button` is `scan`, `copy`, `email`, `pdf`, `file` or `extra`, and `details` has the backend's option name. Only for a scanner whose info lists `buttons`. See Hardware buttons. |
 
 A typical exchange:
 
@@ -244,6 +257,7 @@ memory for as long as the application stays on the bus; nothing is written to di
 | `type` in the scanner info, alongside `kind`, in the portal's own words | Applications hide devices that are not scanners (webcams through `v4l`, SANE's `test` backend). `kind`, the connection, cannot express that. SANE's own type string can, but it differs between drivers, is free text and can hold an address (`ip=192.0.2.10` for `airscan`), so the portal says `scanner`, `film`, `camera` or `virtual` and keeps the driver's string out. |
 | `GetFrameParameters` as an estimate | SANE allows `sane_get_parameters` before `sane_start` and applications use it to size buffers and previews. Without it a client cannot know the frame size until data is already flowing. |
 | `org.freedesktop.DBus.Error.AccessDenied` for a session that is not the caller's, closed or unknown | The other portals that have sessions answer this way, and it does not tell an application whether the session exists for someone else. `NotAllowed` stays for a scanner that was not granted, which is a decision of the user's. |
+| `OpenScanner` is a request, not a call that returns the session | Opening takes seconds on USB and on a network scanner through `airscan` took 16 and 25 s, at D-Bus's default call timeout of 25 s, so a client that kept the default could fail on a scanner that would have opened. ScreenCast and GlobalShortcuts create their sessions the same way, and an application can show progress while it waits. |
 | A dedicated `Busy` error | A locked scanner, a frame in progress and an option set during a frame are ordinary, expected conditions that an application must handle differently from a real failure. Folding them into `Failed` forces clients to guess from the message. |
 | Opaque scanner ids, never raw SANE device names | Some backends interpret device names as file paths or network addresses. Handing an application control of that string lets it steer the host at arbitrary files and hosts. |
 | The application sees only granted scanners | Enumerating the LAN's scanners is a fingerprinting and privacy problem, and not something an application needs before the user has chosen anything. |
@@ -298,12 +312,14 @@ against it from inside a Flatpak with neither `--device=all` nor `--share=networ
 
 | Checked | How | Result |
 |---|---|---|
-| Interface behaviour | 40 scenario checks on a private bus, against SANE's `test` backend | Pass: grants, opaque ids, the exclusive lock, other applications refused on someone else's session, option errors, option order, automatic values, frame numbers, `Cancel()`, closing the pipe early, release when the application leaves the bus, hand scanner (`lines` = -1), `no-documents` from an empty feeder |
+| Interface behaviour | 53 scenario checks on a private bus, against SANE's `test` backend, with the frontend in C | Pass: grants, opaque ids, the exclusive lock, other applications refused on someone else's session, option errors, option order, automatic values, frame numbers, `Cancel()`, closing the pipe early, release when the application leaves the bus, hand scanner (`lines` = -1), `no-documents` from an empty feeder, the `type` vocabulary, `OpenScanner` answering at once and giving no `Response` when its request is closed. The Rust prototype passes all but one, which is a limit of its test double (it keeps grants for all applications, not each) |
+| Drivers and curation | `tests/duplicates.py` with fake drivers, with the frontend in C | Pass: one scanner found by two drivers is one entry, the table names capabilities and an unusable entry applies to nothing, ties between drivers go by name, the driver a table entry names comes first and describes the scanner, a driver that does not drive the scanner is followed by the next, an I/O error is not |
+| Hardware buttons | `tests/buttons.py` with a fake backend, and the 8200i | Pass: a press is one event, a held button is one press, two buttons are told apart, a latch is read once, a button down when the session opened is not a press. On the 8200i 23 and 24 presses in 40 s of QuickScan and IntelliScan were reported through the portal, each under the right name, and Negative Vibes scanned and previewed from the buttons. The scanner went silent twice after it had been opened through `genesys`, which a power cycle cured; see `docs/HARDWARE-TEST.md` |
 | Pixel data correctness | Prototype client output compared with `scanimage` | Byte for byte identical for grayscale, 8-bit RGB, 16-bit RGB and three-pass red/green/blue |
 | Portal path versus libsane | Parity test scanning the same options through both, via one trait | Frame parameters, pixel data, option descriptors and constraints identical; busy scanner, empty feeder, rejected value and cancel-with-unread-pipe all surface as the same conditions |
 | Real hardware | Plustek OpticFilm 8200i film scanner, 23 checks | Pass, including colour plus infrared, two numbered frames in one session, and cancel then rescan; colour, infrared, repeat and cancel match libsane within sensor noise |
 | Flatpak sandbox | Scenarios and a GTK application, no `--device=all`, no network | Pass: preview and raw scan on the 8200i, so fd passing and signals work through the Flatpak D-Bus proxy |
-| A second, independent application | GNOME Simple Scan ported to the draft | Scanned from the sandbox on the 8200i, was cancelled mid-frame and scanned again in the same session; the device arrived as `film scanner` |
+| A second, independent application | GNOME Simple Scan ported to the draft | Scanned from the sandbox on the 8200i, was cancelled mid-frame and scanned again in the same session; the device arrived as a film scanner, and the application hid it itself |
 | The dialog | A libadwaita implementation of `org.freedesktop.impl.portal.Scanner` for xdg-desktop-portal-gnome, called directly with made-up scanners on a private bus on a Wayland session | Pass: select returns the chosen id, Escape and Cancel answer "cancelled" with no results, `Request.Close` destroys the window without an answer; unavailable scanners are shown and cannot be chosen; the application's title shows as secondary text under the heading the portal writes |
 | The frontend in C, in xdg-desktop-portal | The frontend, a helper process that holds libsane, and the dialog above, on a private bus: both applications, the SANE `test` backend, the 8200i and a network scanner | Pass for the grant and the dialog, `OpenScanner` with the exclusive lock and `Busy`, options, `auto`, `StartFrame` with the pipe, frame events and numbers, `Cancel`, closing the pipe early, the helper killed in the middle of a frame (the pipe ends and the application gets `Session.Closed`) and the application leaving in the middle of a frame, checked with scripted clients against the `test` backend. Negative Vibes scanned and rescanned after a stop on the 8200i; Simple Scan, from its Flatpak sandbox, scanned on the 8200i and on an HP Color LaserJet MFP M283cdw through the `airscan` backend. The stop on the 8200i was confirmed by hand, and Simple Scan has no cancel button. The 23 hardware checks (`tools/portal-hw-check.sh --frontend c`) also passed on the 8200i with the frontend in C: colour and infrared scans against `scanimage`, a repeat scan, progress, and a cancel at 30% followed by a rescan |
 
@@ -314,7 +330,8 @@ were not enough to settle them.
 Not yet verified: window-handle attachment for the dialog, the dialog in portal-gtk and in
 KDE, more than one network scanner or backend (one eSCL scanner has been tried), a helper
 that stops answering without dying, two applications opening the same scanner at the same
-instant, and any provider other than SANE.
+instant, buttons on any scanner but the 8200i (the `genesys` and Pixma entries of the table in
+particular), and any provider other than SANE.
 
 ## Open questions
 
@@ -334,10 +351,11 @@ instant, and any provider other than SANE.
    actual SANE backends to be sure the list is right.
 6. **One scanner, several applications.** v1 takes an exclusive lock. Is that the right
    policy, and is `Busy` enough to report it?
-7. **Flatpak permissions.** Applications would need no new permission:
-   `--talk-name=org.freedesktop.portal.Desktop`, which they already have, should cover it,
-   and `--device=all` can then be dropped. This has not been tested against the real
-   frontend.
+7. **Flatpak permissions.** Applications need no new permission:
+   `--talk-name=org.freedesktop.portal.Desktop`, which they already have, covers it, and
+   `--device=all` and `--share=network` can be dropped. Both Simple Scan and Negative Vibes run
+   from Flatpaks without either, against the frontend in C, and scan on the 8200i. Settled; the
+   question is whether upstream agrees that it is enough.
 8. **Remember the choice?** No. This proposal follows the print portal: the dialog is shown when
    the application first needs a scanner, and the choice lasts until the application exits. The
    USB portal stores grants in the permission store, where they are revocable; doing that here
@@ -352,7 +370,6 @@ instant, and any provider other than SANE.
 10. **Bundled backends as a fallback.** Scanners whose driver the host does not ship — the
    8200i is one — still need the USB portal and bundled backends. Worth saying so explicitly
    in the documentation.
-
 11. **How long may `OpenScanner` take?** Settled: it is a request. On the 8200i it is quick, but
     on a network scanner through `airscan` it took 16 and 25 s, and D-Bus's default call timeout
     is 25 s, so a client that kept the default could fail on a scanner that would have opened.
@@ -386,7 +403,7 @@ instant, and any provider other than SANE.
     and a USB scanner by more than one backend. The helper reports which physical scanner a
     device is (the USB bus address, or the host of a network scanner), and the frontend gives
     those one id, offers the dialog one entry and keeps the drivers in order, `airscan` and `escl`
-    before the others and HPLIP's `hpaio` last. Three rules came out of the 8200i SE, which both
+    before the others, HPLIP's `hpaio` after them and SANE's `net` driver last. Three rules came out of the 8200i SE, which both
     `genesys` and `plustek8200i` find. They ranked the same, the order of the search decided,
     and `genesys` won: it does not report the scanner's buttons, and opening the scanner through
     it is the likely reason the buttons went silent until a power cycle (see
@@ -411,14 +428,15 @@ instant, and any provider other than SANE.
 
 1. Open an issue on xdg-desktop-portal with this proposal and the measured results, and
    settle the open questions, question 1 first.
-2. Implement the frontend in C: `src/scanner.c`, the in-memory grants,
-   `data/org.freedesktop.portal.Scanner.xml`, `data/org.freedesktop.impl.portal.Scanner.xml`,
-   documentation and tests in `tests/`.
+2. Implement the frontend in C: `src/scanner.c` (`desktop-portal/scanner.c` on main), the
+   helper, the in-memory grants, `data/org.freedesktop.portal.Scanner.xml`,
+   `data/org.freedesktop.impl.portal.Scanner.xml`, `data/scanner-devices.json`, documentation and
+   tests in `tests/`. Written, as 16 patches for 1.22.1 and for main.
 3. Implement the dialog in `xdg-desktop-portal-gtk`, as a plain GTK 4 window, which is where the
    print dialog lives and which serves GTK desktops other than GNOME (a sandboxed application
    there has no other way to scan), and in `xdg-desktop-portal-gnome` with libadwaita, where the
-   USB dialog lives. A KDE counterpart follows. A libadwaita version is written and tested; the
-   GTK one is not yet.
+   USB dialog lives. A KDE counterpart follows. The libadwaita version is written and tested; the
+   GTK one is written (two patches) and not yet tested.
 4. Land the Simple Scan port once the interface is accepted, as a non-prototype consumer.
 
 ## Prior art
