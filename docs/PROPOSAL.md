@@ -329,10 +329,7 @@ particular), and any provider other than SANE.
    use another name?
 2. **The option filter list.** Hiding file name and button options needs a pass over the
    actual SANE backends to be sure the list is right.
-3. **Bundled backends as a fallback.** Scanners whose driver the host does not ship — the
-   8200i is one — still need the USB portal and bundled backends. Worth saying so explicitly
-   in the documentation.
-4. **A scanner that is replugged.** A USB scanner is matched by its bus address while the helper
+3. **A scanner that is replugged.** A USB scanner is matched by its bus address while the helper
    is listing it, so after it is replugged or power cycled it has a new address and a name from
    before is stale. The portal treats ids as opaque and per run. Is that enough, or should an id
    outlive the run, with the serial number or the port path?
