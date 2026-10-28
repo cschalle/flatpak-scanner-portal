@@ -44,7 +44,7 @@ the same kind of consent question, has none.
 - A sandboxed application can scan with no device, network or filesystem access.
 - The user chooses which scanners an application may use, in a dialog. The choice lasts while
   the application runs, so nothing is stored and there is nothing to revoke. The choice is not
-  remembered across runs, on purpose (open question 8).
+  remembered across runs, on purpose (see the decisions table).
 - libsane and its backends run on the host, so host and proprietary drivers work and the
   host's SANE configuration applies.
 - The API is rich enough for demanding applications: multi-bit-depth, infrared, multi-pass,
@@ -67,36 +67,14 @@ the same kind of consent question, has none.
 - **Scanner setup**: adding a network scanner, installing a driver or editing SANE's
   configuration. The portal uses what the host has already set up.
 - **Sharing one scanner between applications at the same time.** The lock is exclusive; see
-  open question 6.
+  the decisions table.
 - **Image processing**: OCR, file formats, colour management, cropping. The portal returns
   frames as the scanner produced them and applications do the rest.
 - **Scanners that SANE does not drive**, such as WIA. Provided by another provider later, if at
-  all; see phase 2.
+  all; the option model is abstract enough for one.
 - **Fixing SANE's device metadata upstream.** The portal corrects what it needs in its own
   table instead, since a change to SANE's API would have to keep every existing application
   working.
-
-## Phase 2
-
-What v1 leaves out on purpose, in the order it is worth doing. None of them breaks what v1 defines; some add to it.
-
-1. **Hardware buttons** (scan-to-application). Designed below and built: the helper, the signal,
-   the table, and Negative Vibes acting on QuickScan and IntelliScan of the 8200i.
-2. **A native eSCL and IPP-Scan provider.** In v1 network scanners work through `sane-airscan`,
-   which speaks eSCL, so this adds no scanners that are not reachable today. It would remove the
-   dependency on a SANE backend for them and make a provider other than SANE real, which the
-   option model is meant to allow.
-3. **The curation table upstream.** The film scanners the portal knows are in
-   `scanner-devices.json`, which the portal reads from the data directories and again when it
-   changes, so a distribution or an administrator can ship a newer list without a new portal.
-   What is left is where the list should live: with the portal, or in SANE's own description
-   files if the project takes a capability field. See open question 13.
-
-Considered and left out: an `excluded_capabilities` option. Because a scanner not known to be
-for film is given `flatbed`, a document application that asks for `any_capabilities` of `flatbed`
-and `adf` is already offered no film-only scanner, and still gets a flatbed with a transparency
-unit, which it should. An exclusion would only matter for an application that wants everything
-but one kind, and there is none yet.
 
 ## Hardware buttons
 
@@ -184,8 +162,8 @@ Two properties of this layout matter:
 into the process, and that code can be proprietary and of unknown quality. Running it in
 xdg-desktop-portal itself would put it in a long-lived process that every portal shares. It
 therefore belongs in a helper, one per open scanner, which also means a wedged backend
-cannot take down other applications' scans. How that helper is launched and managed is the
-first open question below.
+cannot take down other applications' scans. The frontend starts it for each session and
+it ends with the session; see the decisions table.
 
 **Pixel data does not travel over D-Bus.** A single 7200 dpi frame is hundreds of megabytes.
 `StartFrame` returns the read end of a pipe, so the data path is a plain fd with kernel
@@ -254,16 +232,28 @@ memory for as long as the application stays on the bus; nothing is written to di
 | A frame number on every `FrameEvent` | A client that cancels a frame and immediately starts another must be able to tell the old frame's trailing events from the new frame's. A per-session counter, and the rule that a frame ends with exactly one non-`started` event, let it discard anything not newer than the last frame it saw end. Without it every client reimplements a drain-and-wait by hand. |
 | Automatic values as the vardict `{'auto': <true>}` | SANE has `SANE_ACTION_SET_AUTO` and real applications use it, for example to let the scanner pick the source. D-Bus has no empty structure, so a vardict stands in for the "no value" marker, and leaves room for further per-option modifiers. |
 | `backend` in the scanner info | The scanner id is opaque, so applications cannot match device quirks on it — and device quirks are unavoidable in practice. The driver name has to be exposed on purpose. |
-| `type` in the scanner info, alongside `kind`, in the portal's own words | Applications hide devices that are not scanners (webcams through `v4l`, SANE's `test` backend). `kind`, the connection, cannot express that. SANE's own type string can, but it differs between drivers, is free text and can hold an address (`ip=192.0.2.10` for `airscan`), so the portal says `scanner`, `film`, `camera` or `virtual` and keeps the driver's string out. |
+| `type` in the scanner info, alongside `kind`, in the portal's own words | Applications hide devices that are not scanners (webcams through `v4l`, SANE's `test` backend). `kind`, the connection, cannot express that. SANE's own type string can, but it differs between drivers, is free text and can hold an address (`ip=192.0.2.10` for `airscan`), so the portal says `scanner`, `film` (a scanner only for film), `camera` or `virtual`, worked out from the driver's string and the capabilities, and keeps the raw string out. The portal leaves cameras out of its lists itself, so `camera` is for a future driver. Simple Scan and Negative Vibes hide `virtual`. |
 | `GetFrameParameters` as an estimate | SANE allows `sane_get_parameters` before `sane_start` and applications use it to size buffers and previews. Without it a client cannot know the frame size until data is already flowing. |
 | `org.freedesktop.DBus.Error.AccessDenied` for a session that is not the caller's, closed or unknown | The other portals that have sessions answer this way, and it does not tell an application whether the session exists for someone else. `NotAllowed` stays for a scanner that was not granted, which is a decision of the user's. |
-| `OpenScanner` is a request, not a call that returns the session | Opening takes seconds on USB and on a network scanner through `airscan` took 16 and 25 s, at D-Bus's default call timeout of 25 s, so a client that kept the default could fail on a scanner that would have opened. ScreenCast and GlobalShortcuts create their sessions the same way, and an application can show progress while it waits. |
+| One helper process per open scanner, started by the frontend | libsane keeps global state, some backends leak or install signal handlers, and `sane_exit` plus `sane_init` is the only reliable reset, so a process that ends with the session is the reset. A crash costs one session. A systemd user service that owns libsane would keep that state for as long as it runs; it could come with a provider other than SANE, and nothing here needs one. |
+| `ListScanners` is a snapshot; hotplug is for `ScannerEvents` to report | Polling the drivers is not the way: `sane_get_devices` on a network takes seconds and stalls the other backends. The sources that know are udev for USB and Avahi for network scanners. `ScannerEvents` is declared in the interface and the frontend does not emit it yet. |
+| Options are scalar in v1; array-valued ones are hidden | Gamma tables and calibration data are arrays. The descriptor has `size` for them, and an array form of the value could be added without changing what exists. |
+| An exclusive lock on the scanner | SANE backends are single-open and most scanners do one scan at a time, so `Busy` is the honest answer. Sharing would mean queueing, which has no good default. |
+| Applications need no permission beyond `--talk-name=org.freedesktop.portal.Desktop` | They already have it. Both Simple Scan and Negative Vibes run from Flatpaks without `--device=all` or `--share=network`, against the frontend in C, and scan on the 8200i. |
+| The dialog only chooses devices, with no scan settings | Print's dialog also collects settings, but print settings are uniform and scanner settings are not: resolution, mode, source and bit depth differ between backends, and film has none of the document ones. Settings in the dialog would be a second option model. |
+| Capabilities come from a table in the portal, not from SANE | SANE's device type says little and differs between drivers: one calls a Plustek OpticFilm a film scanner and another a flatbed, and `airscan` gives its address. The portal keeps a list of the scanners that are for film, by USB id or product line, in `scanner-devices.json`, read at run time so that a distribution or an administrator can ship a newer one, and it assumes that a scanner not known to be only for film is for documents, so it has `flatbed` unless its driver says it is a sheet feeder. Film scanners are few and a film application is the one that needs them found, so a list is feasible where a list of document scanners would not be. A flatbed with a transparency unit has both. If the SANE project takes a capability field in its description files, the table can move there. |
+| One entry per physical scanner, and the drivers in a fixed order | A network printer is found by an eSCL driver and by the vendor's, and a USB scanner by more than one backend. The helper reports which physical scanner a device is (the USB bus address, or the host of a network scanner), and the frontend gives those one id, offers the dialog one entry and keeps the drivers in order: `airscan` and `escl` before the others, HPLIP's `hpaio` after them and SANE's `net` driver last. Scanners found only through `net` are not merged, since the host may serve several. |
+| Ties between drivers go by the driver's name | The 8200i SE is found by both `genesys` and `plustek8200i`. They ranked the same, the order of the search decided, and `genesys` won. It does not report the scanner's buttons, and opening the scanner through it is the likely reason the buttons went silent until a power cycle (see `docs/HARDWARE-TEST.md`). |
+| A table entry can name the driver that opens the scanner first | `"driver": "plustek8200i"` puts that driver ahead of every other that found the scanner, whatever the ranks, so a known problem scanner is fixed at its description and not in the global ranks. The scanner info's `backend` is that of the driver that will open it, also in the answer to `SelectScanners`. |
+| A second driver is tried only when the first says it does not drive the scanner | That is SANE's `INVAL` or `UNSUPPORTED`, the way HPLIP answers for a printer that only speaks eSCL. Not after a busy scanner, which another driver would only meet too, and not after an I/O error: the driver may have talked to the device, and a second one on a device in an unknown state is how a scanner gets reset. |
+| No `excluded_capabilities` option | A scanner not known to be for film is given `flatbed`, so a document application that asks for `any_capabilities` of `flatbed` and `adf` is already offered no film-only scanner, and still gets a flatbed with a transparency unit, which it should. An exclusion would only matter for an application that wants everything but one kind, and there is none yet. |
+| `OpenScanner` is a request, not a call that returns the session | Opening takes seconds on USB and on a network scanner through `airscan` took 16 and 25 s, at D-Bus's default call timeout of 25 s, so a client that kept the default could fail on a scanner that would have opened. ScreenCast and GlobalShortcuts create their sessions the same way, and an application can show progress while it waits. The portal, Simple Scan, Negative Vibes and the test double all use it, and the scenarios check that the call returns before the scanner is open and that closing the request gives no `Response` and lets the scanner go. |
 | A dedicated `Busy` error | A locked scanner, a frame in progress and an option set during a frame are ordinary, expected conditions that an application must handle differently from a real failure. Folding them into `Failed` forces clients to guess from the message. |
 | Opaque scanner ids, never raw SANE device names | Some backends interpret device names as file paths or network addresses. Handing an application control of that string lets it steer the host at arbitrary files and hosts. |
 | The application sees only granted scanners | Enumerating the LAN's scanners is a fingerprinting and privacy problem, and not something an application needs before the user has chosen anything. |
 | A `Session` for an open scanner | Lifecycle comes for free: the application exiting releases the hardware lock, and the portal can revoke access with `Session.Closed`. |
 | No per-scan prompt once granted | An application with a grant can scan only what is on the glass or in the feeder, and the dialog names the scanner, so one choice per run of the application is proportionate. It is not true that a scan cannot happen unnoticed: a page left in the scanner can be read. The exposure is small, and a prompt for every scan would make the scanning applications unusable. Open to argument if reviewers disagree. |
-| Grants last for the application's run and are kept in memory | The print portal asks every time and keeps nothing, and scanning is an occasional, deliberate act like printing, so a dialog at the start of a scanning session is the expected cost. It removes the permission table, a revocation path and a settings panel from v1, and the user's only revocation is to close the application. The choice is not remembered across runs; see open question 8. |
+| Grants last for the application's run and are kept in memory | The print portal asks every time and keeps nothing, and scanning is an occasional, deliberate act like printing, so a dialog at the start of a scanning session is the expected cost. It removes the permission table, a revocation path and a settings panel from v1, and the user's only revocation is to close the application. The choice is not remembered across runs. The USB portal stores grants in the permission store, where they are revocable; doing that here would cost a permission table, a stable scanner id, a revocation path and a place in Settings, and what it saves is one dialog on the launch of a scanning application. We do not plan to add it. If reviewers want it, it could be a `remember` option answered in the dialog, without changing anything else. |
 | The backend does UI only | Same split as `org.freedesktop.impl.portal.Usb`, and it keeps libsane out of the desktop shell's process as well as out of the frontend's. |
 
 ## Security and privacy
@@ -334,100 +324,23 @@ instant, buttons on any scanner but the 8200i (the `genesys` and Pixma entries o
 particular), and any provider other than SANE.
 
 ## Open questions
-
-1. **How is the host helper launched?** Either the frontend spawns a helper process per
-   session, or it talks to a separate systemd user service that owns libsane and could also
-   serve eSCL later. The prototype spawns per session. This is the main structural question
-   for review.
-2. **Hotplug and availability** for network scanners: poll through the helper, or rely on
-   Avahi?
-3. **Array-valued options.** Gamma tables and some calibration data are arrays. The
-   descriptor has `size` for it but v1 carries one value per option and hides arrays.
-   Either v1 states that options are scalar, or the value encoding needs an array form.
-4. **Is `Busy` an acceptable error name?** `org.freedesktop.portal.Error.Busy` is not in
+1. **Is `Busy` an acceptable error name?** `org.freedesktop.portal.Error.Busy` is not in
    xdg-desktop-portal's existing error set, and the condition is real and common. Add it, or
    use another name?
-5. **The option filter list.** Hiding file name and button options needs a pass over the
+2. **The option filter list.** Hiding file name and button options needs a pass over the
    actual SANE backends to be sure the list is right.
-6. **One scanner, several applications.** v1 takes an exclusive lock. Is that the right
-   policy, and is `Busy` enough to report it?
-7. **Flatpak permissions.** Applications need no new permission:
-   `--talk-name=org.freedesktop.portal.Desktop`, which they already have, covers it, and
-   `--device=all` and `--share=network` can be dropped. Both Simple Scan and Negative Vibes run
-   from Flatpaks without either, against the frontend in C, and scan on the 8200i. Settled; the
-   question is whether upstream agrees that it is enough.
-8. **Remember the choice?** No. This proposal follows the print portal: the dialog is shown when
-   the application first needs a scanner, and the choice lasts until the application exits. The
-   USB portal stores grants in the permission store, where they are revocable; doing that here
-   would cost a permission table, a stable scanner id, a revocation path and a place in Settings,
-   and the cost it saves is one dialog on the launch of a scanning application. We do not plan
-   to add it. If upstream reviewers want it, it could be added as a `remember` option answered
-   in the dialog, without changing anything else.
-9. **Settings in the dialog.** Print's dialog also collects settings. This one only chooses
-   devices, because film and document scanning need the application's own option UI. A
-   simple resolution, mode and source step, for applications that have no UI of their own,
-   could be added later without changing the API; is it wanted?
-10. **Bundled backends as a fallback.** Scanners whose driver the host does not ship — the
+3. **Bundled backends as a fallback.** Scanners whose driver the host does not ship — the
    8200i is one — still need the USB portal and bundled backends. Worth saying so explicitly
    in the documentation.
-11. **How long may `OpenScanner` take?** Settled: it is a request. On the 8200i it is quick, but
-    on a network scanner through `airscan` it took 16 and 25 s, and D-Bus's default call timeout
-    is 25 s, so a client that kept the default could fail on a scanner that would have opened.
-    `OpenScanner` now returns a `Request` and answers with a `Response` that carries the session
-    handle, as the portals that create sessions upstream (ScreenCast, GlobalShortcuts) do, and an
-    application can show progress while it waits. It costs a round trip and one signal to handle.
-    The portal, Simple Scan, Negative Vibes and the test double all use it, and the scenarios
-    check that the call returns before the scanner is open and that closing the request gives no
-    `Response` and lets the scanner go. Still open: whether the `Response` should carry progress.
-12. **What is `type`?** Settled: the portal's own small vocabulary. SANE's device string is
-    whatever the backend puts there (`film scanner`, `virtual device`, and for `airscan` the
-    scanner's address, `ip=192.0.2.10`), which an application that was granted the scanner would
-    see. The portal now reports `scanner`, `film` (a scanner only for film), `camera` or `virtual`,
-    worked out from the driver's string and the capabilities, and keeps the raw string out. The
-    portal leaves cameras out of its lists itself, so `camera` is for a future driver. Simple Scan
-    and Negative Vibes hide `virtual`.
-13. **Where do `capabilities` come from?** Not from SANE, whose device type says little and
-    differs between drivers: one calls a Plustek OpticFilm a film scanner and another a flatbed,
-    and `airscan` gives its address. The frontend keeps a list of the scanners that are for
-    film, by USB id or by product line (`data/scanner-devices.json`, read at run time), and assumes that a
-    scanner not known to be only for film is for documents, so it has `flatbed` unless its
-    driver says it is a sheet feeder. Film scanners are few and a film application is the one
-    that needs them found, so a list is feasible, where a list of document scanners would not
-    be. A flatbed with a transparency unit has both `film` and `flatbed`. This makes
-    `required_capabilities` reliable, and `any_capabilities` lets an application for documents
-    ask for `flatbed` or `adf`, so neither kind of application needs to exclude the other's
-    scanners. The list is data, in a file that can be updated without a new portal. What is open is
-    who keeps it: the portal, or SANE's own description files if the SANE project takes a
-    capability field.
-14. **The same scanner twice.** A network printer is found by an eSCL driver and by the vendor's,
-    and a USB scanner by more than one backend. The helper reports which physical scanner a
-    device is (the USB bus address, or the host of a network scanner), and the frontend gives
-    those one id, offers the dialog one entry and keeps the drivers in order, `airscan` and `escl`
-    before the others, HPLIP's `hpaio` after them and SANE's `net` driver last. Three rules came out of the 8200i SE, which both
-    `genesys` and `plustek8200i` find. They ranked the same, the order of the search decided,
-    and `genesys` won: it does not report the scanner's buttons, and opening the scanner through
-    it is the likely reason the buttons went silent until a power cycle (see
-    `docs/HARDWARE-TEST.md`).
-    - **Ties are settled by the driver's name,** never by which driver answered first.
-    - **A table entry can name a driver** (`"driver": "plustek8200i"`), which then opens the
-      scanner before any other that found it, whatever the ranks. This is where a known problem
-      scanner is fixed, at its description and not in the global ranks. The scanner info's
-      `backend` is that of the driver that will open it, also in the answer to
-      `SelectScanners`.
-    - **A second driver is tried only when the first says it does not drive the scanner**
-      (SANE's `INVAL` or `UNSUPPORTED`), the way HPLIP does for a printer that only speaks eSCL.
-      Not after a busy scanner, which another driver would only meet too, and not after an I/O
-      error: the driver may have talked to the device, and a second one on a device in an
-      unknown state is how a scanner gets reset.
-
-    Scanners found only through SANE's `net` driver are not merged, since the host may serve
-    several. Open: a USB scanner is only matched by its bus address while the helper is listing
-    it, so a name from before a power cycle is stale; the portal treats ids as opaque and per run.
+4. **A scanner that is replugged.** A USB scanner is matched by its bus address while the helper
+   is listing it, so after it is replugged or power cycled it has a new address and a name from
+   before is stale. The portal treats ids as opaque and per run. Is that enough, or should an id
+   outlive the run, with the serial number or the port path?
 
 ## Upstreaming plan
 
 1. Open an issue on xdg-desktop-portal with this proposal and the measured results, and
-   settle the open questions, question 1 first.
+   settle the open questions.
 2. Implement the frontend in C: `src/scanner.c` (`desktop-portal/scanner.c` on main), the
    helper, the in-memory grants, `data/org.freedesktop.portal.Scanner.xml`,
    `data/org.freedesktop.impl.portal.Scanner.xml`, `data/scanner-devices.json`, documentation and
