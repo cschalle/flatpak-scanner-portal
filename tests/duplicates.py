@@ -13,13 +13,22 @@ def main():
     scanners = results.get("scanners", [])
     names = sorted(s[1]["name"] for s in scanners)
     check("two drivers finding one scanner is one entry, and another scanner is another",
-          code == 0 and len(scanners) == 4, (code, names))
+          code == 0 and len(scanners) == 5, (code, names))
     for s in scanners:
         check("the entry has no address or bookkeeping", "physical" not in s[1] and "usb_id" not in s[1], s[1])
     film = [s for s in scanners if s[1]["name"] == "Fake Film Thing"]
     check("scanner-devices.json names a scanner and gives it capabilities",
           len(film) == 1 and film[0][1]["capabilities"] == ["film", "color"], names)
-    others = [s for s in scanners if s not in film]
+    wand = [s for s in scanners if s[1]["name"] == "Fake Wand"]
+    check("a handheld scanner has the capability 'handheld' and is not taken for a flatbed",
+          len(wand) == 1 and wand[0][1]["capabilities"] == ["handheld"], wand)
+    for_documents = c.select(multiple=v("b", True), any_capabilities=v("as", ["flatbed", "feeder"]))[1].get("scanners", [])
+    check("an application for documents is not offered it",
+          "Fake Wand" not in [s[1]["name"] for s in for_documents] and len(for_documents) == 3, for_documents)
+    only_wands = c.select(multiple=v("b", True), required_capabilities=v("as", ["handheld"]))[1].get("scanners", [])
+    check("an application that asks for 'handheld' is offered only it",
+          [s[1]["name"] for s in only_wands] == ["Fake Wand"], only_wands)
+    others = [s for s in scanners if s not in film and s not in wand]
     feeder = [s for s in others if s[1]["name"] == "Fake Tie Pair"]
     others = [s for s in others if s not in feeder]
     check("a scanner it does not name is for documents",
@@ -32,7 +41,7 @@ def main():
     check("the type is the portal's word, not the driver's",
           film[0][1]["type"] == "film" and all(s[1]["type"] == "scanner" for s in others + feeder), [s[1]["type"] for s in scanners])
     listed = c.call("ListScanners", ({},), "(a{sv})")[0]
-    check("ListScanners lists them the same", len(listed) == 4, listed)
+    check("ListScanners lists them the same", len(listed) == 5, listed)
 
     # An entry of the file that has nothing to match on is ignored, not taken for everything
     check("an unusable entry of the file does not apply to every scanner",

@@ -14,7 +14,7 @@ import sys
 from gi.repository import GLib
 
 
-def info(vendor, model, backend, typ, physical):
+def info(vendor, model, backend, typ, physical, caps=()):
     d = {
         "name": GLib.Variant("s", f"{vendor} {model}"),
         "vendor": GLib.Variant("s", vendor),
@@ -22,7 +22,7 @@ def info(vendor, model, backend, typ, physical):
         "backend": GLib.Variant("s", backend),
         "kind": GLib.Variant("s", "network"),
         "type": GLib.Variant("s", typ),
-        "capabilities": GLib.Variant("as", []),
+        "capabilities": GLib.Variant("as", list(caps)),
         "available": GLib.Variant("b", True),
         "physical": GLib.Variant("s", physical),
     }
@@ -38,6 +38,7 @@ def main():
             devices = [
                 ("sane-aaaa", "fakea:copier", info("Fake", "Copier 1000", "fakea", "all-in-one", "net:192.0.2.10")),
                 ("sane-bbbb", "fakea:other", info("Fake", "Other", "fakea", "all-in-one", "net:192.0.2.20")),
+                ("sane-dddd", "fakea:wand", info("Fake", "Wand", "fakea", "handheld scanner", "net:192.0.2.50", ["handheld"])),
             ]
         elif backend in ("fakey", "fakez"):
             devices = [

@@ -1,0 +1,83 @@
+From 84aeae765694d7b22646862802b851bdf2f9bf5b Mon Sep 17 00:00:00 2001
+From: "Christian F.K. Schaller" <christian.schaller@gmail.com>
+Date: Thu, 29 Oct 2026 19:02:03 -0400
+Subject: [PATCH] scanner: Report a handheld scanner with the capability
+ handheld
+
+This commit adds the capability handheld, set from SANE's device type
+"handheld scanner", so that an application can filter on it in
+SelectScanners() with required_capabilities and any_capabilities. It was
+a property that only showed in the frame parameters (lines is -1), too
+late to choose a scanner by.
+
+A scanner that is handheld is no longer assumed to be a flatbed, so an
+application for documents that asks for flatbed or feeder is not offered
+one.
+
+Tested with the scenario checks and the duplicates check, against a
+fake driver that reports a handheld scanner. Not tested with a real
+handheld scanner.
+---
+ data/org.freedesktop.portal.Scanner.xml | 6 ++++--
+ src/scanner-helper.c                    | 2 ++
+ src/scanner.c                           | 6 ++++--
+ 3 files changed, 10 insertions(+), 4 deletions(-)
+
+diff --git a/data/org.freedesktop.portal.Scanner.xml b/data/org.freedesktop.portal.Scanner.xml
+index 90544b3..6681510 100644
+--- a/data/org.freedesktop.portal.Scanner.xml
++++ b/data/org.freedesktop.portal.Scanner.xml
+@@ -78,7 +78,8 @@
+ 
+           Only offer scanners that have all of these capabilities. Known
+           values: ``film`` (transparency unit), ``feeder`` (automatic
+-          document feeder), ``infrared``, ``flatbed``, ``color``. Unknown
++          document feeder), ``infrared``, ``flatbed``, ``color``,
++          ``handheld`` (a scanner moved by hand over the document). Unknown
+           values are ignored.
+ 
+         * ``any_capabilities`` (``as``)
+@@ -89,7 +90,8 @@
+           ``['flatbed', 'feeder']``, one for film for ``film`` in
+           ``required_capabilities``, and neither is offered the other's
+           scanners. A flatbed with a transparency unit has both, and is
+-          offered to both.
++          offered to both. A handheld scanner has neither, so it is offered only
++          to an application that asks for ``handheld``.
+ 
+         The following results get returned via the :ref:`org.freedesktop.portal.Request::Response` signal:
+ 
+diff --git a/src/scanner-helper.c b/src/scanner-helper.c
+index 2ec7e40..50c2da4 100644
+--- a/src/scanner-helper.c
++++ b/src/scanner-helper.c
+@@ -66,6 +66,8 @@ scanner_capabilities (const char *type)
+     g_ptr_array_add (caps, "flatbed");
+   if (strstr (t, "sheet") || strstr (t, "adf"))
+     g_ptr_array_add (caps, "feeder");
++  if (strstr (t, "hand"))
++    g_ptr_array_add (caps, "handheld");
+   g_ptr_array_add (caps, NULL);
+ 
+   return (const char **) g_ptr_array_free (caps, FALSE);
+diff --git a/src/scanner.c b/src/scanner.c
+index 7f2be95..d54d144 100644
+--- a/src/scanner.c
++++ b/src/scanner.c
+@@ -532,9 +532,11 @@ scanner_device_new_from_helper (const char *id,
+       g_free (hints);
+     }
+ 
+-  /* What is not known to be only for film is for documents. Film scanners are few and named; the
+-   * rest, such as a network scanner whose driver says nothing, are flatbeds or sheet feeders. */
++  /* What is not known to be only for film or handheld is for documents. Film scanners are few and
++   * named; the rest, such as a network scanner whose driver says nothing, are flatbeds or sheet
++   * feeders. */
+   if (!g_ptr_array_find_with_equal_func (caps, "film", g_str_equal, NULL) &&
++      !g_ptr_array_find_with_equal_func (caps, "handheld", g_str_equal, NULL) &&
+       !g_ptr_array_find_with_equal_func (caps, "flatbed", g_str_equal, NULL) &&
+       !g_ptr_array_find_with_equal_func (caps, "feeder", g_str_equal, NULL))
+     g_ptr_array_add (caps, g_strdup ("flatbed"));
+-- 
+2.56.0
+

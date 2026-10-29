@@ -78,7 +78,8 @@
 
           Only offer scanners that have all of these capabilities. Known
           values: ``film`` (transparency unit), ``feeder`` (automatic
-          document feeder), ``infrared``, ``flatbed``, ``color``. Unknown
+          document feeder), ``infrared``, ``flatbed``, ``color``,
+          ``handheld`` (a scanner moved by hand over the document). Unknown
           values are ignored.
 
         * ``any_capabilities`` (``as``)
@@ -89,7 +90,8 @@
           ``['flatbed', 'feeder']``, one for film for ``film`` in
           ``required_capabilities``, and neither is offered the other's
           scanners. A flatbed with a transparency unit has both, and is
-          offered to both.
+          offered to both. A handheld scanner has neither, so it is offered only
+          to an application that asks for ``handheld``.
 
         The following results get returned via the :ref:`org.freedesktop.portal.Request::Response` signal:
 

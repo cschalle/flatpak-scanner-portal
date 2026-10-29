@@ -7,7 +7,7 @@ process and hands the application each frame over a pipe. It is modelled on the 
 portals. SANE only, in this first version.
 
 The portal gives an application one entry per physical scanner however many drivers find it,
-with capabilities it sets itself (`film`, `flatbed`, `feeder`, …) and its own word for what the
+with capabilities it sets itself (`film`, `flatbed`, `feeder`, `handheld`, …) and its own word for what the
 device is. Opening a scanner is a request, since it can take longer than D-Bus's default call
 timeout. The buttons of a scanner that has them reach the application as `ButtonEvent`. What the
 portal knows about scanners that SANE does not say is in `scanner-devices.json`, which it reads
@@ -49,7 +49,7 @@ patches:
 
 | Package | `<release>/` | `main/` |
 |---|---|---|
-| xdg-desktop-portal | 1.22.1 (21 patches) | main (21) |
+| xdg-desktop-portal | 1.22.1 (22 patches) | main (22) |
 | xdg-desktop-portal-gnome | 50.0 (5) | main (5) |
 | xdg-desktop-portal-gtk | 1.15.3 (3) | main (3) |
 
