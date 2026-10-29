@@ -190,7 +190,7 @@ Scanning, on a `Session` from `OpenScanner`:
 | `GetFrameParameters(session, options) → a{sv}` | The layout the next frame would have, as an estimate, for sizing buffers and previews. |
 | `StartFrame(session, options) → (fd, frame)` | Starts one frame and returns at once with the read end of a pipe and the number of the frame. |
 | `Cancel(session, frame)` | Cancels the frame with that number, which `StartFrame` returned. A frame that is over is not cancelled again, and a number never returned is an error. |
-| `FrameEvent(session, state, details)` | `started`, `finished`, `cancelled`, `no-documents` or `error`. `started` carries `format`, `depth`, `pixels_per_line`, `bytes_per_line`, `lines` and `last_frame`. Every event carries its frame number. |
+| `FrameEvent(session, state, details)` | `started`, `finished`, `cancelled`, `no-documents` or `error`. `started` carries `format`, `depth`, `pixels_per_line`, `bytes_per_line`, `lines` and `last_in_image`. Every event carries its frame number. |
 | `ButtonEvent(session, scanner_id, button, details)` | A press of a button on the scanner, while no frame is running: `button` is `scan`, `copy`, `email`, `pdf`, `file` or `extra`, and `details` has the backend's option name. Only for a scanner whose info lists `buttons`. See Hardware buttons. |
 
 A typical exchange:
@@ -203,10 +203,10 @@ GetOptions(session)                  → descriptors
 SetOptions(session, [("mode","Color"), ("resolution",3600)])
 loop:
     StartFrame(session)              → fd
-    FrameEvent started               → format, depth, bytes_per_line, lines, last_frame
+    FrameEvent started               → format, depth, bytes_per_line, lines, last_in_image
     read(fd) until EOF
     FrameEvent finished
-    until last_frame
+    until last_in_image
 Session.Close(session)
 ```
 
@@ -250,6 +250,7 @@ nothing is written to disk.
 | A second driver is tried only when the first says it does not drive the scanner | That is SANE's `INVAL` or `UNSUPPORTED`, the way HPLIP answers for a printer that only speaks eSCL. Not after a busy scanner, which another driver would only meet too, and not after an I/O error: the driver may have talked to the device, and a second one on a device in an unknown state is how a scanner gets reset. |
 | No `excluded_capabilities` option | A scanner not known to be for film is given `flatbed`, so a document application that asks for `any_capabilities` of `flatbed` and `adf` is already offered no film-only scanner, and still gets a flatbed with a transparency unit, which it should. An exclusion would only matter for an application that wants everything but one kind, and there is none yet. |
 | `handheld` is a capability, not only a frame with `lines` = -1 | A handheld scanner differs from the others before it is opened: its height is unknown and a person moves it, so a document application would not want it in the dialog. The portal takes it from SANE's device type "handheld scanner" and does not give it `flatbed`, so `any_capabilities` of `flatbed` and `feeder` already leaves it out and an application written for one asks for `handheld`. |
+| `last_in_image`, not `last_frame` | The flag is true on the last frame of the image the application combines (the blue pass of an RGB scan), not on the last frame of the scan: a feeder has more pages after it. The name says which. The end of the scan is a `no-documents` event, as before. |
 | `OpenScanner` is a request, not a call that returns the session | Opening takes seconds on USB and on a network scanner through `airscan` took 16 and 25 s, at D-Bus's default call timeout of 25 s, so a client that kept the default could fail on a scanner that would have opened. ScreenCast and GlobalShortcuts create their sessions the same way, and an application can show progress while it waits. The portal, Simple Scan, Negative Vibes and the test double all use it, and the scenarios check that the call returns before the scanner is open and that closing the request gives no `Response` and lets the scanner go. |
 | A dedicated `Busy` error | A locked scanner, a frame in progress and an option set during a frame are ordinary, expected conditions that an application must handle differently from a real failure. Folding them into `Failed` forces clients to guess from the message. |
 | Opaque scanner ids, never raw SANE device names | Some backends interpret device names as file paths or network addresses. Handing an application control of that string lets it steer the host at arbitrary files and hosts. |
@@ -320,7 +321,7 @@ The second application is what produced the frame numbers, the automatic values,
 field and a good deal of the interface documentation: the first application's needs alone
 were not enough to settle them.
 
-Not yet verified: the patches for main since the frame number, the `feeder` and `type` words and the removal of `ScannerEvents` (they apply, and were tested on 1.22.1), Simple Scan since the same changes, window-handle attachment for the dialog, the dialog in portal-gtk and in
+Not yet verified: the patches for main since the frame number, the `feeder` and `type` words, the removal of `ScannerEvents`, `handheld` and `last_in_image` (they apply, and were tested on 1.22.1), Simple Scan since the same changes, window-handle attachment for the dialog, the dialog in portal-gtk and in
 KDE, more than one network scanner or backend (one eSCL scanner has been tried), a helper
 that stops answering without dying, two applications opening the same scanner at the same
 instant, buttons on any scanner but the 8200i (the `genesys` and Pixma entries of the table in

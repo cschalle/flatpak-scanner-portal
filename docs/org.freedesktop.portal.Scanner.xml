@@ -17,7 +17,9 @@
       a list of typed options, and image data delivered one frame at a time.
 
       Typical use: SelectScanners() once, OpenScanner(), GetOptions(),
-      SetOptions(), then StartFrame() until last_frame is true.
+      SetOptions(), then StartFrame() until last_in_image is true, which
+      completes one image. A feeder scan is one image per page: call
+      StartFrame() again for the next, until a ``no-documents`` event.
 
       An application finds out whether the portal can be used by checking
       that the ``version`` property of this interface exists on
@@ -398,15 +400,19 @@
           A 16-bit sample is two bytes in the host's byte order, as SANE
           delivers it. Samples of one pixel are next to each other in a row.
 
-        * A scan in several passes is several frames, one for each of
-          ``red``, ``green`` and ``blue``, and ``last_frame`` is true on the
-          last of them. The application combines them.
+        * An image can take several frames. A scan in several passes is one
+          frame for each of the ``format`` values ``red``, ``green`` and
+          ``blue``, and the application combines them into one image.
+          ``last_in_image`` in the ``started`` event is true on the last frame
+          of the image. It is not the end of the scan: a feeder has another
+          page, and so another image, after it.
 
         * When ``lines`` is -1 the height is not known in advance, as for a
-          hand scanner, and the frame is as long as the data on the pipe.
+          handheld scanner, and the frame is as long as the data on the pipe.
 
-        Call again after ``finished`` while ``last_frame`` was false (for
-        example separate red, green, blue and infrared frames). Fails with
+        Call again after ``finished`` while ``last_in_image`` was false, for
+        the next frame of the same image (for example separate red, green,
+        blue and infrared frames). Fails with
         ``org.freedesktop.portal.Error.Busy`` if a frame is in progress.
         Closing the pipe early cancels the frame, as does Cancel().
 
@@ -458,8 +464,8 @@
         ``format`` (``s``: ``gray``, ``rgb``, ``red``, ``green``, ``blue``, and for
         scanners with an infrared channel ``ir``, ``rgbi``, ``grayi``),
         ``depth`` (``u``), ``pixels_per_line`` (``u``), ``bytes_per_line``
-        (``u``), ``lines`` (``i``, -1 when unknown, as for hand scanners)
-        and ``last_frame`` (``b``).
+        (``u``), ``lines`` (``i``, -1 when unknown, as for handheld scanners)
+        and ``last_in_image`` (``b``).
 
         ``finished``: all data was written. ``cancelled``: the frame was
         cancelled. ``no-documents``: the feeder or film holder is empty or

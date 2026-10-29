@@ -49,7 +49,7 @@ patches:
 
 | Package | `<release>/` | `main/` |
 |---|---|---|
-| xdg-desktop-portal | 1.22.1 (22 patches) | main (22) |
+| xdg-desktop-portal | 1.22.1 (23 patches) | main (23) |
 | xdg-desktop-portal-gnome | 50.0 (5) | main (5) |
 | xdg-desktop-portal-gtk | 1.15.3 (3) | main (3) |
 

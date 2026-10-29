@@ -45,7 +45,7 @@ def scan_frames(c, sess):
         if ev is None or ev[1] != "finished":
             raise SystemExit(f"frame ended with {ev}")
         frames.append((started, data))
-        if started["last_frame"]:
+        if started["last_in_image"]:
             return frames
 
 

@@ -1,0 +1,92 @@
+From eab4b09f902d569513cba462bad90c8343b849e3 Mon Sep 17 00:00:00 2001
+From: "Christian F.K. Schaller" <christian.schaller@gmail.com>
+Date: Thu, 29 Oct 2026 19:02:51 -0400
+Subject: [PATCH] scanner: Call last_frame last_in_image and say what it ends
+
+This commit renames the key last_frame of the started event to
+last_in_image. It is true on the last frame of the image that the
+application combines, not on the last frame of the scan: a feeder has
+more pages, and so more images, after it. The old name suggested the
+end of everything.
+
+The documentation of StartFrame() now says that the passes red, green
+and blue are values of the format key of the started event, that
+last_in_image completes one image, and that a feeder scan continues
+with the next page until a no-documents event. It also uses "handheld"
+for the scanners the capability handheld names.
+
+Tested with the scenario checks, which pass. The hardware cancel script
+reads the new key and was not run, and no multi-pass scanner was tried.
+---
+ data/org.freedesktop.portal.Scanner.xml | 24 +++++++++++++++---------
+ src/scanner-helper.c                    |  2 +-
+ 2 files changed, 16 insertions(+), 10 deletions(-)
+
+diff --git a/data/org.freedesktop.portal.Scanner.xml b/data/org.freedesktop.portal.Scanner.xml
+index 6681510..bdbc730 100644
+--- a/data/org.freedesktop.portal.Scanner.xml
++++ b/data/org.freedesktop.portal.Scanner.xml
+@@ -17,7 +17,9 @@
+       a list of typed options, and image data delivered one frame at a time.
+ 
+       Typical use: SelectScanners() once, OpenScanner(), GetOptions(),
+-      SetOptions(), then StartFrame() until last_frame is true.
++      SetOptions(), then StartFrame() until last_in_image is true, which
++      completes one image. A feeder scan is one image per page: call
++      StartFrame() again for the next, until a ``no-documents`` event.
+ 
+       An application finds out whether the portal can be used by checking
+       that the ``version`` property of this interface exists on
+@@ -398,15 +400,19 @@
+           A 16-bit sample is two bytes in the host's byte order, as SANE
+           delivers it. Samples of one pixel are next to each other in a row.
+ 
+-        * A scan in several passes is several frames, one for each of
+-          ``red``, ``green`` and ``blue``, and ``last_frame`` is true on the
+-          last of them. The application combines them.
++        * An image can take several frames. A scan in several passes is one
++          frame for each of the ``format`` values ``red``, ``green`` and
++          ``blue``, and the application combines them into one image.
++          ``last_in_image`` in the ``started`` event is true on the last frame
++          of the image. It is not the end of the scan: a feeder has another
++          page, and so another image, after it.
+ 
+         * When ``lines`` is -1 the height is not known in advance, as for a
+-          hand scanner, and the frame is as long as the data on the pipe.
++          handheld scanner, and the frame is as long as the data on the pipe.
+ 
+-        Call again after ``finished`` while ``last_frame`` was false (for
+-        example separate red, green, blue and infrared frames). Fails with
++        Call again after ``finished`` while ``last_in_image`` was false, for
++        the next frame of the same image (for example separate red, green,
++        blue and infrared frames). Fails with
+         ``org.freedesktop.portal.Error.Busy`` if a frame is in progress.
+         Closing the pipe early cancels the frame, as does Cancel().
+ 
+@@ -458,8 +464,8 @@
+         ``format`` (``s``: ``gray``, ``rgb``, ``red``, ``green``, ``blue``, and for
+         scanners with an infrared channel ``ir``, ``rgbi``, ``grayi``),
+         ``depth`` (``u``), ``pixels_per_line`` (``u``), ``bytes_per_line``
+-        (``u``), ``lines`` (``i``, -1 when unknown, as for hand scanners)
+-        and ``last_frame`` (``b``).
++        (``u``), ``lines`` (``i``, -1 when unknown, as for handheld scanners)
++        and ``last_in_image`` (``b``).
+ 
+         ``finished``: all data was written. ``cancelled``: the frame was
+         cancelled. ``no-documents``: the feeder or film holder is empty or
+diff --git a/src/scanner-helper.c b/src/scanner-helper.c
+index 50c2da4..0cbc072 100644
+--- a/src/scanner-helper.c
++++ b/src/scanner-helper.c
+@@ -771,7 +771,7 @@ frame_parameters_to_variant (const SANE_Parameters *params,
+   g_variant_builder_add (&builder, "{sv}", "pixels_per_line", g_variant_new_uint32 (params->pixels_per_line));
+   g_variant_builder_add (&builder, "{sv}", "bytes_per_line", g_variant_new_uint32 (params->bytes_per_line));
+   g_variant_builder_add (&builder, "{sv}", "lines", g_variant_new_int32 (params->lines));
+-  g_variant_builder_add (&builder, "{sv}", "last_frame", g_variant_new_boolean (params->last_frame));
++  g_variant_builder_add (&builder, "{sv}", "last_in_image", g_variant_new_boolean (params->last_frame));
+ 
+   return g_variant_builder_end (&builder);
+ }
+-- 
+2.56.0
+
