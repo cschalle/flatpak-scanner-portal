@@ -44,23 +44,7 @@ for p in "${PKGS[@]}"; do
   fi
   cp "$HERE/$p"/* "$top/SOURCES/" 2>/dev/null || true
   rm -f "$top/SOURCES/$p.spec"
-  python3 - "$spec" "$top/SPECS/$p.spec" "$top/SOURCES" "$SUFFIX" "$p" "$RELNUM" <<'PY'
-import glob, os, re, sys
-spec, out, sources, suffix, pkg, rel = sys.argv[1:]
-s = open(spec).read()
-patches = sorted(os.path.basename(f) for f in glob.glob(sources + "/0*.patch"))
-lines = "".join("Patch%04d: %s\n" % (i + 1, f) for i, f in enumerate(patches))
-s = re.sub(r"^(Source0:.*\n)", lambda m: m.group(1) + lines, s, count=1, flags=re.M)
-s = s.replace("Release: %autorelease", "Release: " + rel + "%{?dist}." + suffix).replace("Release:        %autorelease", "Release:        " + rel + "%{?dist}." + suffix)
-s = s.replace("%autochangelog", "* Mon Oct 26 2026 Christian Schaller <christian.schaller@gmail.com> - %s-%s.%s\n- Add the scanner portal (prototype)\n" % ("VERSION", rel, suffix))
-v = re.search(r"^Version:\s*(\S+)", s, re.M).group(1)
-s = s.replace("- VERSION-", "- " + v + "-")
-if pkg == "xdg-desktop-portal":
-    s = s.replace("BuildRequires: pkgconfig(libsystemd)\n", "BuildRequires: pkgconfig(libsystemd)\nBuildRequires: pkgconfig(sane-backends)\n", 1)
-    s = s.replace("%meson %{!?with_docs:-Ddocumentation=disabled}", "%meson -Dsane=enabled %{!?with_docs:-Ddocumentation=disabled}")
-    s = s.replace("%{_libexecdir}/xdg-desktop-portal-rewrite-launchers\n", "%{_libexecdir}/xdg-desktop-portal-rewrite-launchers\n%{_libexecdir}/xdg-desktop-portal-scanner-helper\n", 1)
-open(out, "w").write(s)
-PY
+  python3 "$(dirname "$0")/patch-spec.py" "$spec" "$top/SPECS/$p.spec" "$top/SOURCES" "$SUFFIX" "$p" "$RELNUM"
   grep -E "^(Release|Patch)" "$top/SPECS/$p.spec" | sed 's/^/   /'
 done
 

@@ -1,0 +1,23 @@
+name: RPM
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  fedora-rpm:
+    runs-on: ubuntu-latest
+    container:
+      image: registry.fedoraproject.org/fedora:44
+    steps:
+      - name: Install git
+        run: dnf -y -q install git
+      - uses: actions/checkout@v4
+      - name: Build the RPMs
+        run: rpm/build-ci.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: scanner-portal-fedora-44-rpms
+          path: rpm/out/
