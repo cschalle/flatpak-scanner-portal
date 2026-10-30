@@ -3,7 +3,15 @@ name: RPM
 on:
   push:
     branches: [main]
+    paths:
+      - 'patches/**'
+      - 'rpm/**'
+      - '.github/workflows/rpm.yml'
   pull_request:
+    paths:
+      - 'patches/**'
+      - 'rpm/**'
+      - '.github/workflows/rpm.yml'
   workflow_dispatch:
 
 jobs:
