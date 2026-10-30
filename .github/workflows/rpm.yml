@@ -24,7 +24,8 @@ jobs:
         run: dnf -y -q install git
       - uses: actions/checkout@v7
       - name: Build the RPMs
-        run: rpm/build-ci.sh
+        # 1000 and up, above the release numbers of local builds, and higher with every run so that dnf sees an upgrade
+        run: SCANNER_RELEASE=$((1000 + GITHUB_RUN_NUMBER)) rpm/build-ci.sh
       - uses: actions/upload-artifact@v7
         with:
           name: scanner-portal-fedora-44-rpms
