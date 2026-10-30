@@ -30,3 +30,26 @@ jobs:
         with:
           name: scanner-portal-fedora-44-rpms
           path: rpm/out/
+
+  # The RPMs of the latest build on main, at a link that needs no login
+  publish:
+    needs: fedora-rpm
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          name: scanner-portal-fedora-44-rpms
+          path: rpms
+      - name: Replace the rpms-latest pre-release
+        run: |
+          gh release delete rpms-latest --cleanup-tag --yes || true
+          gh release create rpms-latest --prerelease --target "$GITHUB_SHA" \
+            --title "Fedora 44 RPMs of the latest build" \
+            --notes "Built by CI from $GITHUB_SHA. Not signed; for testing the scanner portal." \
+            rpms/*.x86_64.rpm

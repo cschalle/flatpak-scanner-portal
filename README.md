@@ -40,6 +40,21 @@ patches for the three portals. The applications that use it are separate project
 | `patches/` | The scanner patches for xdg-desktop-portal, -gnome and -gtk, as files |
 | `rpm/build.sh` | Builds the three portals with the patches as RPMs for Fedora 44 |
 
+## Try it: RPMs for Fedora 44
+
+CI builds the three portals with the scanner patches on every change to `patches/` or `rpm/`, and
+keeps the latest build at
+**[Releases, rpms-latest](https://github.com/cschalle/flatpak-scanner-portal/releases/tag/rpms-latest)**.
+The RPMs are not signed, and the release number goes up with each build, so a newer build upgrades
+an older one:
+
+    sudo dnf install ./xdg-desktop-portal-*.rpm
+
+Download all the `.rpm` files of the release first, leave out the `-debuginfo` and `-debugsource`
+ones if you like, and log out and in again afterwards. They replace the portals of Fedora, so
+`sudo dnf distro-sync xdg-desktop-portal xdg-desktop-portal-gnome xdg-desktop-portal-gtk` takes them
+off again.
+
 ## The portal code
 
 The frontend (`scanner.c`, `scanner-helper.c`, and `data/scanner-devices.json`) is a branch of a clone of xdg-desktop-portal, and
