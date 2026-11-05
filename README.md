@@ -44,7 +44,10 @@ patches for the three portals. The applications that use it are separate project
 
 CI builds the three portals with the scanner patches on every change to `patches/` or `rpm/`, and
 keeps the latest build at
-**[Releases, rpms-latest](https://github.com/cschalle/flatpak-scanner-portal/releases/tag/rpms-latest)**.
+**[Releases, rpms-latest](https://github.com/cschalle/flatpak-scanner-portal/releases/tag/rpms-latest)**,
+and mirrored as a generic OCI artifact in
+**[Packages](https://github.com/cschalle/flatpak-scanner-portal/packages)** (`oras pull
+ghcr.io/cschalle/flatpak-scanner-portal:latest`; GitHub Packages has no RPM/yum repository type).
 The RPMs are not signed, and the release number goes up with each build, so a newer build upgrades
 an older one:
 

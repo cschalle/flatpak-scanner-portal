@@ -53,3 +53,26 @@ jobs:
             --title "Fedora 44 RPMs of the latest build" \
             --notes "Built by CI from $GITHUB_SHA. Not signed; for testing the scanner portal." \
             rpms/*.x86_64.rpm
+
+  # Mirror the same RPMs into this repo's GitHub Packages, as a generic OCI artifact (GitHub
+  # Packages has no RPM/yum repository type, so there's no "real" package type to push to)
+  packages:
+    needs: fedora-rpm
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          name: scanner-portal-fedora-44-rpms
+          path: rpms
+      - uses: oras-project/setup-oras@v1
+      - name: Push the RPMs to ghcr.io
+        run: |
+          echo "${{ github.token }}" | oras login ghcr.io -u "${{ github.actor }}" --password-stdin
+          oras push "ghcr.io/${{ github.repository }}:latest,${{ github.run_number }}" \
+            --artifact-type application/vnd.fedoraproject.rpm \
+            --annotation "org.opencontainers.image.source=https://github.com/${{ github.repository }}" \
+            --annotation "org.opencontainers.image.description=Fedora 44 RPMs of xdg-desktop-portal, xdg-desktop-portal-gnome and xdg-desktop-portal-gtk with the scanner portal patches. Not signed; for testing the scanner portal." \
+            rpms/*.x86_64.rpm
