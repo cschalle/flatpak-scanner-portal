@@ -1,0 +1,350 @@
+From dfc628a8915ab5741dbe9a694d755ba27ffd95ea Mon Sep 17 00:00:00 2001
+From: "Christian F.K. Schaller" <christian.schaller@gmail.com>
+Date: Mon, 16 Nov 2026 15:42:18 -0500
+Subject: [PATCH] scanner: Let an application ask for a choice to be
+ remembered, with persist
+
+An application that keeps a scanner of its own, such as a profile, had to
+ask the user at every launch, since the grant ended with the run.
+
+SelectScanners takes persist. The dialog is told, and is where the user
+agrees: it says so with persist in its answer, and a dialog that does not
+know of it leaves it out, so nothing is kept. Then, for each chosen
+scanner whose persistent is true, the frontend writes a yes for the
+application to the permission store, in the table scanner under the
+scanner id, as the USB portal does for devices. It is taken back with
+`flatpak permission-remove scanner ID APP`. The answer has persist, true if
+at least one scanner is kept.
+
+ListScanners and OpenScanner look in the store as well as in the grants of
+the run. ListScanners reads the ids the application has there before it
+asks the hardware, so that an application with nothing is still not the
+cause of a probe. A scanner that is not there is not listed, and its
+entry waits. An application with no id, a host one, is kept nothing, and
+the dialog is not told it may be, since its entry would be every such
+application's.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ data/org.freedesktop.impl.portal.Scanner.xml |  9 +++
+ data/org.freedesktop.portal.Scanner.xml      | 29 ++++++-
+ desktop-portal/scanner.c                     | 83 +++++++++++++++++++-
+ desktop-portal/xdp-permissions.c             | 25 ++++++
+ desktop-portal/xdp-permissions.h             |  4 +
+ 5 files changed, 143 insertions(+), 7 deletions(-)
+
+diff --git a/data/org.freedesktop.impl.portal.Scanner.xml b/data/org.freedesktop.impl.portal.Scanner.xml
+index a8cd75d..a28bf39 100644
+--- a/data/org.freedesktop.impl.portal.Scanner.xml
++++ b/data/org.freedesktop.impl.portal.Scanner.xml
+@@ -34,6 +34,15 @@
+ 
+           The ids chosen from @scanners. The frontend keeps the grant in memory.
+ 
++        * ``persist`` (``b``)
++
++          Whether the user agreed to let the portal remember the choice. Only
++          when @options has ``persist`` set to true: the application asks, and the
++          dialog is where the user is told and answers, for example with a
++          switch that is off to start with. The frontend keeps the choice only
++          if this is true, so a dialog that does not know of it, and leaves it
++          out, remembers nothing.
++
+         The frontend does not wait for every driver before it calls this. Finding the
+         scanners can take seconds, mostly for the ones on the network, while a scanner on USB
+         is found at once. If the frontend is still looking, @options has ``searching`` (``b``)
+diff --git a/data/org.freedesktop.portal.Scanner.xml b/data/org.freedesktop.portal.Scanner.xml
+index 868c696..ed68d1f 100644
+--- a/data/org.freedesktop.portal.Scanner.xml
++++ b/data/org.freedesktop.portal.Scanner.xml
+@@ -41,11 +41,19 @@
+ 
+         Presents a dialog listing the scanners the host knows about and lets
+         the user choose which ones the application may use. The choice lasts
+-        until the application leaves the bus; nothing is stored, so the
+-        application must ask again the next time it starts.
++        until the application leaves the bus, unless the application asked
++        for it to be remembered with ``persist`` and the user agreed. Then
++        the scanners that have ``persistent`` set in their information are
++        still listed by ListScanners() the next time the application runs,
++        and the application need not ask again. The choice is kept in the
++        permission store, in the table ``scanner`` under the scanner id, and
++        is taken back with ``flatpak permission-remove scanner ID APP``.
++        Nothing is kept for an application that has no application id,
++        such as one that is not sandboxed.
+ 
+         Call it in response to the user asking to choose a scanner, or when
+-        ListScanners() returns nothing, which is the case after every start. The dialog waits
++        ListScanners() returns nothing, which is the case after every start
++        for the choice that was not remembered. The dialog waits
+         for the user, so applications that have a worker thread should not
+         block it on the response, and should close the request with
+         org.freedesktop.portal.Request.Close() if they stop waiting.
+@@ -65,6 +73,15 @@
+ 
+           Whether more than one scanner may be selected. Defaults to no.
+ 
++        * ``persist`` (``b``)
++
++          Whether to ask the user to let the portal remember the choice, so
++          that the scanners can be used again the next time the application
++          runs. Defaults to no. Only a scanner whose ``persistent`` is true can
++          be remembered, since the id of another is not the same next time, and
++          the application must ask again for it. The user may decline, and
++          a desktop whose dialog does not offer it never remembers.
++
+         * ``accept_label`` (``s``)
+ 
+           Label for the accept button. Mnemonic underlines are allowed.
+@@ -101,6 +118,12 @@
+ 
+           The selected scanners as an array of scanner id and a vardict with
+           the keys described in ListScanners().
++
++        * ``persist`` (``b``)
++
++          Whether at least one of the scanners will be remembered. False if
++          the application did not ask, the user did not agree, or none of them
++          is ``persistent``.
+     -->
+     <method name="SelectScanners">
+       <arg type="s" name="parent_window" direction="in"/>
+diff --git a/desktop-portal/scanner.c b/desktop-portal/scanner.c
+index 72f6972..14efb96 100644
+--- a/desktop-portal/scanner.c
++++ b/desktop-portal/scanner.c
+@@ -22,6 +22,7 @@
+ #include "xdp-context.h"
+ #include "xdp-dbus.h"
+ #include "xdp-impl-dbus.h"
++#include "xdp-permissions.h"
+ #include "xdp-portal-config.h"
+ #include "scanner-protocol.h"
+ #include "xdp-request.h"
+@@ -109,6 +110,28 @@ scanner_grants_from_app_info (XdpAppInfo *app_info)
+   return grants;
+ }
+ 
++/* The table of the permission store that has the scanners an application may use again, by id.
++ * Only the ids that are `persistent` are kept, and the entry of a scanner is the application's
++ * yes. It is the one the USB portal has for devices, and is revoked the same way, with
++ * `flatpak permission-remove scanner ID APP`. */
++#define SCANNER_PERMISSION_TABLE "scanner"
++
++/* Whether an application may use a scanner: the user chose it in this run, or in an earlier one and
++ * let the portal remember it. A host application has no id of its own, so nothing is kept for it
++ * and the scanner of one is not another's. The caller holds the mutex. */
++static gboolean
++scanner_is_granted (XdpAppInfo *app_info,
++                    const char *scanner_id)
++{
++  if (g_hash_table_contains (scanner_grants_from_app_info (app_info), scanner_id))
++    return TRUE;
++
++  if (*xdp_app_info_get_id (app_info) == '\0')
++    return FALSE;
++
++  return xdp_get_permission_sync (app_info, SCANNER_PERMISSION_TABLE, scanner_id) == XDP_PERMISSION_YES;
++}
++
+ /* ---- The scanners the host has ----
+  *
+  * One entry per scanner: an opaque id and the information vardict that ListScanners returns,
+@@ -1345,6 +1368,15 @@ handle_list_scanners (XdpDbusScanner         *object,
+   has_grants = g_hash_table_size (grants) > 0;
+   g_mutex_unlock (&self->mutex);
+ 
++  /* The ones the user let the portal remember are in the permission store, and are looked for there
++   * and not among the scanners, which would be a probe of the hardware */
++  if (!has_grants && *xdp_app_info_get_id (app_info) != '\0')
++    {
++      g_auto(GStrv) remembered = xdp_get_permitted_ids_sync (app_info, SCANNER_PERMISSION_TABLE);
++
++      has_grants = remembered != NULL && remembered[0] != NULL;
++    }
++
+   if (has_grants)
+     devices = scanner_enumerate (self, SCANNER_CACHE_SECONDS);
+   else
+@@ -1358,7 +1390,7 @@ handle_list_scanners (XdpDbusScanner         *object,
+     {
+       ScannerDevice *device = g_ptr_array_index (devices, i);
+ 
+-      if (g_hash_table_contains (grants, device->id))
++      if (scanner_is_granted (app_info, device->id))
+         g_variant_builder_add_value (&scanners_builder, scanner_device_to_variant (device));
+     }
+   g_mutex_unlock (&self->mutex);
+@@ -1375,6 +1407,7 @@ typedef struct
+ {
+   XdpScanner *scanner;
+   gboolean multiple;
++  gboolean persist;       /* the application asked for the choice to be remembered */
+   GHashTable *candidates; /* id → GVariant (s, a{sv}) */
+   GStrv required;         /* the capabilities asked for: a scanner has all of them */
+   GStrv any;              /* the capabilities asked for: a scanner has at least one of them */
+@@ -1425,6 +1458,8 @@ select_scanners_cb (GObject      *source_object,
+   SelectData *data;
+   GHashTable *grants;
+   guint response = XDG_DESKTOP_PORTAL_RESPONSE_OTHER;
++  g_autoptr(GPtrArray) to_remember = g_ptr_array_new_with_free_func (g_free);
++  gboolean remember = FALSE;
+   guint n_chosen = 0;
+ 
+   REQUEST_AUTOLOCK (request);
+@@ -1457,6 +1492,12 @@ select_scanners_cb (GObject      *source_object,
+       goto out;
+     }
+ 
++  /* The choice is kept only if the application asked, and the dialog told the user and the user
++   * agreed: the dialog says so with persist in its answer. A dialog that does not know of it does
++   * not say, and nothing is kept. */
++  if (data->persist)
++    g_variant_lookup (results, "persist", "b", &remember);
++
+   g_mutex_lock (&self->mutex);
+   grants = scanner_grants_from_app_info (request->app_info);
+ 
+@@ -1470,6 +1511,17 @@ select_scanners_cb (GObject      *source_object,
+         continue;
+ 
+       g_hash_table_add (grants, g_strdup (ids[i]));
++
++      /* Only a scanner whose id is the same next time can be remembered */
++      if (remember)
++        {
++          g_autoptr(GVariant) info = g_variant_get_child_value (candidate, 1);
++          gboolean persistent = FALSE;
++
++          if (g_variant_lookup (info, "persistent", "b", &persistent) && persistent)
++            g_ptr_array_add (to_remember, g_strdup (ids[i]));
++        }
++
+       /* The dialog was offered the entry of the driver that answered first. Once the search is over
+        * the merged one is known, whose backend is the driver that will open the scanner. */
+       {
+@@ -1486,13 +1538,22 @@ select_scanners_cb (GObject      *source_object,
+            xdp_app_info_get_id (request->app_info), g_hash_table_size (grants));
+   g_mutex_unlock (&self->mutex);
+ 
++  for (guint i = 0; i < to_remember->len; i++)
++    xdp_set_permission_sync (request->app_info, SCANNER_PERMISSION_TABLE,
++                             g_ptr_array_index (to_remember, i), XDP_PERMISSION_YES);
++
+   if (n_chosen == 0)
+     response = XDG_DESKTOP_PORTAL_RESPONSE_OTHER;
+ 
+ out:
+   if (response == XDG_DESKTOP_PORTAL_RESPONSE_SUCCESS)
+-    g_variant_builder_add (&results_builder, "{sv}", "scanners",
+-                           g_variant_builder_end (&chosen_builder));
++    {
++      g_variant_builder_add (&results_builder, "{sv}", "scanners",
++                             g_variant_builder_end (&chosen_builder));
++      /* Whether at least one of them will be there the next time the application asks */
++      g_variant_builder_add (&results_builder, "{sv}", "persist",
++                             g_variant_new_boolean (to_remember->len > 0));
++    }
+   else
+     g_variant_builder_clear (&chosen_builder);
+ 
+@@ -1769,11 +1830,13 @@ handle_select_scanners (XdpDbusScanner         *object,
+   XdpRequest *request;
+   GVariant *offered;
+   gboolean multiple = FALSE;
++  gboolean persist = FALSE;
+   gboolean searching = FALSE;
+ 
+   static const XdpOptionKey scanner_select_options[] = {
+     { "modal", G_VARIANT_TYPE_BOOLEAN, NULL },
+     { "multiple", G_VARIANT_TYPE_BOOLEAN, NULL },
++    { "persist", G_VARIANT_TYPE_BOOLEAN, NULL },
+     { "accept_label", G_VARIANT_TYPE_STRING, NULL },
+     { "title", G_VARIANT_TYPE_STRING, NULL },
+     { "required_capabilities", G_VARIANT_TYPE_STRING_ARRAY, validate_required_capabilities },
+@@ -1798,6 +1861,17 @@ handle_select_scanners (XdpDbusScanner         *object,
+   filtered_options = g_variant_ref_sink (g_variant_builder_end (&options_builder));
+ 
+   g_variant_lookup (filtered_options, "multiple", "b", &multiple);
++  g_variant_lookup (filtered_options, "persist", "b", &persist);
++  /* Nothing is kept for an application with no id, so the dialog is not told it may be */
++  if (persist && *xdp_app_info_get_id (request->app_info) == '\0')
++    {
++      g_autoptr(GVariantDict) without = g_variant_dict_new (filtered_options);
++
++      g_variant_dict_remove (without, "persist");
++      g_variant_unref (filtered_options);
++      filtered_options = g_variant_ref_sink (g_variant_dict_end (without));
++      persist = FALSE;
++    }
+   g_variant_lookup (filtered_options, "required_capabilities", "^a&s", &required);
+   g_variant_lookup (filtered_options, "any_capabilities", "^a&s", &any);
+ 
+@@ -1806,6 +1880,7 @@ handle_select_scanners (XdpDbusScanner         *object,
+   data = g_new0 (SelectData, 1);
+   data->scanner = g_object_ref (self);
+   data->multiple = multiple;
++  data->persist = persist;
+   data->required = g_strdupv ((char **) required);
+   data->any = g_strdupv ((char **) any);
+   data->cancellable = g_cancellable_new ();
+@@ -2524,7 +2599,7 @@ handle_open_scanner (XdpDbusScanner         *object,
+   token_copy = g_strdup (token != NULL ? token : "t");
+ 
+   g_mutex_lock (&self->mutex);
+-  granted = g_hash_table_contains (scanner_grants_from_app_info (app_info), scanner_id);
++  granted = scanner_is_granted (app_info, scanner_id);
+   g_mutex_unlock (&self->mutex);
+ 
+   if (!granted)
+diff --git a/desktop-portal/xdp-permissions.c b/desktop-portal/xdp-permissions.c
+index b9d95f8..31956e2 100644
+--- a/desktop-portal/xdp-permissions.c
++++ b/desktop-portal/xdp-permissions.c
+@@ -268,6 +268,31 @@ xdp_permission_set_future (XdpAppInfo    *app_info,
+                                      (const char * const *) perms);
+ }
+ 
++char **
++xdp_get_permitted_ids_sync (XdpAppInfo *app_info,
++                            const char *table)
++{
++  g_autoptr(GError) error = NULL;
++  g_auto(GStrv) ids = NULL;
++  GPtrArray *permitted = g_ptr_array_new ();
++
++  if (!xdp_dbus_impl_permission_store_call_list_sync (permission_store, table, &ids, NULL, &error))
++    {
++      g_dbus_error_strip_remote_error (error);
++      g_debug ("No '%s' table: %s", table, error->message);
++      g_ptr_array_add (permitted, NULL);
++      return (char **) g_ptr_array_free (permitted, FALSE);
++    }
++
++  for (size_t i = 0; ids != NULL && ids[i] != NULL; i++)
++    if (xdp_get_permission_sync (app_info, table, ids[i]) == XDP_PERMISSION_YES)
++      g_ptr_array_add (permitted, g_strdup (ids[i]));
++
++  g_ptr_array_add (permitted, NULL);
++
++  return (char **) g_ptr_array_free (permitted, FALSE);
++}
++
+ gboolean
+ xdp_init_permission_store (GDBusConnection  *connection,
+                            GError          **error)
+diff --git a/desktop-portal/xdp-permissions.h b/desktop-portal/xdp-permissions.h
+index cd69b74..1426f01 100644
+--- a/desktop-portal/xdp-permissions.h
++++ b/desktop-portal/xdp-permissions.h
+@@ -54,6 +54,10 @@ DexFuture * xdp_permission_set_future (XdpAppInfo    *app_info,
+                                        const char    *id,
+                                        XdpPermission  permission);
+ 
++/* The ids in a table that the application has been given the permission "yes" for, or NULL */
++char **xdp_get_permitted_ids_sync (XdpAppInfo *app_info,
++                                   const char *table);
++
+ char **xdp_permissions_from_tristate (XdpPermission permission);
+ 
+ XdpPermission xdp_permissions_to_tristate (char **permissions);

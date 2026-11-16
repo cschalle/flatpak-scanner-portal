@@ -43,8 +43,10 @@ the same kind of consent question, has none.
 
 - A sandboxed application can scan with no device, network or filesystem access.
 - The user chooses which scanners an application may use, in a dialog. The choice lasts while
-  the application runs, so nothing is stored and there is nothing to revoke. The choice is not
-  remembered across runs, on purpose (see the decisions table).
+  the application runs. An application that keeps a scanner of its own, such as a profile, may ask
+  for the choice to be remembered, and the user is asked in the dialog: it is then kept in the
+  permission store for the scanners whose id stays the same, and revoked there (see the decisions
+  table).
 - libsane and its backends run on the host, so host and proprietary drivers work and the
   host's SANE configuration applies.
 - The API is rich enough for demanding applications: multi-bit-depth, infrared, multi-pass,
@@ -124,7 +126,8 @@ portal reports them.
 `ButtonEvent` on the session that has the scanner open. Nothing new for an application to call.
 There is no way to watch the buttons without holding the scanner, and no launch of an
 application on a press: both would need the portal to know an application across launches, which
-it does not, because grants are not remembered.
+it does not, unless the user let it remember the grant, which is not an application that is
+running or one that has been told of a press.
 
 **Who gets a press.** The session that has the scanner open, which is one at a time because the
 lock is exclusive. A press goes only to an application that was granted the scanner; it tells it
@@ -176,7 +179,7 @@ Consent and enumeration:
 
 | Member | Purpose |
 |---|---|
-| `SelectScanners(parent_window, options) → Request` | Shows the dialog and records the grant for the application's connection. Called on a user action, or when `ListScanners` comes back empty, which is the case on every start, since grants are not remembered. `options` can ask for `multiple` and filter on `required_capabilities` (all of them) or `any_capabilities` (at least one of them), from `film`, `feeder`, `infrared`, `flatbed`, `color`. |
+| `SelectScanners(parent_window, options) → Request` | Shows the dialog and records the grant for the application's connection. Called on a user action, or when `ListScanners` comes back empty, which is the case on every start for a choice that was not remembered. `options` can ask for `multiple`, for `persist` (the user is asked to let the portal remember the choice, for the scanners whose `persistent` is true) and filter on `required_capabilities` (all of them) or `any_capabilities` (at least one of them), from `film`, `feeder`, `infrared`, `flatbed`, `color`. |
 | `ListScanners(options) → a(sa{sv})` | The granted, currently available scanners. Each is an opaque id plus `name`, `vendor`, `model`, `backend`, `kind`, `type` (`scanner`, `film` or `other`), `capabilities`, `buttons`, `available`. |
 
 Scanning, on a `Session` from `OpenScanner`:
@@ -219,8 +222,10 @@ assembled and returns the ids the user picked. Searching can take seconds, since
 waits on the network, so the frontend shows the dialog after at most 300 ms with what has been
 found, sets `searching` in the options, and sends the rest with `UpdateScanners` as the drivers
 answer; the last call says the search is over. Only scanners that were offered to the dialog can be
-granted. The frontend keeps the grant in memory for as long as the application stays on the bus;
-nothing is written to disk.
+granted. The frontend keeps the grant in memory for as long as the application stays on the bus.
+Only if the application asked with `persist` and the dialog says that the user agreed is a grant
+for a scanner whose `persistent` is true also written to the permission store, which is what
+`ListScanners` and `OpenScanner` look in on the next run.
 
 ## Decisions and why
 
@@ -257,7 +262,7 @@ nothing is written to disk.
 | The application sees only granted scanners | Enumerating the LAN's scanners is a fingerprinting and privacy problem, and not something an application needs before the user has chosen anything. |
 | A `Session` for an open scanner | Lifecycle comes for free: the application exiting releases the hardware lock, and the portal can revoke access with `Session.Closed`. |
 | No per-scan prompt once granted | An application with a grant can scan only what is on the glass or in the feeder, and the dialog names the scanner, so one choice per run of the application is proportionate. It is not true that a scan cannot happen unnoticed: a page left in the scanner can be read. The exposure is small, and a prompt for every scan would make the scanning applications unusable. Open to argument if reviewers disagree. |
-| Grants last for the application's run and are kept in memory | The print portal asks every time and keeps nothing, and scanning is an occasional, deliberate act like printing, so a dialog at the start of a scanning session is the expected cost. It removes the permission table, a revocation path and a settings panel from v1, and the user's only revocation is to close the application. The choice is not remembered across runs. The USB portal stores grants in the permission store, where they are revocable; doing that here would cost a permission table, a stable scanner id, a revocation path and a place in Settings, and what it saves is one dialog on the launch of a scanning application. We do not plan to add it. If reviewers want it, it could be a `remember` option answered in the dialog, but it needs ids that survive a replug, which most scanners do not give; see Scanner identity. |
+| Grants last for the application's run, unless the application asks and the user agrees to have them remembered | The print portal asks every time and keeps nothing, and scanning is an occasional, deliberate act like printing, so a dialog at the start of a scanning session is the expected cost for most applications. An application with profiles tied to one scanner, as NAPS2 has, would ask at every launch, and cannot be built on that. So the application may pass `persist`, and the dialog, which is where the user is told, answers with `persist` if the user agreed, as a switch that is off to start with. The frontend keeps the choice only on that answer, so a dialog that knows nothing of it keeps nothing. What is kept is one entry of the permission store for each scanner, in the table `scanner`, under its id, and a "yes" for the application, as the USB portal does for devices; it is taken back with `flatpak permission-remove scanner ID APP` and by anything else that edits the store. Only a scanner whose `persistent` is true can be kept, since another has a new id the next time. A host application with no id gets nothing kept, and the dialog is not told it may be. `ListScanners` and `OpenScanner` read the table, `ListScanners` without a look at the hardware for an application that has nothing in it. The portal says nothing of an entry for a scanner that is not there: it is not listed, as the call has always said. |
 | The backend does UI only | Same split as `org.freedesktop.impl.portal.Usb`, and it keeps libsane out of the desktop shell's process as well as out of the frontend's. |
 
 ## Scanner identity
@@ -314,11 +319,11 @@ report none or a placeholder.
    does not. By rule 3 the id must be the same from each, so a network scanner cannot have one
    until the host can give every driver the same name, from mDNS: Avahi, which the helper does
    not use today. This is the open part.
-7. **A grant that is kept names a scanner that may be missing.** Not implemented: v1 keeps no
-   grant. `ListScanners` would return it with `available` = false, and never match it to another
-   scanner.
+7. **A grant that is kept names a scanner that may be missing.** It is not listed: `ListScanners`
+   is the scanners that are granted and there, as it was, and the entry waits in the store for
+   the scanner to come back. It is never matched to another scanner.
 8. **Losing a grant is never an error.** If a port changes, the application gets an empty
-   `ListScanners` and calls `SelectScanners` again, as on every start in v1.
+   `ListScanners` and calls `SelectScanners` again.
 
 **What was found by building it.**
 
@@ -338,8 +343,9 @@ network scanner needs a lookup of the mDNS name for each driver.
 
 **What it does not do.** It does not make every scanner persistent: one without a serial number
 loses its id when the cable moves, and a network scanner has none yet, and the application should
-say so and not treat that as a fault. And it says nothing about where a kept grant is stored or
-how it is revoked, which `Grants last for the application's run` leaves out of v1.
+say so and not treat that as a fault. And an application that wants to know that the scanner it
+saved is gone, and not only that it is not listed, has no call for it; it keeps its own name for
+the scanner and compares.
 
 ## Security and privacy
 
@@ -351,7 +357,10 @@ how it is revoked, which `Grants last for the application's run` leaves out of v
   file name options above all — are not listed by `GetOptions` and cannot be set.
 - Grants are kept in memory by the frontend, per application connection, and end when the
   application leaves the bus, which also closes its sessions. A restart of the frontend forgets
-  them, and applications ask again. The portal can still end a session at any time with
+  them, and applications ask again, except for the ones the user let the portal remember, which are
+  in the permission store, the same place and the same revocation as the USB portal's. They are
+  asked for by the application and agreed to by the user in the dialog, and only for scanners whose
+  id stays the same, and only for an application with an id. The portal can still end a session at any time with
   `Session.Closed`.
 - The host's exclusive lock means one application at a time has the scanner, so one sandbox
   cannot read another's scan in progress.
@@ -394,6 +403,7 @@ against it from inside a Flatpak with neither `--device=all` nor `--share=networ
 | Portal path versus libsane | Parity test scanning the same options through both, via one trait | Frame parameters, pixel data, option descriptors and constraints identical; busy scanner, empty feeder, rejected value and cancel-with-unread-pipe all surface as the same conditions |
 | Real hardware | Plustek OpticFilm 8200i film scanner, 23 checks | Pass, including colour plus infrared, two numbered frames in one session, and cancel then rescan; colour, infrared, repeat and cancel match libsane within sensor noise |
 | Flatpak sandbox | Scenarios and a GTK application, no `--device=all`, no network | Pass: preview and raw scan on the 8200i, so fd passing and signals work through the Flatpak D-Bus proxy |
+| Remembered grants | `tests/persist.py` with the stand-in helper and dialog and a real permission store, with the frontend in C; and the 8200i | Pass: a choice nobody asked to remember, or the user declined, is not there in the next run; one the user agreed to is, for the scanners whose id stays the same and without a dialog, and the others are refused; the store has a "yes" for the application under each id; taking one permission back, or all, takes the scanner away and `OpenScanner` is refused; another application's entry is not this one's; a host application with no id is kept nothing. On the 8200i with the real helper only it was remembered, not the network printer, with the id it had before the replug. The dialogs of GNOME (a switch, Remember My Choice) and GTK (a check button) have the control, and answer `persist` only when it is on and a chosen scanner is `persistent`; the GNOME dialog is built and shows it, the GTK one only compiles as far as its dialog file, and the dialog buttons were not clicked through in a test yet |
 | A second, independent application | GNOME Simple Scan ported to the draft | Scanned from the sandbox on the 8200i, was cancelled mid-frame and scanned again in the same session; the device arrived as a film scanner, and the application hid it itself |
 | The dialog | A libadwaita implementation of `org.freedesktop.impl.portal.Scanner` for xdg-desktop-portal-gnome, called directly with made-up scanners on a private bus on a Wayland session | Pass: select returns the chosen id, Escape and Cancel answer "cancelled" with no results, `Request.Close` destroys the window without an answer; unavailable scanners are shown and cannot be chosen; the application's title shows as secondary text under the heading the portal writes. Shown before the search is over: with the system's SANE configuration the dialog is up after 0.30 s where a full listing took about 6 s, scanners found later are added to it, and it says "Searching for Scanners…" until the search ends, not "No Scanners Found" |
 | The frontend in C, in xdg-desktop-portal | The frontend, a helper process that holds libsane, and the dialog above, on a private bus: both applications, the SANE `test` backend, the 8200i and a network scanner | Pass for the grant and the dialog, `OpenScanner` with the exclusive lock and `Busy`, options, `auto`, `StartFrame` with the pipe, frame events and numbers, `Cancel`, closing the pipe early, the helper killed in the middle of a frame (the pipe ends and the application gets `Session.Closed`) and the application leaving in the middle of a frame, checked with scripted clients against the `test` backend. Negative Vibes scanned and rescanned after a stop on the 8200i; Simple Scan, from its Flatpak sandbox, scanned on the 8200i and on an HP Color LaserJet MFP M283cdw through the `airscan` backend. The stop on the 8200i was confirmed by hand, and Simple Scan has no cancel button. The 23 hardware checks (`tools/portal-hw-check.sh --frontend c`) also passed on the 8200i with the frontend in C: colour and infrared scans against `scanimage`, a repeat scan, progress, and a cancel at 30% followed by a rescan |
@@ -417,11 +427,11 @@ particular), and any provider other than SANE.
    actual SANE backends to be sure the list is right.
 3. **A scanner that is replugged.** A USB scanner is matched by its bus address while the helper
    is listing it, so after it is replugged or power cycled it has a new address and a name from
-   before is stale. Ids are opaque and per run in v1. Should an id outlive the run, by the rules
-   in Scanner identity (serial number, else port path, else not at all), and should that come
-   with grants that are kept? The id rules are written down; grants that are kept are not
-   proposed. Feedback on sane-devel from an application with per-scanner profiles (NAPS2) asked
-   for it.
+   before is stale. An id outlives the run, by the rules in Scanner
+   identity (serial number, else port path, else not at all), and a grant may be kept for it with
+   `persist`. Is that the right amount? Feedback on sane-devel from an application with per-scanner
+   profiles (NAPS2) asked for it, and for an "all scanners" grant, which this does not add: the
+   application still cannot list a scanner the user has not chosen.
 
 ## Upstreaming plan
 

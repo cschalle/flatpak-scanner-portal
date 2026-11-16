@@ -41,11 +41,19 @@
 
         Presents a dialog listing the scanners the host knows about and lets
         the user choose which ones the application may use. The choice lasts
-        until the application leaves the bus; nothing is stored, so the
-        application must ask again the next time it starts.
+        until the application leaves the bus, unless the application asked
+        for it to be remembered with ``persist`` and the user agreed. Then
+        the scanners that have ``persistent`` set in their information are
+        still listed by ListScanners() the next time the application runs,
+        and the application need not ask again. The choice is kept in the
+        permission store, in the table ``scanner`` under the scanner id, and
+        is taken back with ``flatpak permission-remove scanner ID APP``.
+        Nothing is kept for an application that has no application id,
+        such as one that is not sandboxed.
 
         Call it in response to the user asking to choose a scanner, or when
-        ListScanners() returns nothing, which is the case after every start. The dialog waits
+        ListScanners() returns nothing, which is the case after every start
+        for the choice that was not remembered. The dialog waits
         for the user, so applications that have a worker thread should not
         block it on the response, and should close the request with
         org.freedesktop.portal.Request.Close() if they stop waiting.
@@ -64,6 +72,15 @@
         * ``multiple`` (``b``)
 
           Whether more than one scanner may be selected. Defaults to no.
+
+        * ``persist`` (``b``)
+
+          Whether to ask the user to let the portal remember the choice, so
+          that the scanners can be used again the next time the application
+          runs. Defaults to no. Only a scanner whose ``persistent`` is true can
+          be remembered, since the id of another is not the same next time, and
+          the application must ask again for it. The user may decline, and
+          a desktop whose dialog does not offer it never remembers.
 
         * ``accept_label`` (``s``)
 
@@ -101,6 +118,12 @@
 
           The selected scanners as an array of scanner id and a vardict with
           the keys described in ListScanners().
+
+        * ``persist`` (``b``)
+
+          Whether at least one of the scanners will be remembered. False if
+          the application did not ask, the user did not agree, or none of them
+          is ``persistent``.
     -->
     <method name="SelectScanners">
       <arg type="s" name="parent_window" direction="in"/>

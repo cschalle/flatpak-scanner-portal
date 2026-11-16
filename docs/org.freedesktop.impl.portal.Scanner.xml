@@ -34,6 +34,15 @@
 
           The ids chosen from @scanners. The frontend keeps the grant in memory.
 
+        * ``persist`` (``b``)
+
+          Whether the user agreed to let the portal remember the choice. Only
+          when @options has ``persist`` set to true: the application asks, and the
+          dialog is where the user is told and answers, for example with a
+          switch that is off to start with. The frontend keeps the choice only
+          if this is true, so a dialog that does not know of it, and leaves it
+          out, remembers nothing.
+
         The frontend does not wait for every driver before it calls this. Finding the
         scanners can take seconds, mostly for the ones on the network, while a scanner on USB
         is found at once. If the frontend is still looking, @options has ``searching`` (``b``)

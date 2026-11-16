@@ -11,6 +11,7 @@ scanners that arrive later are offered too.
 
     impl_auto_grant.py BUS_NAME IMPL_INTERFACE_XML
 """
+import os
 import sys
 
 import gi
@@ -29,13 +30,18 @@ def main():
 
     waiting = {}
 
-    def answer(invocation, ids, multiple, app_id, offered):
+    def answer(invocation, ids, multiple, app_id, offered, persist=False):
         chosen = ids if multiple else ids[:1]
         print(f"SelectScanners for {app_id!r}: offered {offered}, granting {chosen}", flush=True)
         if not chosen:
             invocation.return_value(GLib.Variant("(ua{sv})", (1, {})))
             return
-        invocation.return_value(GLib.Variant("(ua{sv})", (0, {"scanners": GLib.Variant("as", chosen)})))
+        results = {"scanners": GLib.Variant("as", chosen)}
+        # The user agrees to be remembered when the application asks, unless the file named by
+        # STAND_IN_DECLINE_PERSIST exists: the answer a dialog with a switch gives
+        if persist and not os.path.exists(os.environ.get("STAND_IN_DECLINE_PERSIST", "/nonexistent")):
+            results["persist"] = GLib.Variant("b", True)
+        invocation.return_value(GLib.Variant("(ua{sv})", (0, results)))
 
     def on_call(_conn, _sender, _path, _iface, method, params, invocation):
         if method == "UpdateScanners":
@@ -49,7 +55,8 @@ def main():
             entry["ids"] += ids
             if not searching:
                 del waiting[handle]
-                answer(entry["invocation"], entry["ids"], entry["multiple"], entry["app_id"], entry["ids"])
+                answer(entry["invocation"], entry["ids"], entry["multiple"], entry["app_id"], entry["ids"],
+                       entry["persist"])
             return
         if method != "SelectScanners":
             invocation.return_dbus_error("org.freedesktop.DBus.Error.UnknownMethod", method)
@@ -58,9 +65,9 @@ def main():
         ids = [s[0] for s in scanners]
         if options.get("searching"):
             waiting[handle] = {"invocation": invocation, "ids": ids, "multiple": options.get("multiple"),
-                               "app_id": app_id}
+                               "app_id": app_id, "persist": options.get("persist")}
             return
-        answer(invocation, ids, options.get("multiple"), app_id, ids)
+        answer(invocation, ids, options.get("multiple"), app_id, ids, options.get("persist"))
 
     def on_bus(conn, _name):
         conn.register_object(PATH, iface, on_call, None, None)

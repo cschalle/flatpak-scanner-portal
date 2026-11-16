@@ -1,0 +1,209 @@
+From 49ac1550e71443df07d02a24794d0a443123a14c Mon Sep 17 00:00:00 2001
+From: "Christian F.K. Schaller" <christian.schaller@gmail.com>
+Date: Mon, 16 Nov 2026 17:11:34 -0500
+Subject: [PATCH] scanner: Let the user keep the choice, when the application
+ asks
+
+An application can ask with the option persist that the scanners it is given are remembered. The
+dialog then shows a check button, Remember my choice, which is off until the user turns it on. It
+can be used while a chosen scanner is one the portal knows again (persistent in its info); the id
+of another changes, and nothing would be kept for it. With it on, the dialog answers persist and
+the portal keeps the choice. Without the option nothing is shown, and a dialog that leaves the
+answer out keeps nothing.
+---
+ data/org.freedesktop.impl.portal.Scanner.xml |  9 +++++
+ src/scanner.c                                |  4 ++
+ src/scannerdialog.c                          | 41 +++++++++++++++++++-
+ src/scannerdialog.h                          |  4 ++
+ src/scannerdialog.ui                         | 14 +++++++
+ 5 files changed, 71 insertions(+), 1 deletion(-)
+
+diff --git a/data/org.freedesktop.impl.portal.Scanner.xml b/data/org.freedesktop.impl.portal.Scanner.xml
+index a8cd75d..a28bf39 100644
+--- a/data/org.freedesktop.impl.portal.Scanner.xml
++++ b/data/org.freedesktop.impl.portal.Scanner.xml
+@@ -34,6 +34,15 @@
+ 
+           The ids chosen from @scanners. The frontend keeps the grant in memory.
+ 
++        * ``persist`` (``b``)
++
++          Whether the user agreed to let the portal remember the choice. Only
++          when @options has ``persist`` set to true: the application asks, and the
++          dialog is where the user is told and answers, for example with a
++          switch that is off to start with. The frontend keeps the choice only
++          if this is true, so a dialog that does not know of it, and leaves it
++          out, remembers nothing.
++
+         The frontend does not wait for every driver before it calls this. Finding the
+         scanners can take seconds, mostly for the ones on the network, while a scanner on USB
+         is found at once. If the frontend is still looking, @options has ``searching`` (``b``)
+diff --git a/src/scanner.c b/src/scanner.c
+index 3073083..5eac54b 100644
+--- a/src/scanner.c
++++ b/src/scanner.c
+@@ -84,6 +84,10 @@ send_response (ScannerDialogHandle *handle)
+ 
+       g_variant_builder_add (&opt_builder, "{sv}", "scanners",
+                              g_variant_new_strv ((const char * const *) selected, -1));
++
++      /* Said only when it was asked for; a dialog that does not say it keeps nothing */
++      if (scanner_dialog_get_persist (SCANNER_DIALOG (handle->dialog)))
++        g_variant_builder_add (&opt_builder, "{sv}", "persist", g_variant_new_boolean (TRUE));
+     }
+ 
+   if (handle->request->exported)
+diff --git a/src/scannerdialog.c b/src/scannerdialog.c
+index 4da9bc5..ed7f4f9 100644
+--- a/src/scannerdialog.c
++++ b/src/scannerdialog.c
+@@ -39,6 +39,8 @@ struct _ScannerDialog {
+   GtkWidget *subheading;
+   GtkWidget *stack;
+   GtkWidget *searching_box;
++  /* Keeps the choice for the next time, when the application asks for that */
++  GtkWidget *remember_check;
+ 
+   /* The check button of every row that can be chosen, in list order */
+   GPtrArray *choices;
+@@ -64,11 +66,13 @@ static guint signals[LAST_SIGNAL];
+ G_DEFINE_TYPE (ScannerDialog, scanner_dialog, GTK_TYPE_WINDOW)
+ 
+ #define SCANNER_ID_KEY "scanner-id"
++#define SCANNER_PERSISTENT_KEY "scanner-persistent"
+ 
+ static void
+ update_accept_button (ScannerDialog *dialog)
+ {
+   gboolean any = FALSE;
++  gboolean any_persistent = FALSE;
+ 
+   for (guint i = 0; i < dialog->choices->len; i++)
+     {
+@@ -77,11 +81,14 @@ update_accept_button (ScannerDialog *dialog)
+       if (gtk_toggle_button_get_active (choice))
+         {
+           any = TRUE;
+-          break;
++          if (g_object_get_data (G_OBJECT (choice), SCANNER_PERSISTENT_KEY))
++            any_persistent = TRUE;
+         }
+     }
+ 
+   gtk_widget_set_sensitive (dialog->accept_button, any);
++  /* Only a scanner the portal can know again is kept, the id of the others changes */
++  gtk_widget_set_sensitive (dialog->remember_check, any_persistent);
+ }
+ 
+ static void
+@@ -188,6 +195,7 @@ scanner_dialog_class_init (ScannerDialogClass *class)
+   gtk_widget_class_bind_template_child (widget_class, ScannerDialog, subheading);
+   gtk_widget_class_bind_template_child (widget_class, ScannerDialog, stack);
+   gtk_widget_class_bind_template_child (widget_class, ScannerDialog, searching_box);
++  gtk_widget_class_bind_template_child (widget_class, ScannerDialog, remember_check);
+   gtk_widget_class_bind_template_callback (widget_class, button_clicked);
+   gtk_widget_class_bind_template_callback (widget_class, row_activated);
+ }
+@@ -342,6 +350,13 @@ add_scanner_row (ScannerDialog *dialog,
+   atk_object_set_description (atk, subtitle);
+ 
+   g_object_set_data_full (G_OBJECT (choice), SCANNER_ID_KEY, g_strdup (id), g_free);
++  {
++    gboolean persistent = FALSE;
++
++    g_variant_dict_lookup (dict, "persistent", "b", &persistent);
++    if (persistent)
++      g_object_set_data (G_OBJECT (choice), SCANNER_PERSISTENT_KEY, GINT_TO_POINTER (1));
++  }
+ 
+   row = gtk_list_box_row_new ();
+   gtk_container_add (GTK_CONTAINER (row), box);
+@@ -447,6 +462,7 @@ scanner_dialog_new (const char *app_id,
+   const char *accept_label = NULL;
+   const char *title = NULL;
+   gboolean modal = TRUE;
++  gboolean persist = FALSE;
+   ScannerDialog *dialog;
+ 
+   dialog = g_object_new (SCANNER_TYPE_DIALOG, NULL);
+@@ -456,6 +472,7 @@ scanner_dialog_new (const char *app_id,
+   g_variant_dict_lookup (opts, "accept_label", "&s", &accept_label);
+   g_variant_dict_lookup (opts, "title", "&s", &title);
+   g_variant_dict_lookup (opts, "searching", "b", &dialog->searching);
++  g_variant_dict_lookup (opts, "persist", "b", &persist);
+ 
+   gtk_window_set_modal (GTK_WINDOW (dialog), modal);
+   gtk_window_set_title (GTK_WINDOW (dialog), dialog->multiple ? _("Select Scanners") : _("Select Scanner"));
+@@ -486,6 +503,17 @@ scanner_dialog_new (const char *app_id,
+       gtk_widget_show (dialog->subheading);
+     }
+ 
++  /* Offered only when the application asked, and it is off until the user turns it on */
++  if (persist)
++    {
++      g_autofree char *label = NULL;
++
++      label = app_name ? g_strdup_printf (_("Let %s use the chosen scanners again without asking"), app_name)
++                       : g_strdup (_("Let the app use the chosen scanners again without asking"));
++      gtk_button_set_label (GTK_BUTTON (dialog->remember_check), label);
++      gtk_widget_show (dialog->remember_check);
++    }
++
+   n_rows = scanner_dialog_add_scanners (dialog, scanners);
+   scanner_dialog_set_searching (dialog, dialog->searching);
+ 
+@@ -521,3 +549,14 @@ scanner_dialog_get_selected (ScannerDialog *dialog)
+ 
+   return selected;
+ }
++
++/* Whether the user asked for the choice to be kept. It counts only while it can be used. */
++gboolean
++scanner_dialog_get_persist (ScannerDialog *dialog)
++{
++  g_return_val_if_fail (dialog != NULL, FALSE);
++
++  return gtk_widget_get_visible (dialog->remember_check) &&
++         gtk_widget_get_sensitive (dialog->remember_check) &&
++         gtk_toggle_button_get_active (GTK_TOGGLE_BUTTON (dialog->remember_check));
++}
+diff --git a/src/scannerdialog.h b/src/scannerdialog.h
+index ad4f0f4..3b46b25 100644
+--- a/src/scannerdialog.h
++++ b/src/scannerdialog.h
+@@ -45,3 +45,7 @@ void scanner_dialog_set_searching (ScannerDialog *dialog,
+ 
+ /* The ids of the scanners the user chose, NULL-terminated; free with g_strfreev () */
+ char **scanner_dialog_get_selected (ScannerDialog *dialog);
++
++/* Whether the user turned on keeping the choice for the next time; only possible when the
++ * application asked with the option persist, and for a scanner the portal knows again */
++gboolean scanner_dialog_get_persist (ScannerDialog *dialog);
+diff --git a/src/scannerdialog.ui b/src/scannerdialog.ui
+index cc26f66..0ea7703 100644
+--- a/src/scannerdialog.ui
++++ b/src/scannerdialog.ui
+@@ -83,6 +83,20 @@
+                 </child>
+               </object>
+             </child>
++            <!-- Only when the application asks for the choice to be kept -->
++            <child>
++              <object class="GtkCheckButton" id="remember_check">
++                <property name="visible">0</property>
++                <property name="no-show-all">1</property>
++                <property name="sensitive">0</property>
++                <property name="halign">start</property>
++                <property name="margin-top">12</property>
++                <property name="label" translatable="yes">Remember my choice</property>
++              </object>
++              <packing>
++                <property name="expand">0</property>
++              </packing>
++            </child>
+             <!-- Shown under the scanners while more may still turn up -->
+             <child>
+               <object class="GtkBox" id="searching_box">
+-- 
+2.56.1
+
