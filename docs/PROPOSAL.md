@@ -257,8 +257,89 @@ nothing is written to disk.
 | The application sees only granted scanners | Enumerating the LAN's scanners is a fingerprinting and privacy problem, and not something an application needs before the user has chosen anything. |
 | A `Session` for an open scanner | Lifecycle comes for free: the application exiting releases the hardware lock, and the portal can revoke access with `Session.Closed`. |
 | No per-scan prompt once granted | An application with a grant can scan only what is on the glass or in the feeder, and the dialog names the scanner, so one choice per run of the application is proportionate. It is not true that a scan cannot happen unnoticed: a page left in the scanner can be read. The exposure is small, and a prompt for every scan would make the scanning applications unusable. Open to argument if reviewers disagree. |
-| Grants last for the application's run and are kept in memory | The print portal asks every time and keeps nothing, and scanning is an occasional, deliberate act like printing, so a dialog at the start of a scanning session is the expected cost. It removes the permission table, a revocation path and a settings panel from v1, and the user's only revocation is to close the application. The choice is not remembered across runs. The USB portal stores grants in the permission store, where they are revocable; doing that here would cost a permission table, a stable scanner id, a revocation path and a place in Settings, and what it saves is one dialog on the launch of a scanning application. We do not plan to add it. If reviewers want it, it could be a `remember` option answered in the dialog, without changing anything else. |
+| Grants last for the application's run and are kept in memory | The print portal asks every time and keeps nothing, and scanning is an occasional, deliberate act like printing, so a dialog at the start of a scanning session is the expected cost. It removes the permission table, a revocation path and a settings panel from v1, and the user's only revocation is to close the application. The choice is not remembered across runs. The USB portal stores grants in the permission store, where they are revocable; doing that here would cost a permission table, a stable scanner id, a revocation path and a place in Settings, and what it saves is one dialog on the launch of a scanning application. We do not plan to add it. If reviewers want it, it could be a `remember` option answered in the dialog, but it needs ids that survive a replug, which most scanners do not give; see Scanner identity. |
 | The backend does UI only | Same split as `org.freedesktop.impl.portal.Usb`, and it keeps libsane out of the desktop shell's process as well as out of the frontend's. |
+
+## Scanner identity
+
+Today an id is the first 16 hex characters of the SHA-256 of a string the helper calls
+`physical`: `usb:<bus>:<devnum>` for USB, the host for a network scanner. That is stable for as
+long as the helper runs and no longer. The bus and device number are assigned by the kernel when
+the scanner is enumerated, so they change when it is replugged, moved to another port or the
+machine restarts, and the host of a network scanner changes with DHCP. That is why v1 keeps ids
+per run, and why a grant that outlives the run needs a different id. This section is the rules
+for one. The USB rules are implemented in the patch series and tested with a stand-in helper; the
+only real scanner they have been looked at on is the 8200i.
+
+**What SANE offers.** Nothing that is stable across runs and drivers. The device name is a string
+private to the driver:
+
+| Bus | Example name | Stable? |
+|---|---|---|
+| USB | `plustek8200i:libusb:003:014` | No: bus and device number |
+| eSCL | `airscan:e0:HP Color LaserJet MFP M283cdw (61F0E7)` | The `e0` is a discovery index and changes; the model with its suffix is steadier |
+| HPLIP | `hpaio:/net/colorlaserjet_mfp_m282-m285?ip=192.168.68.91` | No: the address is in the name |
+| SANE `net` | `net:<host>:<backend>:<device>` | As stable as the host name or address |
+| Video | `v4l:/dev/video2` | No, and `type` is `other`, so it is not offered |
+
+A USB serial number is not enough either. The 8200i reports `serial=1` in sysfs, and many scanners
+report none or a placeholder.
+
+**The rules.** Implemented for USB; the network rule is design only (see below).
+
+1. **An id outlives the run only if the portal can name the device.** A scanner is `persistent`
+   when it can, and `persistent` is in its info. Otherwise it is granted for the run only, as in
+   v1, with an id made as before.
+2. **USB.** The id comes from the USB id and the serial number when the scanner has one that tells
+   it from every other USB device of that USB id on the machine, so that it survives a move to
+   another port. A serial number that is empty, short (under four characters), one character
+   repeated, a known placeholder ("0123456789", "none", …) or shared with another device of the
+   kind is not used; the 8200i reports `serial=1`. Then the id comes from the USB id and the port
+   path in sysfs (`3-4`, the hubs and ports from the root), which survives a replug into the same
+   port and a restart but not a move to another port. Never from the bus and device number.
+3. **Every driver gives the same id.** The helper reads sysfs for what the scanner is, not what
+   its driver is, so the id is the same whichever driver finds it. This is a requirement and not
+   a nicety: `SelectScanners` offers the dialog a scanner as soon as one driver finds it, and the
+   id the user is granted has to be the one `ListScanners` gives afterwards, when the drivers have
+   been merged. For the same reason the id is made for each scanner alone and not in a pass over
+   the whole list.
+4. **A wrong match is worse than a lost grant.** The USB id and model alone never make an id, so
+   a grant for one scanner cannot apply to a second of the same model. Two identical scanners are
+   told apart by their serial numbers, or by their ports, which sysfs gives one device each.
+5. **The id stays opaque.** It is a hash of the pieces above with a version, so that the rules
+   can change without the application seeing it, and it does not say which rule made it. The
+   application learns only `persistent`.
+6. **A network scanner is not persistent.** Only one driver, `airscan`, finds a name that stays
+   the same (the service name without the discovery index); the others have an address, which
+   does not. By rule 3 the id must be the same from each, so a network scanner cannot have one
+   until the host can give every driver the same name, from mDNS: Avahi, which the helper does
+   not use today. This is the open part.
+7. **A grant that is kept names a scanner that may be missing.** Not implemented: v1 keeps no
+   grant. `ListScanners` would return it with `available` = false, and never match it to another
+   scanner.
+8. **Losing a grant is never an error.** If a port changes, the application gets an empty
+   `ListScanners` and calls `SelectScanners` again, as on every start in v1.
+
+**What was found by building it.**
+
+- The helper does the checking, since it can see sysfs: whether a serial number is shared is
+  asked of the whole machine and not of the scanners one driver found, so that every driver
+  agrees. The frontend only turns what the helper says into an id.
+- On the 8200i the serial number is rejected and the id comes from the port, `3-4`. The
+  network printer on the same machine gets no stable id.
+- It is tested with a stand-in helper (`tests/stable-ids.py`): an id with a serial number and
+  with a port is the same after a replug (a new bus address), the id of a scanner found by two
+  drivers is the same from both, two scanners of a kind get different ids, and one found by an
+  address or without a port is not persistent. **Not tested:** a real replug of a scanner, a
+  scanner with a real serial number, two real scanners of a kind, and a scanner behind a hub.
+
+**What it costs.** Reading sysfs in the helper, which `usb_id_for_address` already does. A
+network scanner needs a lookup of the mDNS name for each driver.
+
+**What it does not do.** It does not make every scanner persistent: one without a serial number
+loses its id when the cable moves, and a network scanner has none yet, and the application should
+say so and not treat that as a fault. And it says nothing about where a kept grant is stored or
+how it is revoked, which `Grants last for the application's run` leaves out of v1.
 
 ## Security and privacy
 
@@ -336,8 +417,11 @@ particular), and any provider other than SANE.
    actual SANE backends to be sure the list is right.
 3. **A scanner that is replugged.** A USB scanner is matched by its bus address while the helper
    is listing it, so after it is replugged or power cycled it has a new address and a name from
-   before is stale. The portal treats ids as opaque and per run. Is that enough, or should an id
-   outlive the run, with the serial number or the port path?
+   before is stale. Ids are opaque and per run in v1. Should an id outlive the run, by the rules
+   in Scanner identity (serial number, else port path, else not at all), and should that come
+   with grants that are kept? The id rules are written down; grants that are kept are not
+   proposed. Feedback on sane-devel from an application with per-scanner profiles (NAPS2) asked
+   for it.
 
 ## Upstreaming plan
 

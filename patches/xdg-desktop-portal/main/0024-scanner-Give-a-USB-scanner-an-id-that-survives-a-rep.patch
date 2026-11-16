@@ -1,0 +1,280 @@
+From 72e21aaccf93a832575bda62862e75aec83b4f9b Mon Sep 17 00:00:00 2001
+From: "Christian F.K. Schaller" <christian.schaller@gmail.com>
+Date: Mon, 16 Nov 2026 12:32:04 -0500
+Subject: [PATCH] scanner: Give a USB scanner an id that survives a replug, and
+ say so with persistent
+
+The id was a hash of the USB bus and device number, which the kernel
+assigns when the scanner is enumerated, so it changed when the scanner
+was replugged, moved to another port or the machine restarted.
+
+The helper now reads sysfs for what a USB scanner is that stays the
+same: its serial number, if it has one that tells it from every other
+USB device of that USB id on the machine, and the port it is on. A
+serial number that is short, one character repeated, a known
+placeholder or shared with another device of the kind is not used; the
+Plustek OpticFilm 8200i reports "1". The whole of sysfs is looked at and
+not the scanners one driver found, so that every driver that finds a
+scanner gives the same answer.
+
+The frontend makes the id from the USB id with the serial number, or
+else with the port, as a hash with a version, and sets the new key
+persistent in the scanner information to true. It is false for every
+other scanner, which keeps the id of the run. The id is made for each
+scanner alone and not in a pass over the merged list, since
+SelectScanners offers a scanner to the dialog as soon as one driver has
+found it, and the id the user grants must be the one ListScanners gives
+later. For the same reason a network scanner is not persistent yet: only
+airscan finds a name that stays the same.
+
+Nothing is kept for an application: persistent only says whether an id
+could be.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ data/org.freedesktop.portal.Scanner.xml |  12 ++-
+ desktop-portal/scanner-helper.c         | 106 ++++++++++++++++++++++++
+ desktop-portal/scanner.c                |  42 +++++++++-
+ 3 files changed, 158 insertions(+), 2 deletions(-)
+
+diff --git a/data/org.freedesktop.portal.Scanner.xml b/data/org.freedesktop.portal.Scanner.xml
+index bdbc730..868c696 100644
+--- a/data/org.freedesktop.portal.Scanner.xml
++++ b/data/org.freedesktop.portal.Scanner.xml
+@@ -117,7 +117,7 @@
+ 
+         Lists the scanners this application has been granted access to and
+         that are currently available. The scanner id is opaque: do not construct
+-        ids, or keep them for the next run.
++        ids, and keep one for the next run only if ``persistent`` is true.
+ 
+         A physical scanner is listed once, however many drivers find it, as
+         a network scanner is by both an eSCL and a vendor driver. The portal
+@@ -167,6 +167,16 @@
+         * ``available`` (``b``)
+ 
+           Whether the scanner can be opened right now.
++
++        * ``persistent`` (``b``)
++
++          Whether the id is the same on the next run, after the scanner has been
++          unplugged and plugged in again, or the machine restarted. It is when
++          the portal can tell the device from any other: by its serial number,
++          or by the USB port it is on. It is not when the driver gives nothing
++          that stays the same, such as the address of a network scanner. The
++          portal keeps nothing for an application: it only says whether an id
++          could be kept.
+     -->
+     <method name="ListScanners">
+       <annotation name="org.qtproject.QtDBus.QtTypeName.In0" value="QVariantMap"/>
+diff --git a/desktop-portal/scanner-helper.c b/desktop-portal/scanner-helper.c
+index 0cbc072..fd8c55a 100644
+--- a/desktop-portal/scanner-helper.c
++++ b/desktop-portal/scanner-helper.c
+@@ -116,6 +116,98 @@ usb_id_for_address (int bus,
+   return NULL;
+ }
+ 
++/* A serial number that tells scanners apart. Many devices report none, or a placeholder such as
++ * "1" or "0123456789", and those would make two scanners one. */
++static gboolean
++usb_serial_is_usable (const char *serial)
++{
++  static const char *placeholders[] = { "0123456789", "1234567890", "123456", "12345678", "none",
++                                        "unknown", "serial", "n/a", "null", "default string", NULL };
++  gsize len = strlen (serial);
++  gboolean same = TRUE;
++
++  if (len < 4)
++    return FALSE;
++
++  for (gsize i = 1; i < len; i++)
++    if (serial[i] != serial[0])
++      same = FALSE;
++  if (same)
++    return FALSE;
++
++  for (int i = 0; placeholders[i] != NULL; i++)
++    if (g_ascii_strcasecmp (serial, placeholders[i]) == 0)
++      return FALSE;
++
++  return TRUE;
++}
++
++/* What a USB scanner is that stays the same when it is replugged, for the id: its serial number if
++ * it has one that tells it from every other USB device with the same USB id on this machine, and
++ * the port it is on ("3-4", the hubs and ports from the root, as sysfs names it). The whole of
++ * sysfs is looked at, not the scanners this driver found, so that every driver that finds the
++ * scanner gives the same answer: its id is the same whichever one is asked. */
++static void
++usb_stability_for_address (int    bus,
++                           int    address,
++                           char **serial,
++                           char **port)
++{
++  g_autoptr(GDir) dir = g_dir_open ("/sys/bus/usb/devices", 0, NULL);
++  g_autofree char *wanted_id = NULL;
++  const char *entry;
++  int same_serial = 0;
++
++  *serial = NULL;
++  *port = NULL;
++
++  while (dir != NULL && (entry = g_dir_read_name (dir)) != NULL)
++    {
++      g_autofree char *base = g_build_filename ("/sys/bus/usb/devices", entry, NULL);
++
++      /* Not an interface ("3-4:1.0"), which has no serial */
++      if (strchr (entry, ':') == NULL && sysfs_int (base, "busnum") == bus && sysfs_int (base, "devnum") == address)
++        {
++          g_autofree char *serial_path = g_build_filename (base, "serial", NULL);
++          g_autofree char *contents = NULL;
++
++          *port = g_strdup (entry);
++          wanted_id = usb_id_for_address (bus, address);
++          if (g_file_get_contents (serial_path, &contents, NULL, NULL) &&
++              usb_serial_is_usable (g_strstrip (contents)))
++            *serial = g_strdup (contents);
++          break;
++        }
++    }
++
++  if (*serial == NULL || wanted_id == NULL)
++    return;
++
++  /* Is there another device of the same kind with that serial number? */
++  g_clear_pointer (&dir, g_dir_close);
++  dir = g_dir_open ("/sys/bus/usb/devices", 0, NULL);
++  while (dir != NULL && (entry = g_dir_read_name (dir)) != NULL)
++    {
++      g_autofree char *base = g_build_filename ("/sys/bus/usb/devices", entry, NULL);
++      g_autofree char *serial_path = g_build_filename (base, "serial", NULL);
++      g_autofree char *contents = NULL;
++      int b = sysfs_int (base, "busnum");
++      int a = sysfs_int (base, "devnum");
++      g_autofree char *id = NULL;
++
++      if (strchr (entry, ':') != NULL || b < 0 || a < 0)
++        continue;
++      if (!g_file_get_contents (serial_path, &contents, NULL, NULL) || g_strcmp0 (g_strstrip (contents), *serial) != 0)
++        continue;
++      id = usb_id_for_address (b, a);
++      if (g_strcmp0 (id, wanted_id) == 0)
++        same_serial++;
++    }
++
++  if (same_serial > 1)
++    g_clear_pointer (serial, g_free);
++}
++
+ /* The host of a network scanner, from the address in its name or type: `ip=192.0.2.1` (HPLIP,
+  * airscan) or a URL (eSCL). Drivers that reach a scanner through another host, such as SANE's net
+  * backend, are not matched, since that host may have several. */
+@@ -208,6 +300,20 @@ scanner_to_variant (const SANE_Device *device)
+     g_variant_builder_add (&info, "{sv}", "physical", g_variant_new_string (physical));
+   if (usb_id != NULL)
+     g_variant_builder_add (&info, "{sv}", "usb_id", g_variant_new_string (usb_id));
++  {
++    const char *usb = strstr (device->name, "libusb:");
++    g_autofree char *serial = NULL;
++    g_autofree char *port = NULL;
++    int bus;
++    int address;
++
++    if (usb != NULL && sscanf (usb, "libusb:%d:%d", &bus, &address) == 2)
++      usb_stability_for_address (bus, address, &serial, &port);
++    if (serial != NULL)
++      g_variant_builder_add (&info, "{sv}", "usb_serial", g_variant_new_string (serial));
++    if (port != NULL)
++      g_variant_builder_add (&info, "{sv}", "usb_port", g_variant_new_string (port));
++  }
+ 
+   return g_variant_new ("(ss@a{sv})", id, device->name, g_variant_builder_end (&info));
+ }
+diff --git a/desktop-portal/scanner.c b/desktop-portal/scanner.c
+index 6b6cb9f..72f6972 100644
+--- a/desktop-portal/scanner.c
++++ b/desktop-portal/scanner.c
+@@ -491,6 +491,26 @@ scanner_portal_type (const char         *raw,
+   return "scanner";
+ }
+ 
++/* What a scanner is called that is the same on the next run, or NULL if nothing about it is: its USB
++ * id with its serial number, or else with the port it is on. Never the bus and device number,
++ * which change when it is replugged, nor an address. The serial number is given only when it
++ * tells the scanner from every other. The id is made from this where there is one, and the scanner
++ * is `persistent`. It is made for each driver alone, and is the same for all that find the
++ * scanner, since SelectScanners offers a scanner to the dialog before it knows which others
++ * found it, and the id offered is the one ListScanners must give later. */
++static char *
++scanner_stable_key (const char *usb_id,
++                    const char *usb_serial,
++                    const char *usb_port)
++{
++  if (usb_id != NULL && usb_serial != NULL)
++    return g_strdup_printf ("usb:%s:serial:%s", usb_id, usb_serial);
++  if (usb_id != NULL && usb_port != NULL)
++    return g_strdup_printf ("usb:%s:port:%s", usb_id, usb_port);
++
++  return NULL;
++}
++
+ /* From one entry of the helper's list: an id, the SANE name and the information vardict. What the
+  * portal knows about the scanner is added: its capabilities, and an id that is the same for every
+  * driver that finds it, so that they are one scanner to the dialog and to applications. */
+@@ -506,17 +526,24 @@ scanner_device_new_from_helper (const char *id,
+   const ScannerKnown *known;
+   const char *physical = NULL;
+   const char *usb_id = NULL;
++  const char *usb_serial = NULL;
++  const char *usb_port = NULL;
+   const char *vendor = NULL;
+   const char *model = NULL;
+   const char *backend = NULL;
+   const char **hints = NULL;
++  g_autofree char *stable = NULL;
+ 
+   g_variant_dict_lookup (&dict, "physical", "&s", &physical);
+   g_variant_dict_lookup (&dict, "usb_id", "&s", &usb_id);
++  g_variant_dict_lookup (&dict, "usb_serial", "&s", &usb_serial);
++  g_variant_dict_lookup (&dict, "usb_port", "&s", &usb_port);
+   g_variant_dict_lookup (&dict, "vendor", "&s", &vendor);
+   g_variant_dict_lookup (&dict, "model", "&s", &model);
+   g_variant_dict_lookup (&dict, "backend", "&s", &backend);
+ 
++  stable = scanner_stable_key (usb_id, usb_serial, usb_port);
++
+   known = scanner_known_lookup (table, usb_id, vendor, model);
+   if (known != NULL)
+     {
+@@ -590,9 +617,21 @@ scanner_device_new_from_helper (const char *id,
+   /* Only the portal needs these, and an address is not for applications */
+   g_variant_dict_remove (&dict, "physical");
+   g_variant_dict_remove (&dict, "usb_id");
++  g_variant_dict_remove (&dict, "usb_serial");
++  g_variant_dict_remove (&dict, "usb_port");
++  g_variant_dict_insert (&dict, "persistent", "b", stable != NULL);
+   device->info = g_variant_ref_sink (g_variant_dict_end (&dict));
+ 
+-  if (device->physical != NULL)
++  if (stable != NULL)
++    {
++      /* A hash with a version, so that the rules can change without an application seeing how
++       * the id was made */
++      g_autofree char *versioned = g_strconcat ("v1:", stable, NULL);
++      g_autofree char *sum = g_compute_checksum_for_string (G_CHECKSUM_SHA256, versioned, -1);
++
++      device->id = g_strdup_printf ("sane-%.16s", sum);
++    }
++  else if (device->physical != NULL)
+     {
+       g_autofree char *sum = g_compute_checksum_for_string (G_CHECKSUM_SHA256, device->physical, -1);
+ 
+@@ -704,6 +743,7 @@ scanner_device_new (const char *id,
+   g_variant_builder_add (&builder, "{sv}", "capabilities",
+                          g_variant_new_strv (capabilities, -1));
+   g_variant_builder_add (&builder, "{sv}", "available", g_variant_new_boolean (available));
++  g_variant_builder_add (&builder, "{sv}", "persistent", g_variant_new_boolean (FALSE));
+   device->info = g_variant_ref_sink (g_variant_builder_end (&builder));
+ 
+   return device;

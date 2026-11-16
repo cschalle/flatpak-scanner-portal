@@ -117,7 +117,7 @@
 
         Lists the scanners this application has been granted access to and
         that are currently available. The scanner id is opaque: do not construct
-        ids, or keep them for the next run.
+        ids, and keep one for the next run only if ``persistent`` is true.
 
         A physical scanner is listed once, however many drivers find it, as
         a network scanner is by both an eSCL and a vendor driver. The portal
@@ -167,6 +167,16 @@
         * ``available`` (``b``)
 
           Whether the scanner can be opened right now.
+
+        * ``persistent`` (``b``)
+
+          Whether the id is the same on the next run, after the scanner has been
+          unplugged and plugged in again, or the machine restarted. It is when
+          the portal can tell the device from any other: by its serial number,
+          or by the USB port it is on. It is not when the driver gives nothing
+          that stays the same, such as the address of a network scanner. The
+          portal keeps nothing for an application: it only says whether an id
+          could be kept.
     -->
     <method name="ListScanners">
       <annotation name="org.qtproject.QtDBus.QtTypeName.In0" value="QVariantMap"/>

@@ -36,6 +36,7 @@ patches for the three portals. The applications that use it are separate project
 | `tests/run-scenarios-c-frontend.sh` | The checks against the frontend in C |
 | `tests/duplicates.py`, `run-duplicates-c-frontend.sh` | A scanner found by two drivers is one entry. Ties between drivers go by name, a driver the table names comes first, and a second driver is tried only after one that says it does not drive the scanner, not after an I/O error |
 | `tests/buttons.py`, `run-buttons-c-frontend.sh`, `fakebtn/` | A scanner's buttons reach the application as ButtonEvent, against a fake SANE backend whose buttons the test presses |
+| `tests/stable-ids.py`, `run-stable-ids-c-frontend.sh`, `stable-ids-helper.py` | A USB scanner's id is the same after a replug when it has a usable serial number or a port, `persistent` says so, and every driver gives the same id |
 | `tools/portal-hw-check.sh` | The portal against libsane on the 8200i |
 | `patches/` | The scanner patches for xdg-desktop-portal, -gnome and -gtk, as files |
 | `rpm/build.sh` | Builds the three portals with the patches as RPMs for Fedora 44 |
@@ -64,7 +65,7 @@ patches:
 
 | Package | `<release>/` | `main/` |
 |---|---|---|
-| xdg-desktop-portal | 1.22.1 (23 patches) | main (23) |
+| xdg-desktop-portal | 1.22.1 (24 patches) | main (24) |
 | xdg-desktop-portal-gnome | 50.0 (5) | main (5) |
 | xdg-desktop-portal-gtk | 1.15.3 (3) | main (3) |
 
